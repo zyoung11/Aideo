@@ -8,9 +8,12 @@ import (
 	"image/png"
 	"math"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
 	"unsafe"
+
+	"golang.org/x/term"
 )
 
 // ==================== 终端控制 ====================
@@ -45,11 +48,16 @@ func getTerminalSize() (*TerminalSize, error) {
 }
 
 const (
-	CLEAR_SCREEN = "\033[2J"
-	CURSOR_HOME  = "\033[H"
-	HIDE_CURSOR  = "\033[?25l"
-	SHOW_CURSOR  = "\033[?25h"
-	RESET_COLORS = "\033[0m"
+	CLEAR_SCREEN     = "\033[2J"
+	CURSOR_HOME      = "\033[H"
+	HIDE_CURSOR      = "\033[?25l"
+	SHOW_CURSOR      = "\033[?25h"
+	RESET_COLORS     = "\033[0m"
+	ENTER_ALTERNATE  = "\033[?1049h"
+	LEAVE_ALTERNATE  = "\033[?1049l"
+	CLEAR_SCROLLBACK = "\033[3J"
+	DISABLE_MOUSE    = "\033[?1000l\033[?1002l\033[?1003l"
+	ENABLE_MOUSE     = "\033[?1000h\033[?1002h\033[?1003h"
 )
 
 func clearScreen()                 { fmt.Print(CLEAR_SCREEN + CURSOR_HOME) }
@@ -383,6 +391,12 @@ func (r *BrailleRenderer) Print() {
 	fmt.Print(r.String())
 }
 
+// 判断是否是转义序列终止符
+func isTerminator(b byte) bool {
+	// 转义序列终止符通常是字母或 ~
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '~'
+}
+
 // ==================== 自适应缩放 ====================
 // Braille 模式：每个字符 = 2列 × 4行像素
 // 终端字符宽高比通常为 1:2，braille 像素恰好为正方形（cw/2 × ch/4 = cw/2 × cw/2）
@@ -428,6 +442,19 @@ func calculateOutputSize(imgWidth, imgHeight, termWidth, termHeight int) (int, i
 // ==================== 主函数 ====================
 
 func main() {
+	// 顶层恢复，确保终端状态恢复
+	defer func() {
+		if r := recover(); r != nil {
+			// 恢复终端状态
+			fmt.Print(ENABLE_MOUSE)
+			fmt.Print(SHOW_CURSOR)
+			fmt.Print(LEAVE_ALTERNATE)
+			// 打印错误信息
+			fmt.Fprintf(os.Stderr, "程序发生 panic: %v\n", r)
+			os.Exit(1)
+		}
+	}()
+
 	if len(os.Args) < 2 {
 		fmt.Println("用法: go run main.go <图片文件.jpg|png>")
 		fmt.Println("示例: go run main.go photo.jpg")
@@ -470,14 +497,126 @@ func main() {
 	renderer := NewBrailleRenderer(charW, charH)
 	renderer.Render(scaledData, 1.0, 0.85)
 
-	clearScreen()
-	hideCursor()
+	// 进入 alternate screen 并隐藏光标，禁用鼠标报告
+	fmt.Print(ENTER_ALTERNATE)
+	fmt.Print(HIDE_CURSOR)
+	fmt.Print(DISABLE_MOUSE)
+	defer func() {
+		// 确保终端状态恢复，即使发生 panic
+		fmt.Print(ENABLE_MOUSE)
+		fmt.Print(SHOW_CURSOR)
+		fmt.Print(LEAVE_ALTERNATE)
+	}()
 
+	// 清屏并渲染图像
+	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 	renderer.Print()
 
-	fmt.Printf("\033[%d;1H\033[90m[ 按回车键退出 ]%s", termSize.Height, RESET_COLORS)
-	fmt.Scanln()
+	// 在底部显示提示
+	fmt.Printf("\033[%d;1H\033[90m[ 按 q 或 ESC 退出 ]%s", termSize.Height, RESET_COLORS)
 
-	showCursor()
-	clearScreen()
+	// 设置 raw 模式输入
+	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+	if err != nil {
+		fmt.Printf("无法设置 raw 模式: %v\n", err)
+		os.Exit(1)
+	}
+	defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+	// 监听信号
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGWINCH, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	defer signal.Stop(sigCh)
+
+	// 键盘输入 channel
+	keyCh := make(chan byte, 10)
+	// 启动 goroutine 读取按键
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// 发生 panic，关闭 channel
+				close(keyCh)
+			}
+		}()
+
+		buf := make([]byte, 256)
+		for {
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
+				close(keyCh)
+				return
+			}
+
+			// 处理读取到的字节
+			for i := 0; i < n; i++ {
+				b := buf[i]
+
+				// 检查是否是转义序列开头
+				if b == 27 && i+1 < n {
+					// 可能是转义序列，检查下一个字符
+					next := buf[i+1]
+					// 如果是 '[' 或 'O' 或 'M'，则是转义序列，不是 ESC 键
+					// 'M' 是鼠标事件
+					if next == '[' || next == 'O' || next == 'M' {
+						// 跳过整个转义序列
+						// 简单处理：跳过直到遇到字母或 ~
+						i++ // 跳过 ESC 后面的字符
+						for i < n && !isTerminator(buf[i]) {
+							i++
+						}
+						continue
+					}
+				}
+
+				// 发送到 channel（非阻塞）
+				select {
+				case keyCh <- b:
+				default:
+					// channel 满，丢弃
+				}
+			}
+		}
+	}()
+
+	// 事件循环
+	for {
+		select {
+		case sig := <-sigCh:
+			switch sig {
+			case syscall.SIGWINCH:
+				// 窗口大小变化，重新获取终端尺寸并重新渲染
+				newSize, err := getTerminalSize()
+				if err != nil {
+					continue
+				}
+				termSize = newSize
+				// 重新计算输出尺寸
+				outWidth, outHeight := calculateOutputSize(
+					imgData.Width, imgData.Height,
+					termSize.Width, termSize.Height,
+				)
+				// 重新缩放图像
+				scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
+				charW = outWidth / 2
+				charH = outHeight / 4
+				// 重新创建渲染器并渲染
+				renderer = NewBrailleRenderer(charW, charH)
+				renderer.Render(scaledData, 1.0, 0.85)
+				// 清屏并重新显示
+				fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
+				renderer.Print()
+				fmt.Printf("\033[%d;1H\033[90m[ 按 q 或 ESC 退出 ]%s", termSize.Height, RESET_COLORS)
+			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP:
+				return
+			}
+		case key, ok := <-keyCh:
+			if !ok {
+				return // channel 关闭
+			}
+			if key == 'q' || key == 'Q' || key == 27 { // 27 = ESC
+				return
+			}
+			// 忽略其他所有输入
+		}
+	}
 }
