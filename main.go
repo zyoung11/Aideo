@@ -68,23 +68,13 @@ func colorFg(r, g, b uint8) string {
 	return fmt.Sprintf("\033[38;2;%d;%d;%dm", r, g, b)
 }
 
-// ==================== 字符定义 ====================
-
-var edgeChars = [4][10]rune{
-	{'|', '|', '|', '|', '|', '|', '|', '|', '|', '|'},
-	{'-', '-', '-', '-', '-', '-', '-', '-', '-', '-'},
-	{'/', '/', '/', '/', '/', '/', '/', '/', '/', '/'},
-	{'\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\', '\\'},
+func colorBg(r, g, b uint8) string {
+	return fmt.Sprintf("\033[48;2;%d;%d;%dm", r, g, b)
 }
 
-var fillChars = []rune{
-	' ', '.', '\'', '`', '^', '"', ',', ':', ';', 'I',
-	'l', '!', 'i', '>', '<', '~', '+', '_', '-', '?',
-	']', '[', '}', '{', '1', ')', '(', '|', '\\', '/',
-	't', 'f', 'j', 'r', 'x', 'n', 'u', 'v', 'c', 'z',
-	'X', 'Y', 'U', 'J', 'C', 'L', 'Q', '0', 'O', 'Z',
-	'm', 'w', 'q', 'p', 'd', 'b', 'k', 'h', 'a', 'o',
-	'*', '#', 'M', 'W', '&', '8', '%', 'B', '@', '█',
+func colorFgBg(fgR, fgG, fgB, bgR, bgG, bgB uint8) string {
+	return fmt.Sprintf("\033[38;2;%d;%d;%d;48;2;%d;%d;%dm",
+		fgR, fgG, fgB, bgR, bgG, bgB)
 }
 
 // ==================== 图像数据结构 ====================
@@ -95,7 +85,7 @@ type ColorData struct {
 	R, G, B       []uint8
 }
 
-// ==================== 图像加载（关键修复） ====================
+// ==================== 图像加载 ====================
 
 func loadImage(filename string) (*ColorData, error) {
 	file, err := os.Open(filename)
@@ -128,13 +118,10 @@ func loadImage(filename string) (*ColorData, error) {
 	g := make([]uint8, total)
 	b := make([]uint8, total)
 
-	// 关键修复：使用 color.NRGBAModel 统一转换
-	// 这样无论 JPEG(YCbCr) 还是 PNG(NRGBA/RGBA) 都能正确获取颜色
 	nrgbaModel := color.NRGBAModel
 
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
-			// 统一转换为 NRGBA（非预乘、无alpha影响的纯色）
 			c := nrgbaModel.Convert(img.At(x, y)).(color.NRGBA)
 			idx := y*width + x
 
@@ -142,7 +129,6 @@ func loadImage(filename string) (*ColorData, error) {
 			g[idx] = c.G
 			b[idx] = c.B
 
-			// 使用标准亮度公式（基于0-255范围）
 			gray[idx] = (0.2126*float64(c.R) + 0.7152*float64(c.G) + 0.0722*float64(c.B)) / 255.0
 		}
 	}
@@ -153,7 +139,7 @@ func loadImage(filename string) (*ColorData, error) {
 // ==================== 图像缩放 ====================
 
 func resizeImageBilinear(src *ColorData, newWidth, newHeight int) *ColorData {
-	if newWidth <= 0 || newHeight <= 0 {
+	if newWidth <= 1 || newHeight <= 1 {
 		return src
 	}
 	if newWidth == src.Width && newHeight == src.Height {
@@ -201,11 +187,9 @@ func resizeImageBilinear(src *ColorData, newWidth, newHeight int) *ColorData {
 
 			dstIdx := y*newWidth + x
 
-			// 灰度插值
 			dstGray[dstIdx] = src.Gray[idx00]*w00 + src.Gray[idx01]*w01 +
 				src.Gray[idx10]*w10 + src.Gray[idx11]*w11
 
-			// 颜色插值（使用float64避免精度丢失）
 			dstR[dstIdx] = uint8(math.Round(
 				float64(src.R[idx00])*w00 + float64(src.R[idx01])*w01 +
 					float64(src.R[idx10])*w10 + float64(src.R[idx11])*w11))
@@ -248,7 +232,6 @@ func gaussianBlurGray(gray []float64, width, height int, sigma float64) []float6
 	result := make([]float64, width*height)
 	temp := make([]float64, width*height)
 
-	// 水平模糊
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			var s float64
@@ -265,7 +248,6 @@ func gaussianBlurGray(gray []float64, width, height int, sigma float64) []float6
 		}
 	}
 
-	// 垂直模糊
 	for y := 0; y < height; y++ {
 		for x := 0; x < width; x++ {
 			var s float64
@@ -326,10 +308,9 @@ func sobelGradient(gray []float64, width, height int) (gx, gy []float64) {
 // ==================== ASCII渲染 ====================
 
 type Pixel struct {
-	Char rune
-	R    uint8
-	G    uint8
-	B    uint8
+	Char          rune
+	R, G, B       uint8 // 前景色
+	BgR, BgG, BgB uint8 // 背景色
 }
 
 type ASCIIRenderer struct {
@@ -347,76 +328,91 @@ func NewASCIIRenderer(width, height int) *ASCIIRenderer {
 
 func (r *ASCIIRenderer) Render(imgData *ColorData, exposure, attenuation float64) {
 	edges := differenceOfGaussians(imgData.Gray, imgData.Width, imgData.Height, 0.8, 1.6, 0.08)
-	gx, gy := sobelGradient(imgData.Gray, imgData.Width, imgData.Height)
 
-	for y := 0; y < imgData.Height && y < r.height; y++ {
-		for x := 0; x < imgData.Width && x < r.width; x++ {
-			idx := y*imgData.Width + x
-			outIdx := y*r.width + x
-
-			luminance := imgData.Gray[idx]
-			pr := imgData.R[idx]
-			pg := imgData.G[idx]
-			pb := imgData.B[idx]
-
-			var char rune
-
-			if edges[idx] > 0.5 {
-				gxVal := gx[idx]
-				gyVal := gy[idx]
-
-				if math.Abs(gxVal) > 0.01 || math.Abs(gyVal) > 0.01 {
-					theta := math.Atan2(gyVal, gxVal)
-					absTheta := math.Abs(theta)
-
-					var direction int
-					if absTheta < 0.4 || absTheta > 2.74 {
-						direction = 0
-					} else if absTheta > 1.17 && absTheta < 1.97 {
-						direction = 1
-					} else if theta > 0 {
-						direction = 2
-					} else {
-						direction = 3
-					}
-
-					lumIdx := clampInt(int(luminance*9.99), 0, 9)
-					char = edgeChars[direction][lumIdx]
-
-					// 边缘直接使用原始颜色
-					r.pixels[outIdx] = Pixel{char, pr, pg, pb}
-					continue
-				}
+	for y := 0; y < r.height; y++ {
+		for x := 0; x < r.width && x < imgData.Width; x++ {
+			// 钳位：确保不越界
+			imgY1 := y * 2
+			if imgY1 >= imgData.Height {
+				imgY1 = imgData.Height - 1
+			}
+			imgY2 := imgY1 + 1
+			if imgY2 >= imgData.Height {
+				imgY2 = imgData.Height - 1
 			}
 
-			// 填充区域
-			adjLum := math.Pow(luminance*exposure, attenuation)
-			charIdx := clampInt(int(adjLum*float64(len(fillChars)-1)), 0, len(fillChars)-1)
-			char = fillChars[charIdx]
+			idx1 := imgY1*imgData.Width + x
+			idx2 := imgY2*imgData.Width + x
 
-			// 直接使用原始颜色，不做额外调整
-			r.pixels[outIdx] = Pixel{char, pr, pg, pb}
+			lum1 := imgData.Gray[idx1]
+			r1, g1, b1 := imgData.R[idx1], imgData.G[idx1], imgData.B[idx1]
+			edge1 := edges[idx1] > 0.5
+
+			lum2 := imgData.Gray[idx2]
+			r2, g2, b2 := imgData.R[idx2], imgData.G[idx2], imgData.B[idx2]
+			edge2 := edges[idx2] > 0.5
+
+			adjLum1 := math.Pow(lum1*exposure, attenuation)
+			adjLum2 := math.Pow(lum2*exposure, attenuation)
+
+			var char rune
+			var fgR, fgG, fgB uint8
+			var bgR, bgG, bgB uint8
+
+			if !edge1 && !edge2 {
+				if adjLum1 >= adjLum2 {
+					char = '▀'
+					fgR, fgG, fgB = r1, g1, b1
+					bgR, bgG, bgB = r2, g2, b2
+				} else {
+					char = '▄'
+					fgR, fgG, fgB = r2, g2, b2
+					bgR, bgG, bgB = r1, g1, b1
+				}
+			} else {
+				char = '█'
+				fgR = uint8((int(r1) + int(r2)) / 2)
+				fgG = uint8((int(g1) + int(g2)) / 2)
+				fgB = uint8((int(b1) + int(b2)) / 2)
+				bgR, bgG, bgB = 0, 0, 0
+			}
+
+			outIdx := y*r.width + x
+			r.pixels[outIdx] = Pixel{
+				Char: char,
+				R:    fgR, G: fgG, B: fgB,
+				BgR: bgR, BgG: bgG, BgB: bgB,
+			}
 		}
 	}
 }
 
 func (r *ASCIIRenderer) String() string {
 	var builder strings.Builder
-	builder.Grow(r.width*r.height*20 + r.height)
+	builder.Grow(r.width*r.height*30 + r.height)
 
-	prevR, prevG, prevB := uint8(255), uint8(255), uint8(255)
+	prevFgR, prevFgG, prevFgB := uint8(255), uint8(255), uint8(255)
+	prevBgR, prevBgG, prevBgB := uint8(0), uint8(0), uint8(0)
 	first := true
 
 	for y := 0; y < r.height; y++ {
 		for x := 0; x < r.width; x++ {
 			p := r.pixels[y*r.width+x]
 
-			// 颜色变化时才写入转义码
-			if first || p.R != prevR || p.G != prevG || p.B != prevB {
+			fgChanged := first || p.R != prevFgR || p.G != prevFgG || p.B != prevFgB
+			bgChanged := first || p.BgR != prevBgR || p.BgG != prevBgG || p.BgB != prevBgB
+
+			if fgChanged && bgChanged {
+				builder.WriteString(colorFgBg(p.R, p.G, p.B, p.BgR, p.BgG, p.BgB))
+			} else if fgChanged {
 				builder.WriteString(colorFg(p.R, p.G, p.B))
-				prevR, prevG, prevB = p.R, p.G, p.B
-				first = false
+			} else if bgChanged {
+				builder.WriteString(colorBg(p.BgR, p.BgG, p.BgB))
 			}
+
+			prevFgR, prevFgG, prevFgB = p.R, p.G, p.B
+			prevBgR, prevBgG, prevBgB = p.BgR, p.BgG, p.BgB
+			first = false
 
 			builder.WriteRune(p.Char)
 		}
@@ -446,32 +442,49 @@ func clampInt(v, min, max int) int {
 }
 
 // ==================== 自适应缩放 ====================
+// 每个终端格子 = 1列 × 2行像素（半块字符）
+// 所以把终端高度视为 termHeight*2 来计算等价缩放比
 
 func calculateOutputSize(imgWidth, imgHeight, termWidth, termHeight int) (int, int) {
 	imgAspect := float64(imgWidth) / float64(imgHeight)
-	termAspect := float64(termWidth) / float64(termHeight*2)
+
+	// 有效终端高度（像素行）= 字符行数 × 2
+	effectiveHeight := termHeight * 2
+	cellAspect := float64(termWidth) / float64(effectiveHeight)
 
 	var outWidth, outHeight int
 
-	if imgAspect > termAspect {
+	if imgAspect > cellAspect {
+		// 图像更宽，以终端宽度为准
 		outWidth = termWidth - 2
-		outHeight = int(float64(outWidth) / imgAspect / 2)
+		outHeight = int(math.Round(float64(outWidth) / imgAspect))
 	} else {
-		outHeight = termHeight - 2
-		outWidth = int(float64(outHeight) * imgAspect * 2)
+		// 图像更高，以终端高度为准
+		outHeight = effectiveHeight - 4
+		outWidth = int(math.Round(float64(outHeight) * imgAspect))
+	}
+
+	// 确保高度为偶数（每个字符行 = 2像素行）
+	if outHeight%2 != 0 {
+		outHeight--
+	}
+
+	// 二次约束：确保渲染行数不超过终端
+	rendererHeight := outHeight / 2
+	if rendererHeight > termHeight-2 {
+		rendererHeight = termHeight - 2
+		outHeight = rendererHeight * 2
+		outWidth = int(math.Round(float64(outHeight) * imgAspect))
 	}
 
 	if outWidth > termWidth-2 {
 		outWidth = termWidth - 2
 	}
-	if outHeight > termHeight-2 {
-		outHeight = termHeight - 2
-	}
 	if outWidth < 10 {
 		outWidth = 10
 	}
-	if outHeight < 5 {
-		outHeight = 5
+	if outHeight < 10 {
+		outHeight = 10
 	}
 
 	return outWidth, outHeight
@@ -508,13 +521,17 @@ func main() {
 		imgData.Width, imgData.Height,
 		termSize.Width, termSize.Height,
 	)
-	fmt.Printf("输出尺寸: %dx%d\n", outWidth, outHeight)
+	fmt.Printf("输出像素: %dx%d\n", outWidth, outHeight)
 
 	fmt.Println("缩放图像...")
 	scaledData := resizeImageBilinear(imgData, outWidth, outHeight)
 
+	// 渲染器高度 = 像素行数 / 2（每个字符行编码2个像素行）
+	rendererHeight := outHeight / 2
+	fmt.Printf("渲染尺寸: %dx%d 字符 (%d 像素行)\n", outWidth, rendererHeight, outHeight)
+
 	fmt.Println("渲染彩色ASCII艺术...")
-	renderer := NewASCIIRenderer(outWidth, outHeight)
+	renderer := NewASCIIRenderer(outWidth, rendererHeight)
 	renderer.Render(scaledData, 1.0, 0.85)
 
 	clearScreen()
