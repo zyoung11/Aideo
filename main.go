@@ -52,25 +52,11 @@ const (
 	RESET_COLORS = "\033[0m"
 )
 
-func clearScreen() {
-	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
-}
-
-func hideCursor() {
-	fmt.Print(HIDE_CURSOR)
-}
-
-func showCursor() {
-	fmt.Print(SHOW_CURSOR)
-}
-
-func colorFg(r, g, b uint8) string {
-	return fmt.Sprintf("\033[38;2;%d;%d;%dm", r, g, b)
-}
-
-func colorBg(r, g, b uint8) string {
-	return fmt.Sprintf("\033[48;2;%d;%d;%dm", r, g, b)
-}
+func clearScreen()                 { fmt.Print(CLEAR_SCREEN + CURSOR_HOME) }
+func hideCursor()                  { fmt.Print(HIDE_CURSOR) }
+func showCursor()                  { fmt.Print(SHOW_CURSOR) }
+func colorFg(r, g, b uint8) string { return fmt.Sprintf("\033[38;2;%d;%d;%dm", r, g, b) }
+func colorBg(r, g, b uint8) string { return fmt.Sprintf("\033[48;2;%d;%d;%dm", r, g, b) }
 
 func colorFgBg(fgR, fgG, fgB, bgR, bgG, bgB uint8) string {
 	return fmt.Sprintf("\033[38;2;%d;%d;%d;48;2;%d;%d;%dm",
@@ -205,189 +191,157 @@ func resizeImageBilinear(src *ColorData, newWidth, newHeight int) *ColorData {
 	return &ColorData{newWidth, newHeight, dstGray, dstR, dstG, dstB}
 }
 
-// ==================== 高斯模糊 ====================
+// ==================== Braille 八分块渲染 ====================
+//
+// 每个 Braille 字符覆盖 2列 × 4行 = 8 个像素点
+//
+//	Unicode Braille 点位布局:
+//	  Dot1(0x01)  Dot4(0x08)    row 0
+//	  Dot2(0x02)  Dot5(0x10)    row 1
+//	  Dot3(0x04)  Dot6(0x20)    row 2
+//	  Dot7(0x40)  Dot8(0x80)    row 3
+//
+// 基址 U+2800，按位或叠加点位掩码得到字符
 
-func gaussianBlurGray(gray []float64, width, height int, sigma float64) []float64 {
-	kernelSize := int(math.Ceil(sigma * 3))
-	if kernelSize%2 == 0 {
-		kernelSize++
-	}
-	if kernelSize < 3 {
-		kernelSize = 3
-	}
+var brailleDotMasks = [4][2]uint8{
+	{0x01, 0x08},
+	{0x02, 0x10},
+	{0x04, 0x20},
+	{0x40, 0x80},
+}
 
-	kernel := make([]float64, kernelSize)
-	sum := 0.0
-	center := kernelSize / 2
-
-	for i := 0; i < kernelSize; i++ {
-		x := float64(i - center)
-		kernel[i] = math.Exp(-(x * x) / (2 * sigma * sigma))
-		sum += kernel[i]
-	}
-	for i := range kernel {
-		kernel[i] /= sum
-	}
-
-	result := make([]float64, width*height)
-	temp := make([]float64, width*height)
-
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			var s float64
-			for kx := -center; kx <= center; kx++ {
-				px := x + kx
-				if px < 0 {
-					px = 0
-				} else if px >= width {
-					px = width - 1
-				}
-				s += gray[y*width+px] * kernel[kx+center]
+func getBrailleChar(dots [4][2]bool) rune {
+	var mask uint8
+	for r := 0; r < 4; r++ {
+		for c := 0; c < 2; c++ {
+			if dots[r][c] {
+				mask |= brailleDotMasks[r][c]
 			}
-			temp[y*width+x] = s
 		}
 	}
-
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
-			var s float64
-			for ky := -center; ky <= center; ky++ {
-				py := y + ky
-				if py < 0 {
-					py = 0
-				} else if py >= height {
-					py = height - 1
-				}
-				s += temp[py*width+x] * kernel[ky+center]
-			}
-			result[y*width+x] = s
-		}
-	}
-
-	return result
+	return rune(0x2800 + int(mask))
 }
 
-// ==================== 边缘检测 ====================
-
-func differenceOfGaussians(gray []float64, width, height int, sigma1, sigma2, threshold float64) []float64 {
-	blur1 := gaussianBlurGray(gray, width, height, sigma1)
-	blur2 := gaussianBlurGray(gray, width, height, sigma2)
-
-	edges := make([]float64, width*height)
-	for i := range edges {
-		diff := blur1[i] - blur2[i]
-		if diff >= threshold {
-			edges[i] = 1.0
-		}
-	}
-	return edges
-}
-
-func sobelGradient(gray []float64, width, height int) (gx, gy []float64) {
-	gx = make([]float64, width*height)
-	gy = make([]float64, width*height)
-
-	for y := 1; y < height-1; y++ {
-		for x := 1; x < width-1; x++ {
-			tl := gray[(y-1)*width+(x-1)]
-			tm := gray[(y-1)*width+x]
-			tr := gray[(y-1)*width+(x+1)]
-			ml := gray[y*width+(x-1)]
-			mr := gray[y*width+(x+1)]
-			bl := gray[(y+1)*width+(x-1)]
-			bm := gray[(y+1)*width+x]
-			br := gray[(y+1)*width+(x+1)]
-
-			gx[y*width+x] = -tl - 2*ml - bl + tr + 2*mr + br
-			gy[y*width+x] = -tl - 2*tm - tr + bl + 2*bm + br
-		}
-	}
-	return
-}
-
-// ==================== ASCII渲染 ====================
+// ==================== Braille 渲染器 ====================
 
 type Pixel struct {
 	Char          rune
-	R, G, B       uint8 // 前景色
-	BgR, BgG, BgB uint8 // 背景色
+	R, G, B       uint8 // 前景色（亮点）
+	BgR, BgG, BgB uint8 // 背景色（暗点）
 }
 
-type ASCIIRenderer struct {
-	width, height int
+type BrailleRenderer struct {
+	width, height int // 字符网格尺寸
 	pixels        []Pixel
 }
 
-func NewASCIIRenderer(width, height int) *ASCIIRenderer {
-	return &ASCIIRenderer{
-		width:  width,
-		height: height,
-		pixels: make([]Pixel, width*height),
+func NewBrailleRenderer(charWidth, charHeight int) *BrailleRenderer {
+	return &BrailleRenderer{
+		width:  charWidth,
+		height: charHeight,
+		pixels: make([]Pixel, charWidth*charHeight),
 	}
 }
 
-func (r *ASCIIRenderer) Render(imgData *ColorData, exposure, attenuation float64) {
-	edges := differenceOfGaussians(imgData.Gray, imgData.Width, imgData.Height, 0.8, 1.6, 0.08)
-
-	for y := 0; y < r.height; y++ {
-		for x := 0; x < r.width && x < imgData.Width; x++ {
-			// 钳位：确保不越界
-			imgY1 := y * 2
-			if imgY1 >= imgData.Height {
-				imgY1 = imgData.Height - 1
-			}
-			imgY2 := imgY1 + 1
-			if imgY2 >= imgData.Height {
-				imgY2 = imgData.Height - 1
-			}
-
-			idx1 := imgY1*imgData.Width + x
-			idx2 := imgY2*imgData.Width + x
-
-			lum1 := imgData.Gray[idx1]
-			r1, g1, b1 := imgData.R[idx1], imgData.G[idx1], imgData.B[idx1]
-			edge1 := edges[idx1] > 0.5
-
-			lum2 := imgData.Gray[idx2]
-			r2, g2, b2 := imgData.R[idx2], imgData.G[idx2], imgData.B[idx2]
-			edge2 := edges[idx2] > 0.5
-
-			adjLum1 := math.Pow(lum1*exposure, attenuation)
-			adjLum2 := math.Pow(lum2*exposure, attenuation)
-
-			var char rune
-			var fgR, fgG, fgB uint8
-			var bgR, bgG, bgB uint8
-
-			if !edge1 && !edge2 {
-				if adjLum1 >= adjLum2 {
-					char = '▀'
-					fgR, fgG, fgB = r1, g1, b1
-					bgR, bgG, bgB = r2, g2, b2
-				} else {
-					char = '▄'
-					fgR, fgG, fgB = r2, g2, b2
-					bgR, bgG, bgB = r1, g1, b1
-				}
-			} else {
-				char = '█'
-				fgR = uint8((int(r1) + int(r2)) / 2)
-				fgG = uint8((int(g1) + int(g2)) / 2)
-				fgB = uint8((int(b1) + int(b2)) / 2)
-				bgR, bgG, bgB = 0, 0, 0
-			}
-
-			outIdx := y*r.width + x
-			r.pixels[outIdx] = Pixel{
-				Char: char,
-				R:    fgR, G: fgG, B: fgB,
-				BgR: bgR, BgG: bgG, BgB: bgB,
+// sortFloat8 对 8 个 float64 做原地排序（冒泡，避免 import sort）
+func sortFloat8(a *[8]float64) {
+	for i := 0; i < 7; i++ {
+		for j := i + 1; j < 8; j++ {
+			if a[j] < a[i] {
+				a[i], a[j] = a[j], a[i]
 			}
 		}
 	}
 }
 
-func (r *ASCIIRenderer) String() string {
+func (r *BrailleRenderer) Render(imgData *ColorData, exposure, attenuation float64) {
+	for cy := 0; cy < r.height; cy++ {
+		for cx := 0; cx < r.width; cx++ {
+			var dots [4][2]bool
+			var lums [8]float64
+			var rs [8]uint8
+			var gs [8]uint8
+			var bs [8]uint8
+
+			// 收集 2×4 像素块
+			for dy := 0; dy < 4; dy++ {
+				for dx := 0; dx < 2; dx++ {
+					px := cx*2 + dx
+					py := cy*4 + dy
+
+					if px >= imgData.Width {
+						px = imgData.Width - 1
+					}
+					if py >= imgData.Height {
+						py = imgData.Height - 1
+					}
+
+					idx := py*imgData.Width + px
+					adjLum := math.Pow(imgData.Gray[idx]*exposure, attenuation)
+
+					li := dy*2 + dx
+					lums[li] = adjLum
+					rs[li] = imgData.R[idx]
+					gs[li] = imgData.G[idx]
+					bs[li] = imgData.B[idx]
+				}
+			}
+
+			// 中位数亮度作为分割阈值
+			sorted := lums
+			sortFloat8(&sorted)
+			median := (sorted[3] + sorted[4]) / 2.0
+
+			// 亮 → 前景点，暗 → 背景
+			var fgR, fgG, fgB, bgR, bgG, bgB float64
+			var fgN, bgN int
+
+			for dy := 0; dy < 4; dy++ {
+				for dx := 0; dx < 2; dx++ {
+					li := dy*2 + dx
+					if lums[li] > median {
+						dots[dy][dx] = true
+						fgR += float64(rs[li])
+						fgG += float64(gs[li])
+						fgB += float64(bs[li])
+						fgN++
+					} else {
+						bgR += float64(rs[li])
+						bgG += float64(gs[li])
+						bgB += float64(bs[li])
+						bgN++
+					}
+				}
+			}
+
+			if fgN == 0 {
+				fgN = 1
+			}
+			if bgN == 0 {
+				bgN = 1
+			}
+
+			char := getBrailleChar(dots)
+			// 空白 braille 用普通空格替代，避免某些终端显示异常
+			if char == 0x2800 {
+				char = ' '
+			}
+
+			outIdx := cy*r.width + cx
+			r.pixels[outIdx] = Pixel{
+				Char: char,
+				R:    uint8(fgR / float64(fgN)),
+				G:    uint8(fgG / float64(fgN)),
+				B:    uint8(fgB / float64(fgN)),
+				BgR:  uint8(bgR / float64(bgN)),
+				BgG:  uint8(bgG / float64(bgN)),
+				BgB:  uint8(bgB / float64(bgN)),
+			}
+		}
+	}
+}
+
+func (r *BrailleRenderer) String() string {
 	var builder strings.Builder
 	builder.Grow(r.width*r.height*30 + r.height)
 
@@ -425,66 +379,47 @@ func (r *ASCIIRenderer) String() string {
 	return builder.String()
 }
 
-func (r *ASCIIRenderer) Print() {
+func (r *BrailleRenderer) Print() {
 	fmt.Print(r.String())
 }
 
-// ==================== 工具函数 ====================
-
-func clampInt(v, min, max int) int {
-	if v < min {
-		return min
-	}
-	if v > max {
-		return max
-	}
-	return v
-}
-
 // ==================== 自适应缩放 ====================
-// 每个终端格子 = 1列 × 2行像素（半块字符）
-// 所以把终端高度视为 termHeight*2 来计算等价缩放比
+// Braille 模式：每个字符 = 2列 × 4行像素
+// 终端字符宽高比通常为 1:2，braille 像素恰好为正方形（cw/2 × ch/4 = cw/2 × cw/2）
 
 func calculateOutputSize(imgWidth, imgHeight, termWidth, termHeight int) (int, int) {
-	imgAspect := float64(imgWidth) / float64(imgHeight)
+	availCharW := termWidth - 2
+	availCharH := termHeight - 2
 
-	// 有效终端高度（像素行）= 字符行数 × 2
-	effectiveHeight := termHeight * 2
-	cellAspect := float64(termWidth) / float64(effectiveHeight)
+	// 对应像素分辨率
+	availPixelW := availCharW * 2
+	availPixelH := availCharH * 4
+
+	imgAspect := float64(imgWidth) / float64(imgHeight)
+	cellAspect := float64(availPixelW) / float64(availPixelH)
 
 	var outWidth, outHeight int
 
 	if imgAspect > cellAspect {
-		// 图像更宽，以终端宽度为准
-		outWidth = termWidth - 2
+		// 图像更宽 → 以宽度为约束
+		outWidth = availPixelW
 		outHeight = int(math.Round(float64(outWidth) / imgAspect))
 	} else {
-		// 图像更高，以终端高度为准
-		outHeight = effectiveHeight - 4
+		// 图像更高 → 以高度为约束
+		outHeight = availPixelH
 		outWidth = int(math.Round(float64(outHeight) * imgAspect))
 	}
 
-	// 确保高度为偶数（每个字符行 = 2像素行）
-	if outHeight%2 != 0 {
-		outHeight--
-	}
+	// 像素宽度必须是 2 的倍数，高度必须是 4 的倍数
+	outWidth = (outWidth / 2) * 2
+	outHeight = (outHeight / 4) * 4
 
-	// 二次约束：确保渲染行数不超过终端
-	rendererHeight := outHeight / 2
-	if rendererHeight > termHeight-2 {
-		rendererHeight = termHeight - 2
-		outHeight = rendererHeight * 2
-		outWidth = int(math.Round(float64(outHeight) * imgAspect))
+	// 最小尺寸保护
+	if outWidth < 4 {
+		outWidth = 4
 	}
-
-	if outWidth > termWidth-2 {
-		outWidth = termWidth - 2
-	}
-	if outWidth < 10 {
-		outWidth = 10
-	}
-	if outHeight < 10 {
-		outHeight = 10
+	if outHeight < 8 {
+		outHeight = 8
 	}
 
 	return outWidth, outHeight
@@ -526,12 +461,13 @@ func main() {
 	fmt.Println("缩放图像...")
 	scaledData := resizeImageBilinear(imgData, outWidth, outHeight)
 
-	// 渲染器高度 = 像素行数 / 2（每个字符行编码2个像素行）
-	rendererHeight := outHeight / 2
-	fmt.Printf("渲染尺寸: %dx%d 字符 (%d 像素行)\n", outWidth, rendererHeight, outHeight)
+	charW := outWidth / 2
+	charH := outHeight / 4
+	fmt.Printf("渲染尺寸: %dx%d 字符 (Braille 2×4, 共 %d 像素)\n",
+		charW, charH, charW*charH*8)
 
-	fmt.Println("渲染彩色ASCII艺术...")
-	renderer := NewASCIIRenderer(outWidth, rendererHeight)
+	fmt.Println("渲染 Braille 八分块艺术...")
+	renderer := NewBrailleRenderer(charW, charH)
 	renderer.Render(scaledData, 1.0, 0.85)
 
 	clearScreen()
