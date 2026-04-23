@@ -2,17 +2,22 @@ package main
 
 import (
 	"bufio"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	ffmpeg "github.com/u2takey/ffmpeg-go"
+	"github.com/gopxl/beep/v2"
+	"github.com/gopxl/beep/v2/speaker"
 	"golang.org/x/term"
 )
 
@@ -250,16 +255,16 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	vp.startRow = newStartRow
 }
 
-// ==================== 双缓冲解码器 ====================
+// ==================== 视频解码器（双缓冲） ====================
 
-type decoder struct {
+type videoDecoder struct {
 	reader  io.ReadCloser
-	closeCh chan struct{} // 通知 decoder goroutine 退出
-	doneCh  chan struct{} // decoder goroutine 已退出
+	closeCh chan struct{}
+	doneCh  chan struct{}
 }
 
-// spawnDecoder 启动一个 ffmpeg 解码进程
-func (vp *VideoPlayer) spawnDecoder() *decoder {
+// spawnVideoDecoder 启动一个 ffmpeg 视频解码进程
+func (vp *VideoPlayer) spawnVideoDecoder() *videoDecoder {
 	ffmpegPath := getFFmpegPath()
 	pr, pw := io.Pipe()
 
@@ -276,7 +281,7 @@ func (vp *VideoPlayer) spawnDecoder() *decoder {
 		SetFfmpegPath(ffmpegPath).
 		WithOutput(pw)
 
-	dec := &decoder{
+	dec := &videoDecoder{
 		reader:  pr,
 		closeCh: make(chan struct{}),
 		doneCh:  make(chan struct{}),
@@ -284,7 +289,6 @@ func (vp *VideoPlayer) spawnDecoder() *decoder {
 
 	go func() {
 		defer close(dec.doneCh)
-		// 启动 ffmpeg
 		errCh := make(chan error, 1)
 		go func() {
 			errCh <- stream.Run()
@@ -292,9 +296,7 @@ func (vp *VideoPlayer) spawnDecoder() *decoder {
 
 		select {
 		case <-dec.closeCh:
-			// 被外部关闭：终止 ffmpeg（关闭 pipe 读取端使 ffmpeg 收到 SIGPIPE）
 			pr.Close()
-			// 等待 ffmpeg 退出（忽略错误）
 			<-errCh
 		case err := <-errCh:
 			if err != nil {
@@ -308,10 +310,154 @@ func (vp *VideoPlayer) spawnDecoder() *decoder {
 	return dec
 }
 
-// close 关闭 decoder
-func (d *decoder) close() {
+func (d *videoDecoder) close() {
 	close(d.closeCh)
 	<-d.doneCh
+}
+
+// ==================== 音频解码器 ====================
+
+const (
+	audioSampleRate = 44100
+	audioChannels   = 2
+	audioBitDepth   = 2 // s16le
+	audioFrameSize  = audioChannels * audioBitDepth // 4 bytes per sample
+)
+
+// audioStreamer 实现 beep.Streamer，从 FFmpeg 的 raw PCM pipe 读取音频数据
+// 支持循环播放（双缓冲），也支持静音降噪
+type audioStreamer struct {
+	mu         sync.Mutex
+	filename   string
+	ffmpegPath string
+	outWidth   int
+	outHeight  int
+
+	currentReader io.ReadCloser
+	nextReader    io.ReadCloser
+
+	closeCh chan struct{}
+	closed  bool
+
+	err error
+}
+
+func newAudioStreamer(filename string) *audioStreamer {
+	return &audioStreamer{
+		filename:   filename,
+		ffmpegPath: getFFmpegPath(),
+		closeCh:    make(chan struct{}),
+	}
+}
+
+func (as *audioStreamer) spawnAudioDecoder() io.ReadCloser {
+	pr, pw := io.Pipe()
+
+	stream := ffmpeg.Input(as.filename).
+		Output("pipe:",
+			ffmpeg.KwArgs{
+				"format":  "s16le",
+				"acodec":  "pcm_s16le",
+				"ac":      audioChannels,
+				"ar":      audioSampleRate,
+				"vn":      "",
+				"sn":      "",
+			}).
+		Silent(true).
+		SetFfmpegPath(as.ffmpegPath).
+		WithOutput(pw)
+
+	go func() {
+		err := stream.Run()
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("音频解码错误: %v", err))
+		} else {
+			pw.Close()
+		}
+	}()
+
+	return pr
+}
+
+// ensureNext 确保 have a next reader ready
+func (as *audioStreamer) ensureNext() {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	if as.nextReader == nil && !as.closed {
+		as.nextReader = as.spawnAudioDecoder()
+	}
+}
+
+// Stream 实现 beep.Streamer.Stream
+func (as *audioStreamer) Stream(samples [][2]float64) (n int, ok bool) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	if as.closed {
+		return 0, false
+	}
+
+	// 首次调用时启动第一个解码器
+	if as.currentReader == nil {
+		as.currentReader = as.spawnAudioDecoder()
+		as.nextReader = as.spawnAudioDecoder()
+	}
+
+	buf := make([]byte, len(samples)*audioFrameSize)
+
+	offset := 0
+	for offset < len(buf) {
+		nRead, err := as.currentReader.Read(buf[offset:])
+		offset += nRead
+		if err != nil {
+			// 当前解码器结束，切换到下一个
+			if as.currentReader != nil {
+				as.currentReader.Close()
+			}
+			as.currentReader = as.nextReader
+			as.nextReader = as.spawnAudioDecoder()
+
+			if as.currentReader == nil {
+				as.err = fmt.Errorf("音频解码器不可用")
+				return 0, false
+			}
+
+			// 继续读新解码器的数据
+			offset = 0 // 抛弃之前读的部分，保持同步
+			continue
+		}
+	}
+
+	// 将 s16le bytes 转换为 float64 samples
+	for i := range samples {
+		if i*audioFrameSize+audioFrameSize > len(buf) {
+			break
+		}
+		left := int16(binary.LittleEndian.Uint16(buf[i*audioFrameSize:]))
+		right := int16(binary.LittleEndian.Uint16(buf[i*audioFrameSize+2:]))
+		samples[i][0] = float64(left) / math.MaxInt16
+		samples[i][1] = float64(right) / math.MaxInt16
+	}
+
+	return len(samples), true
+}
+
+func (as *audioStreamer) Err() error {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	return as.err
+}
+
+func (as *audioStreamer) Close() {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	as.closed = true
+	if as.currentReader != nil {
+		as.currentReader.Close()
+	}
+	if as.nextReader != nil {
+		as.nextReader.Close()
+	}
 }
 
 // ==================== 播放循环 ====================
@@ -388,10 +534,18 @@ func (vp *VideoPlayer) startLoop() {
 	var outputBuf strings.Builder
 	outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
-	// 启动第一个解码器
-	currentDec := vp.spawnDecoder()
-	// 预启动第二个解码器（双缓冲）
-	nextDec := vp.spawnDecoder()
+	// 启动音频播放
+	audioStream := newAudioStreamer(vp.filename)
+	err := speaker.Init(beep.SampleRate(audioSampleRate), audioSampleRate/10)
+	if err == nil {
+		speaker.Play(beep.Seq(audioStream, beep.Callback(func() {})))
+	}
+	defer speaker.Close()
+
+	// 启动第一个视频解码器
+	currentDec := vp.spawnVideoDecoder()
+	// 预启动第二个视频解码器（双缓冲）
+	nextDec := vp.spawnVideoDecoder()
 
 	// 清屏一次（只在最开始时）
 	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
@@ -403,29 +557,38 @@ func (vp *VideoPlayer) startLoop() {
 	for {
 		select {
 		case <-vp.quit:
+			audioStream.Close()
 			currentDec.close()
 			nextDec.close()
 			return
 		case <-sigCh:
 			// 窗口变化：丢弃所有解码器，重新开始
+			audioStream.Close()
 			currentDec.close()
 			nextDec.close()
 			vp.updateTerminalSizeFromSigwinch()
 			// 重新计算 frameSize
 			frameSize = vp.outWidth * vp.outHeight * 4
 			outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
-			currentDec = vp.spawnDecoder()
-			nextDec = vp.spawnDecoder()
+			audioStream = newAudioStreamer(vp.filename)
+			err = speaker.Init(beep.SampleRate(audioSampleRate), audioSampleRate/10)
+			if err == nil {
+				speaker.Play(beep.Seq(audioStream, beep.Callback(func() {})))
+			}
+			currentDec = vp.spawnVideoDecoder()
+			nextDec = vp.spawnVideoDecoder()
 			// 清屏消除残留
 			fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 			continue
 		case key, ok := <-keyCh:
 			if !ok {
+				audioStream.Close()
 				currentDec.close()
 				nextDec.close()
 				return
 			}
 			if key == 'q' || key == 'Q' || key == 27 {
+				audioStream.Close()
 				currentDec.close()
 				nextDec.close()
 				return
@@ -443,7 +606,7 @@ func (vp *VideoPlayer) startLoop() {
 			// 交换：nextDec 变成 currentDec
 			currentDec = nextDec
 			// 启动新的 nextDec
-			nextDec = vp.spawnDecoder()
+			nextDec = vp.spawnVideoDecoder()
 
 			// 继续读（不执行任何清屏操作）
 			continue
