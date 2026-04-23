@@ -431,23 +431,29 @@ func main() {
 	// 顶层恢复，确保终端状态恢复
 	defer func() {
 		if r := recover(); r != nil {
-			// 恢复终端状态
 			fmt.Print(ENABLE_MOUSE)
 			fmt.Print(SHOW_CURSOR)
 			fmt.Print(LEAVE_ALTERNATE)
-			// 打印错误信息
 			fmt.Fprintf(os.Stderr, "程序发生 panic: %v\n", r)
 			os.Exit(1)
 		}
 	}()
 
 	if len(os.Args) < 2 {
-		fmt.Println("用法: go run main.go <图片文件.jpg|png>")
+		fmt.Println("用法: go run main.go <图片/视频文件>")
+		fmt.Println("支持格式: .jpg .jpeg .png .mp4 .mov .mkv")
 		fmt.Println("示例: go run main.go photo.jpg")
+		fmt.Println("示例: go run main.go video.mp4")
 		os.Exit(1)
 	}
 
 	filename := os.Args[1]
+
+	// 如果是视频文件，直接播放视频
+	if isVideoFile(filename) {
+		initVideoPlayback(filename)
+		return
+	}
 
 	termSize, err := getTerminalSize()
 	if err != nil {
