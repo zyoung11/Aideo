@@ -263,19 +263,26 @@ type videoDecoder struct {
 }
 
 // spawnVideoDecoder 启动一个 ffmpeg 视频解码进程
-func (vp *VideoPlayer) spawnVideoDecoder() *videoDecoder {
+// seekSecs 为 0 表示从头开始，>0 表示从该秒附近开始解码
+// 使用 output 端 -ss 实现精确 seek（fasteek），可确保输出的第一帧就是目标时间附近的帧
+func (vp *VideoPlayer) spawnVideoDecoder(seekSecs float64) *videoDecoder {
 	ffmpegPath := getFFmpegPath()
 	pr, pw := io.Pipe()
 
+	outputArgs := ffmpeg.KwArgs{
+		"format":   "rawvideo",
+		"pix_fmt":  "rgba",
+		"s":        fmt.Sprintf("%dx%d", vp.outWidth, vp.outHeight),
+		"an":       "",
+		"sn":       "",
+	}
+	if seekSecs > 0 {
+		// output 端 -ss = 精确 seek，ffmpeg 会解码但丢弃前面的帧，直接输出目标位置的帧
+		outputArgs["ss"] = fmt.Sprintf("%.3f", seekSecs)
+	}
+
 	stream := ffmpeg.Input(vp.filename).
-		Output("pipe:",
-			ffmpeg.KwArgs{
-				"format":   "rawvideo",
-				"pix_fmt":  "rgba",
-				"s":        fmt.Sprintf("%dx%d", vp.outWidth, vp.outHeight),
-				"an":       "",
-				"sn":       "",
-			}).
+		Output("pipe:", outputArgs).
 		Silent(true).
 		SetFfmpegPath(ffmpegPath).
 		WithOutput(pw)
@@ -553,10 +560,13 @@ func (vp *VideoPlayer) startLoop() {
 		speaker.Play(beep.Seq(audioStream, beep.Callback(func() {})))
 	}
 
+	// 帧计数和当前播放时间（用于 resize seek）
+	var frameCount int64
+
 	// 启动第一个视频解码器
-	currentDec := vp.spawnVideoDecoder()
+	currentDec := vp.spawnVideoDecoder(0)
 	// 预启动第二个视频解码器（双缓冲）
-	nextDec := vp.spawnVideoDecoder()
+	nextDec := vp.spawnVideoDecoder(0)
 
 	// 清屏一次（只在最开始时）
 	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
@@ -594,31 +604,58 @@ func (vp *VideoPlayer) startLoop() {
 			}
 			resizePending = false
 
-			// 窗口变化：丢弃所有解码器，重新开始
-			closer()
+			// 记录当前播放时间
+			targetFrame := frameCount
+			currentTime := float64(frameCount) / vp.fps
+
+			// 精确 seek 到当前时间往前 0.15 秒（output 端 -ss 会解码到目标位置输出）
+			seekTime := currentTime - 0.15
+			if seekTime < 0 {
+				seekTime = 0
+			}
+
+			// 关闭旧的视频解码器
 			currentDec.close()
 			nextDec.close()
+
+			// 更新终端尺寸
 			vp.updateTerminalSizeFromSigwinch()
 			// 重新计算 frameSize
 			frameSize = vp.outWidth * vp.outHeight * 4
 			outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
-			// 重新创建音频流（不重新 Init speaker，只在第一次初始化）
-			if hasAudio {
-				s := newAudioStreamer(vp.filename)
-				audioStream = s
-				closer = func() { s.Close() }
-				if speakerInitialized {
-					speaker.Play(beep.Seq(audioStream, beep.Callback(func() {})))
-				}
-			} else {
-				s := &noopAudioStreamer{}
-				audioStream = s
-				closer = func() { s.Close() }
+			// 从 seekTime 处启动新的解码器
+			currentDec = vp.spawnVideoDecoder(seekTime)
+			nextDec = vp.spawnVideoDecoder(seekTime)
+
+			// 不重建音频流，保持连续播放
+
+			// 追帧：快速解码并丢弃帧，直到追上目标帧号
+			// seekTime 到 currentTime 之间的帧都要丢掉
+			seekFrame := int64(seekTime * vp.fps)
+			if seekFrame < 0 {
+				seekFrame = 0
+			}
+			framesToCatch := int(targetFrame - seekFrame)
+			if framesToCatch < 0 {
+				framesToCatch = 0
 			}
 
-			currentDec = vp.spawnVideoDecoder()
-			nextDec = vp.spawnVideoDecoder()
+			catchUpBuf := make([]byte, frameSize)
+			for i := 0; i < framesToCatch; i++ {
+				n, err := io.ReadFull(currentDec.reader, catchUpBuf)
+				if err != nil || n != frameSize {
+					// 当前解码器异常，切换到 nextDec
+					currentDec.close()
+					currentDec = nextDec
+					nextDec = vp.spawnVideoDecoder(seekTime)
+					// 从新解码器继续追
+					i--
+					continue
+				}
+				frameCount++
+			}
+
 			// 清屏消除残留
 			fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 			continue
@@ -654,11 +691,14 @@ func (vp *VideoPlayer) startLoop() {
 			// 交换：nextDec 变成 currentDec
 			currentDec = nextDec
 			// 启动新的 nextDec
-			nextDec = vp.spawnVideoDecoder()
+			nextDec = vp.spawnVideoDecoder(0)
 
 			// 继续读（不执行任何清屏操作）
 			continue
 		}
+
+		// 帧计数（用于 resize seek）
+		frameCount++
 
 		// 渲染
 		imgData := rawRGBAToColorData(buf, vp.outWidth, vp.outHeight)
