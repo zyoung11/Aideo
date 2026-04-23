@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
-	"unsafe"
 
 	"golang.org/x/term"
 )
@@ -24,26 +23,13 @@ type TerminalSize struct {
 }
 
 func getTerminalSize() (*TerminalSize, error) {
-	type winsize struct {
-		Row    uint16
-		Col    uint16
-		Xpixel uint16
-		Ypixel uint16
+	width, height, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return nil, err
 	}
-
-	ws := &winsize{}
-	retCode, _, errno := syscall.Syscall(syscall.SYS_IOCTL,
-		uintptr(syscall.Stdout),
-		uintptr(syscall.TIOCGWINSZ),
-		uintptr(unsafe.Pointer(ws)))
-
-	if int(retCode) == -1 {
-		return nil, fmt.Errorf("syscall failed: %v", errno)
-	}
-
 	return &TerminalSize{
-		Width:  int(ws.Col),
-		Height: int(ws.Row),
+		Width:  width,
+		Height: height,
 	}, nil
 }
 
@@ -479,20 +465,29 @@ func main() {
 	}
 	fmt.Printf("原始尺寸: %dx%d\n", imgData.Width, imgData.Height)
 
-	outWidth, outHeight := calculateOutputSize(
+	// 声明变量，以便在窗口大小变化时访问
+	var (
+		outWidth, outHeight int
+		scaledData          *ColorData
+		charW, charH        int
+		renderer            *BrailleRenderer
+	)
+
+	// 初始化渲染
+	outWidth, outHeight = calculateOutputSize(
 		imgData.Width, imgData.Height,
 		termSize.Width, termSize.Height,
 	)
 	fmt.Printf("输出像素: %dx%d\n", outWidth, outHeight)
 
-	scaledData := resizeImageBilinear(imgData, outWidth, outHeight)
+	scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
 
-	charW := outWidth / 2
-	charH := outHeight / 4
+	charW = outWidth / 2
+	charH = outHeight / 4
 	fmt.Printf("渲染尺寸: %dx%d 字符 (Braille 2×4, 共 %d 像素)\n",
 		charW, charH, charW*charH*8)
 
-	renderer := NewBrailleRenderer(charW, charH)
+	renderer = NewBrailleRenderer(charW, charH)
 	renderer.Render(scaledData, 1.0, 0.85)
 
 	// 进入 alternate screen 并隐藏光标，禁用鼠标报告
@@ -506,9 +501,40 @@ func main() {
 		fmt.Print(LEAVE_ALTERNATE)
 	}()
 
-	// 清屏并渲染图像
+	// 计算居中位置
+	startCol := (termSize.Width - charW) / 2
+	startRow := (termSize.Height - charH) / 2
+
+	// 确保位置不为负数
+	if startCol < 0 {
+		startCol = 0
+	}
+	if startRow < 0 {
+		startRow = 0
+	}
+
+	// 清屏
 	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
-	renderer.Print()
+
+	// 渲染图像到居中位置
+	imageStr := renderer.String()
+	lines := strings.Split(imageStr, "\n")
+
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		// 移动到指定位置并输出该行
+		fmt.Printf("\033[%d;%dH%s", startRow+i+1, startCol+1, line)
+	}
+
+	// 清除图片右侧的空白区域
+	if charW > 0 && startCol+charW <= termSize.Width {
+		clearStartCol := startCol + charW + 1
+		for row := startRow + 1; row <= startRow+charH; row++ {
+			fmt.Printf("\033[%d;%dH\033[K", row, clearStartCol)
+		}
+	}
 
 	// 在底部显示提示
 	fmt.Printf("\033[%d;1H\033[90m[ 按 q 或 ESC 退出 ]%s", termSize.Height, RESET_COLORS)
@@ -587,7 +613,7 @@ func main() {
 				}
 				termSize = newSize
 				// 重新计算输出尺寸
-				outWidth, outHeight := calculateOutputSize(
+				outWidth, outHeight = calculateOutputSize(
 					imgData.Width, imgData.Height,
 					termSize.Width, termSize.Height,
 				)
@@ -598,9 +624,39 @@ func main() {
 				// 重新创建渲染器并渲染
 				renderer = NewBrailleRenderer(charW, charH)
 				renderer.Render(scaledData, 1.0, 0.85)
-				// 清屏并重新显示
+				// 计算新的居中位置
+				newStartCol := (termSize.Width - charW) / 2
+				newStartRow := (termSize.Height - charH) / 2
+				if newStartCol < 0 {
+					newStartCol = 0
+				}
+				if newStartRow < 0 {
+					newStartRow = 0
+				}
+
+				// 清屏
 				fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
-				renderer.Print()
+
+				// 渲染图像到居中位置
+				imageStr := renderer.String()
+				lines := strings.Split(imageStr, "\n")
+
+				for i, line := range lines {
+					if line == "" {
+						continue
+					}
+					// 移动到指定位置并输出该行
+					fmt.Printf("\033[%d;%dH%s", newStartRow+i+1, newStartCol+1, line)
+				}
+
+				// 清除图片右侧的空白区域
+				if charW > 0 && newStartCol+charW <= termSize.Width {
+					clearStartCol := newStartCol + charW + 1
+					for row := newStartRow + 1; row <= newStartRow+charH; row++ {
+						fmt.Printf("\033[%d;%dH\033[K", row, clearStartCol)
+					}
+				}
+
 				fmt.Printf("\033[%d;1H\033[90m[ 按 q 或 ESC 退出 ]%s", termSize.Height, RESET_COLORS)
 			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP:
 				return
