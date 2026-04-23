@@ -163,10 +163,10 @@ func rawRGBAToColorData(raw []byte, width, height int) *ColorData {
 
 type VideoPlayer struct {
 	filename    string
-	srcWidth    int       // 原始视频宽度（探测时获得）
-	srcHeight   int       // 原始视频高度（探测时获得）
-	outWidth    int       // 当前解码输出宽度
-	outHeight   int       // 当前解码输出高度
+	srcWidth    int
+	srcHeight   int
+	outWidth    int
+	outHeight   int
 	charW       int
 	charH       int
 
@@ -183,17 +183,11 @@ type VideoPlayer struct {
 	startRow    int
 	startCol    int
 
-	renderer     *BrailleRenderer
-	resizeNeeded bool // 窗口变化标记，下一轮循环重新解码
+	renderer    *BrailleRenderer
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
-	// 初始计算输出尺寸
-	outWidth, outHeight := calculateOutputSize(
-		srcWidth, srcHeight,
-		termWidth, termHeight,
-	)
-
+	outWidth, outHeight := calculateOutputSize(srcWidth, srcHeight, termWidth, termHeight)
 	charW := outWidth / 2
 	charH := outHeight / 4
 
@@ -207,18 +201,18 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 	}
 
 	return &VideoPlayer{
-		filename:  filename,
-		srcWidth:  srcWidth,
-		srcHeight: srcHeight,
-		outWidth:  outWidth,
-		outHeight: outHeight,
-		charW:     charW,
-		charH:     charH,
-		quit:      make(chan struct{}),
-		done:      make(chan struct{}),
-		fps:       30,
-		frameTime: time.Second / 30,
-		exposure:  1.0,
+		filename:    filename,
+		srcWidth:    srcWidth,
+		srcHeight:   srcHeight,
+		outWidth:    outWidth,
+		outHeight:   outHeight,
+		charW:       charW,
+		charH:       charH,
+		quit:        make(chan struct{}),
+		done:        make(chan struct{}),
+		fps:         30,
+		frameTime:   time.Second / 30,
+		exposure:    1.0,
 		attenuation: 0.85,
 		termWidth:   termWidth,
 		termHeight:  termHeight,
@@ -238,17 +232,11 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 		newWidth, newHeight,
 	)
 
-	// 如果尺寸变了，标记需要重新解码
-	if newOutW != vp.outWidth || newOutH != vp.outHeight {
-		vp.outWidth = newOutW
-		vp.outHeight = newOutH
-		vp.charW = newOutW / 2
-		vp.charH = newOutH / 4
-		vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
-		vp.resizeNeeded = true
-	} else {
-		vp.resizeNeeded = false
-	}
+	vp.outWidth = newOutW
+	vp.outHeight = newOutH
+	vp.charW = newOutW / 2
+	vp.charH = newOutH / 4
+	vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
 
 	newStartCol := (newWidth - vp.charW) / 2
 	newStartRow := (newHeight - vp.charH) / 2
@@ -262,8 +250,16 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	vp.startRow = newStartRow
 }
 
-// launchDecoder 启动 ffmpeg 解码进程，返回 frame reader
-func (vp *VideoPlayer) launchDecoder() io.ReadCloser {
+// ==================== 双缓冲解码器 ====================
+
+type decoder struct {
+	reader  io.ReadCloser
+	closeCh chan struct{} // 通知 decoder goroutine 退出
+	doneCh  chan struct{} // decoder goroutine 已退出
+}
+
+// spawnDecoder 启动一个 ffmpeg 解码进程
+func (vp *VideoPlayer) spawnDecoder() *decoder {
 	ffmpegPath := getFFmpegPath()
 	pr, pw := io.Pipe()
 
@@ -280,19 +276,47 @@ func (vp *VideoPlayer) launchDecoder() io.ReadCloser {
 		SetFfmpegPath(ffmpegPath).
 		WithOutput(pw)
 
+	dec := &decoder{
+		reader:  pr,
+		closeCh: make(chan struct{}),
+		doneCh:  make(chan struct{}),
+	}
+
 	go func() {
-		err := stream.Run()
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("ffmpeg 错误: %v", err))
-		} else {
-			pw.Close()
+		defer close(dec.doneCh)
+		// 启动 ffmpeg
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- stream.Run()
+		}()
+
+		select {
+		case <-dec.closeCh:
+			// 被外部关闭：终止 ffmpeg（关闭 pipe 读取端使 ffmpeg 收到 SIGPIPE）
+			pr.Close()
+			// 等待 ffmpeg 退出（忽略错误）
+			<-errCh
+		case err := <-errCh:
+			if err != nil {
+				pw.CloseWithError(fmt.Errorf("ffmpeg 错误: %v", err))
+			} else {
+				pw.Close()
+			}
 		}
 	}()
 
-	return pr
+	return dec
 }
 
-// startLoop 循环播放，直到用户退出
+// close 关闭 decoder
+func (d *decoder) close() {
+	close(d.closeCh)
+	<-d.doneCh
+}
+
+// ==================== 播放循环 ====================
+
+// startLoop 循环播放，使用双缓冲 decoder 实现无缝循环
 func (vp *VideoPlayer) startLoop() {
 	defer close(vp.done)
 
@@ -303,8 +327,10 @@ func (vp *VideoPlayer) startLoop() {
 
 	// 键盘输入 goroutine
 	keyCh := make(chan byte, 10)
+	keyDone := make(chan struct{})
 	go func() {
 		defer func() { recover() }()
+		defer close(keyDone)
 
 		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 		if err != nil {
@@ -358,110 +384,114 @@ func (vp *VideoPlayer) startLoop() {
 		}
 	}()
 
+	frameSize := vp.outWidth * vp.outHeight * 4
 	var outputBuf strings.Builder
+	outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
-	// 主循环（循环播放，窗口变化时重新解码）
+	// 启动第一个解码器
+	currentDec := vp.spawnDecoder()
+	// 预启动第二个解码器（双缓冲）
+	nextDec := vp.spawnDecoder()
+
+	// 清屏一次（只在最开始时）
+	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
+
+	fpsTicker := time.NewTicker(vp.frameTime)
+	defer fpsTicker.Stop()
+
+	// 主帧循环
 	for {
 		select {
 		case <-vp.quit:
+			currentDec.close()
+			nextDec.close()
 			return
+		case <-sigCh:
+			// 窗口变化：丢弃所有解码器，重新开始
+			currentDec.close()
+			nextDec.close()
+			vp.updateTerminalSizeFromSigwinch()
+			// 重新计算 frameSize
+			frameSize = vp.outWidth * vp.outHeight * 4
+			outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
+			currentDec = vp.spawnDecoder()
+			nextDec = vp.spawnDecoder()
+			// 清屏消除残留
+			fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
+			continue
+		case key, ok := <-keyCh:
+			if !ok {
+				currentDec.close()
+				nextDec.close()
+				return
+			}
+			if key == 'q' || key == 'Q' || key == 27 {
+				currentDec.close()
+				nextDec.close()
+				return
+			}
 		default:
 		}
 
-		// 启动解码器
-		frameReader := vp.launchDecoder()
-		frameSize := vp.outWidth * vp.outHeight * 4
-		fpsTicker := time.NewTicker(vp.frameTime)
+		// 读取一帧
+		buf := make([]byte, frameSize)
+		n, err := io.ReadFull(currentDec.reader, buf)
+		if err != nil || n != frameSize {
+			// 当前视频结束 → 无缝切换到下一个 decoder
+			currentDec.close()
 
-		outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
+			// 交换：nextDec 变成 currentDec
+			currentDec = nextDec
+			// 启动新的 nextDec
+			nextDec = vp.spawnDecoder()
 
-		// 清屏
-		fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
-
-	frameLoop:
-		for {
-			select {
-			case <-vp.quit:
-				fpsTicker.Stop()
-				frameReader.Close()
-				return
-			case <-sigCh:
-				// 窗口变化：关闭当前解码器，重新计算尺寸，外层循环重新启动
-				newSize, err := getTerminalSize()
-				if err != nil {
-					continue
-				}
-				vp.updateTerminalSize(newSize.Width, newSize.Height)
-				fpsTicker.Stop()
-				frameReader.Close()
-				break frameLoop
-			case key, ok := <-keyCh:
-				if !ok {
-					fpsTicker.Stop()
-					frameReader.Close()
-					return
-				}
-				if key == 'q' || key == 'Q' || key == 27 {
-					fpsTicker.Stop()
-					frameReader.Close()
-					return
-				}
-			default:
-			}
-
-			// 读取一帧
-			buf := make([]byte, frameSize)
-			n, err := io.ReadFull(frameReader, buf)
-			if err != nil || n != frameSize {
-				// 视频结束 → 循环重新播放
-				fpsTicker.Stop()
-				frameReader.Close()
-				break frameLoop
-			}
-
-			// 渲染
-			imgData := rawRGBAToColorData(buf, vp.outWidth, vp.outHeight)
-			vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
-
-			// 构建输出
-			outputBuf.Reset()
-			imageStr := vp.renderer.String()
-			lines := strings.Split(imageStr, "\n")
-
-			for i, line := range lines {
-				if line == "" {
-					continue
-				}
-				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
-					vp.startRow+i+1, vp.startCol+1, line))
-			}
-
-			// 清除右侧空白
-			if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
-				clearStartCol := vp.startCol + vp.charW + 1
-				for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
-					outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
-				}
-			}
-
-			// 底部提示
-			outputBuf.WriteString(fmt.Sprintf("\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
-				vp.termHeight, RESET_COLORS))
-
-			fmt.Print(outputBuf.String())
-
-			// 等待下一个帧时间
-			<-fpsTicker.C
+			// 继续读（不执行任何清屏操作）
+			continue
 		}
+
+		// 渲染
+		imgData := rawRGBAToColorData(buf, vp.outWidth, vp.outHeight)
+		vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
+
+		// 构建输出
+		outputBuf.Reset()
+		imageStr := vp.renderer.String()
+		lines := strings.Split(imageStr, "\n")
+
+		for i, line := range lines {
+			if line == "" {
+				continue
+			}
+			outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
+				vp.startRow+i+1, vp.startCol+1, line))
+		}
+
+		// 清除右侧空白
+		if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
+			clearStartCol := vp.startCol + vp.charW + 1
+			for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
+				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
+			}
+		}
+
+		// 底部提示
+		outputBuf.WriteString(fmt.Sprintf("\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
+			vp.termHeight, RESET_COLORS))
+
+		fmt.Print(outputBuf.String())
+
+		// 等待下一个帧时间
+		<-fpsTicker.C
 	}
 }
 
-// Stop 停止播放
-func (vp *VideoPlayer) Stop() {
-	select {
-	case vp.quit <- struct{}{}:
-	default:
+// updateTerminalSizeFromSigwinch 从系统获取当前终端尺寸并更新
+func (vp *VideoPlayer) updateTerminalSizeFromSigwinch() {
+	newSize, err := getTerminalSize()
+	if err != nil {
+		return
 	}
+	vp.updateTerminalSize(newSize.Width, newSize.Height)
 }
 
 // ==================== 播放入口 ====================
@@ -487,13 +517,13 @@ func playVideo(filename string) error {
 	fmt.Printf("\033[%d;%dH\033[90m正在探测视频...%s",
 		termSize.Height/2, termSize.Width/2-10, RESET_COLORS)
 
-	// 探测视频信息（获取原始尺寸）
+	// 探测视频信息
 	info, err := probeVideo(filename)
 	if err != nil {
 		return fmt.Errorf("视频探测失败: %v", err)
 	}
 
-	// 创建播放器（传入原始尺寸，内部会根据终端尺寸计算输出尺寸）
+	// 创建播放器
 	player := NewVideoPlayer(filename, info.Width, info.Height, termSize.Width, termSize.Height)
 	player.fps = info.FPS
 	player.frameTime = time.Duration(float64(time.Second) / info.FPS)
