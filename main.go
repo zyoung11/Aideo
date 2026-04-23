@@ -10,7 +10,19 @@ import (
 	"golang.org/x/term"
 )
 
+// ==================== 全局模式选择 ====================
+// 优先级：命令行参数 -sixel > 环境变量 AIDEO_SIXEL > Braille 默认
+
+var useSixel bool
+
 // ==================== 主函数 ====================
+
+func init() {
+	// 环境变量支持：AIDEO_SIXEL=1 启用 Sixel 渲染
+	if os.Getenv("AIDEO_SIXEL") == "1" {
+		useSixel = true
+	}
+}
 
 func main() {
 	// 顶层恢复，确保终端状态恢复
@@ -25,14 +37,32 @@ func main() {
 	}()
 
 	if len(os.Args) < 2 {
-		fmt.Println("用法: go run main.go <图片/视频文件>")
+		fmt.Println("用法: go run main.go [选项] <图片/视频文件>")
+		fmt.Println("选项:")
+		fmt.Println("  -sixel       使用 Sixel 格式渲染（默认使用 Braille）")
 		fmt.Println("支持格式: .jpg .jpeg .png .mp4 .mov .mkv")
 		fmt.Println("示例: go run main.go photo.jpg")
+		fmt.Println("示例: go run main.go -sixel photo.jpg")
 		fmt.Println("示例: go run main.go video.mp4")
+		fmt.Println("环境变量: AIDEO_SIXEL=1 等同于 -sixel")
 		os.Exit(1)
 	}
 
-	filename := os.Args[1]
+	// 解析参数
+	filename := ""
+	sixelFlag := false
+	for i := 1; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		if arg == "-sixel" {
+			sixelFlag = true
+		} else if filename == "" {
+			filename = arg
+		}
+	}
+
+	if sixelFlag {
+		useSixel = true
+	}
 
 	// 如果是视频文件，直接播放视频
 	if isVideoFile(filename) {
@@ -61,25 +91,50 @@ func main() {
 		outWidth, outHeight int
 		scaledData          *ColorData
 		charW, charH        int
-		renderer            *BrailleRenderer
+		brailleRenderer     *BrailleRenderer
+		sixelRenderer       *SixelRenderer
 	)
 
-	// 初始化渲染
-	outWidth, outHeight = calculateOutputSize(
-		imgData.Width, imgData.Height,
-		termSize.Width, termSize.Height,
-	)
-	fmt.Printf("输出像素: %dx%d\n", outWidth, outHeight)
+	// 按模式初始化渲染
+	if useSixel {
+		// Sixel 全屏画布尺寸 = 终端物理像素
+		// 图像按比例缩放，居中嵌入画布
+		canvasW, canvasH := getTerminalPixelSize(termSize.Width, termSize.Height)
+		// 计算图像在该画布中的缩放尺寸
+		outWidth, outHeight = calculateSixelOutputSize(
+			imgData.Width, imgData.Height,
+			termSize.Width, termSize.Height,
+		)
+		fmt.Printf("终端像素: %dx%d, 图像渲染: %dx%d\n", canvasW, canvasH, outWidth, outHeight)
 
-	scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
+		scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
 
-	charW = outWidth / 2
-	charH = outHeight / 4
-	fmt.Printf("渲染尺寸: %dx%d 字符 (Braille 2×4, 共 %d 像素)\n",
-		charW, charH, charW*charH*8)
+		// Sixel 画布填满整个终端，图像居中嵌入
+		sixelRenderer = NewSixelRenderer(canvasW, canvasH)
+		sixelRenderer.setImagePlacement(outWidth, outHeight)
+		sixelRenderer.Render(scaledData, 1.0, 0.85)
 
-	renderer = NewBrailleRenderer(charW, charH)
-	renderer.Render(scaledData, 1.0, 0.85)
+		// 六角形模式下 charW/charH 不再用于居中，仅用于显示信息
+		charW = canvasW
+		charH = canvasH
+		fmt.Printf("Sixel 画布: %dx%d 像素\n", canvasW, canvasH)
+	} else {
+		outWidth, outHeight = calculateOutputSize(
+			imgData.Width, imgData.Height,
+			termSize.Width, termSize.Height,
+		)
+		fmt.Printf("输出像素: %dx%d\n", outWidth, outHeight)
+
+		scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
+
+		charW = outWidth / 2
+		charH = outHeight / 4
+		fmt.Printf("渲染尺寸: %dx%d 字符 (Braille 2×4, 共 %d 像素)\n",
+			charW, charH, charW*charH*8)
+
+		brailleRenderer = NewBrailleRenderer(charW, charH)
+		brailleRenderer.Render(scaledData, 1.0, 0.85)
+	}
 
 	// 进入 alternate screen 并隐藏光标，禁用鼠标报告
 	fmt.Print(ENTER_ALTERNATE)
@@ -92,38 +147,44 @@ func main() {
 		fmt.Print(LEAVE_ALTERNATE)
 	}()
 
-	// 计算居中位置
-	startCol := (termSize.Width - charW) / 2
-	startRow := (termSize.Height - charH) / 2
-
-	// 确保位置不为负数
-	if startCol < 0 {
-		startCol = 0
-	}
-	if startRow < 0 {
-		startRow = 0
-	}
-
 	// 清屏
 	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 
-	// 渲染图像到居中位置
-	imageStr := renderer.String()
-	lines := strings.Split(imageStr, "\n")
-
-	for i, line := range lines {
-		if line == "" {
-			continue
+	// 渲染图像
+	var imageStr string
+	if useSixel {
+		// Sixel 模式：全屏画布，直接输出在左上角 (1,1)
+		// 图像已在 buildSixel 内部居中嵌入画布
+		imageStr = sixelRenderer.String()
+		fmt.Print(imageStr)
+	} else {
+		// Braille 模式：计算居中位置
+		startCol := (termSize.Width - charW) / 2
+		startRow := (termSize.Height - charH) / 2
+		if startCol < 0 {
+			startCol = 0
 		}
-		// 移动到指定位置并输出该行
-		fmt.Printf("\033[%d;%dH%s", startRow+i+1, startCol+1, line)
-	}
+		if startRow < 0 {
+			startRow = 0
+		}
 
-	// 清除图片右侧的空白区域
-	if charW > 0 && startCol+charW <= termSize.Width {
-		clearStartCol := startCol + charW + 1
-		for row := startRow + 1; row <= startRow+charH; row++ {
-			fmt.Printf("\033[%d;%dH\033[K", row, clearStartCol)
+		imageStr = brailleRenderer.String()
+		lines := strings.Split(imageStr, "\n")
+
+		for i, line := range lines {
+			if line == "" {
+				continue
+			}
+			// 移动到指定位置并输出该行
+			fmt.Printf("\033[%d;%dH%s", startRow+i+1, startCol+1, line)
+		}
+
+		// 清除图片右侧的空白区域
+		if charW > 0 && startCol+charW <= termSize.Width {
+			clearStartCol := startCol + charW + 1
+			for row := startRow + 1; row <= startRow+charH; row++ {
+				fmt.Printf("\033[%d;%dH\033[K", row, clearStartCol)
+			}
 		}
 	}
 
@@ -203,48 +264,65 @@ func main() {
 					continue
 				}
 				termSize = newSize
-				// 重新计算输出尺寸
-				outWidth, outHeight = calculateOutputSize(
-					imgData.Width, imgData.Height,
-					termSize.Width, termSize.Height,
-				)
-				// 重新缩放图像
-				scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
-				charW = outWidth / 2
-				charH = outHeight / 4
-				// 重新创建渲染器并渲染
-				renderer = NewBrailleRenderer(charW, charH)
-				renderer.Render(scaledData, 1.0, 0.85)
-				// 计算新的居中位置
-				newStartCol := (termSize.Width - charW) / 2
-				newStartRow := (termSize.Height - charH) / 2
-				if newStartCol < 0 {
-					newStartCol = 0
-				}
-				if newStartRow < 0 {
-					newStartRow = 0
+
+				if useSixel {
+					canvasW, canvasH := getTerminalPixelSize(termSize.Width, termSize.Height)
+					outWidth, outHeight = calculateSixelOutputSize(
+						imgData.Width, imgData.Height,
+						termSize.Width, termSize.Height,
+					)
+					scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
+					sixelRenderer = NewSixelRenderer(canvasW, canvasH)
+					sixelRenderer.setImagePlacement(outWidth, outHeight)
+					sixelRenderer.Render(scaledData, 1.0, 0.85)
+					charW = canvasW
+					charH = canvasH
+				} else {
+					outWidth, outHeight = calculateOutputSize(
+						imgData.Width, imgData.Height,
+						termSize.Width, termSize.Height,
+					)
+					scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
+					charW = outWidth / 2
+					charH = outHeight / 4
+					brailleRenderer = NewBrailleRenderer(charW, charH)
+					brailleRenderer.Render(scaledData, 1.0, 0.85)
 				}
 
 				// 清屏
 				fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 
-				// 渲染图像到居中位置
-				imageStr := renderer.String()
-				lines := strings.Split(imageStr, "\n")
-
-				for i, line := range lines {
-					if line == "" {
-						continue
+				// 渲染图像
+				if useSixel {
+					// Sixel 全屏画布，输出在左上角
+					fmt.Print(sixelRenderer.String())
+				} else {
+					// Braille 模式：计算居中位置
+					newStartCol := (termSize.Width - charW) / 2
+					newStartRow := (termSize.Height - charH) / 2
+					if newStartCol < 0 {
+						newStartCol = 0
 					}
-					// 移动到指定位置并输出该行
-					fmt.Printf("\033[%d;%dH%s", newStartRow+i+1, newStartCol+1, line)
-				}
+					if newStartRow < 0 {
+						newStartRow = 0
+					}
 
-				// 清除图片右侧的空白区域
-				if charW > 0 && newStartCol+charW <= termSize.Width {
-					clearStartCol := newStartCol + charW + 1
-					for row := newStartRow + 1; row <= newStartRow+charH; row++ {
-						fmt.Printf("\033[%d;%dH\033[K", row, clearStartCol)
+					imageStr := brailleRenderer.String()
+					lines := strings.Split(imageStr, "\n")
+
+					for i, line := range lines {
+						if line == "" {
+							continue
+						}
+						fmt.Printf("\033[%d;%dH%s", newStartRow+i+1, newStartCol+1, line)
+					}
+
+					// 清除图片右侧的空白区域
+					if charW > 0 && newStartCol+charW <= termSize.Width {
+						clearStartCol := newStartCol + charW + 1
+						for row := newStartRow + 1; row <= newStartRow+charH; row++ {
+							fmt.Printf("\033[%d;%dH\033[K", row, clearStartCol)
+						}
 					}
 				}
 

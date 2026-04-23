@@ -1,7 +1,7 @@
 package main
 
 import (
-		"encoding/binary"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,9 +14,9 @@ import (
 	"syscall"
 	"time"
 
-	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"github.com/gopxl/beep/v2"
 	"github.com/gopxl/beep/v2/speaker"
+	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"golang.org/x/term"
 )
 
@@ -166,34 +166,49 @@ func rawRGBAToColorData(raw []byte, width, height int) *ColorData {
 // ==================== 视频播放器 ====================
 
 type VideoPlayer struct {
-	filename    string
-	srcWidth    int
-	srcHeight   int
-	outWidth    int
-	outHeight   int
-	charW       int
-	charH       int
+	filename  string
+	srcWidth  int
+	srcHeight int
+	outWidth  int
+	outHeight int
+	charW     int
+	charH     int
 
-	quit        chan struct{}
-	done        chan struct{}
+	quit chan struct{}
+	done chan struct{}
 
 	fps         float64
 	frameTime   time.Duration
 	exposure    float64
 	attenuation float64
 
-	termWidth   int
-	termHeight  int
-	startRow    int
-	startCol    int
+	termWidth  int
+	termHeight int
+	startRow   int
+	startCol   int
 
-	renderer    *BrailleRenderer
+	renderer      *BrailleRenderer
+	sixelRenderer *SixelRenderer
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
-	outWidth, outHeight := calculateOutputSize(srcWidth, srcHeight, termWidth, termHeight)
-	charW := outWidth / 2
-	charH := outHeight / 4
+	var (
+		canvasW, canvasH    int
+		outWidth, outHeight int
+		charW, charH        int
+	)
+
+	canvasW, canvasH = getTerminalPixelSize(termWidth, termHeight)
+
+	if useSixel {
+		outWidth, outHeight = calculateSixelOutputSize(srcWidth, srcHeight, termWidth, termHeight)
+	} else {
+		outWidth, outHeight = calculateOutputSize(srcWidth, srcHeight, termWidth, termHeight)
+	}
+
+	// Braille 模式下需要字符网格尺寸用于居中
+	charW = outWidth / 2
+	charH = outHeight / 4
 
 	startCol := (termWidth - charW) / 2
 	startRow := (termHeight - charH) / 2
@@ -204,7 +219,7 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 		startRow = 0
 	}
 
-	return &VideoPlayer{
+	vp := &VideoPlayer{
 		filename:    filename,
 		srcWidth:    srcWidth,
 		srcHeight:   srcHeight,
@@ -222,8 +237,17 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 		termHeight:  termHeight,
 		startRow:    startRow,
 		startCol:    startCol,
-		renderer:    NewBrailleRenderer(charW, charH),
 	}
+
+	if useSixel {
+		// Sixel 渲染器使用全屏画布，图像居中嵌入
+		vp.sixelRenderer = NewSixelRenderer(canvasW, canvasH)
+		vp.sixelRenderer.setImagePlacement(outWidth, outHeight)
+	} else {
+		vp.renderer = NewBrailleRenderer(charW, charH)
+	}
+
+	return vp
 }
 
 // updateTerminalSize 窗口变化时重新计算输出尺寸和居中位置
@@ -231,16 +255,28 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	vp.termWidth = newWidth
 	vp.termHeight = newHeight
 
-	newOutW, newOutH := calculateOutputSize(
-		vp.srcWidth, vp.srcHeight,
-		newWidth, newHeight,
-	)
+	canvasW, canvasH := getTerminalPixelSize(newWidth, newHeight)
 
-	vp.outWidth = newOutW
-	vp.outHeight = newOutH
-	vp.charW = newOutW / 2
-	vp.charH = newOutH / 4
-	vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
+	if useSixel {
+		newOutW, newOutH := calculateSixelOutputSize(
+			vp.srcWidth, vp.srcHeight,
+			newWidth, newHeight,
+		)
+		vp.outWidth = newOutW
+		vp.outHeight = newOutH
+		vp.sixelRenderer = NewSixelRenderer(canvasW, canvasH)
+		vp.sixelRenderer.setImagePlacement(newOutW, newOutH)
+	} else {
+		newOutW, newOutH := calculateOutputSize(
+			vp.srcWidth, vp.srcHeight,
+			newWidth, newHeight,
+		)
+		vp.outWidth = newOutW
+		vp.outHeight = newOutH
+		vp.charW = newOutW / 2
+		vp.charH = newOutH / 4
+		vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
+	}
 
 	newStartCol := (newWidth - vp.charW) / 2
 	newStartRow := (newHeight - vp.charH) / 2
@@ -270,11 +306,11 @@ func (vp *VideoPlayer) spawnVideoDecoder(seekSecs float64) *videoDecoder {
 	pr, pw := io.Pipe()
 
 	outputArgs := ffmpeg.KwArgs{
-		"format":   "rawvideo",
-		"pix_fmt":  "rgba",
-		"s":        fmt.Sprintf("%dx%d", vp.outWidth, vp.outHeight),
-		"an":       "",
-		"sn":       "",
+		"format":  "rawvideo",
+		"pix_fmt": "rgba",
+		"s":       fmt.Sprintf("%dx%d", vp.outWidth, vp.outHeight),
+		"an":      "",
+		"sn":      "",
 	}
 	if seekSecs > 0 {
 		// output 端 -ss = 精确 seek，ffmpeg 会解码但丢弃前面的帧，直接输出目标位置的帧
@@ -326,7 +362,7 @@ func (d *videoDecoder) close() {
 const (
 	audioSampleRate = 44100
 	audioChannels   = 2
-	audioBitDepth   = 2 // s16le
+	audioBitDepth   = 2                             // s16le
 	audioFrameSize  = audioChannels * audioBitDepth // 4 bytes per sample
 )
 
@@ -362,12 +398,12 @@ func (as *audioStreamer) spawnAudioDecoder() io.ReadCloser {
 	stream := ffmpeg.Input(as.filename).
 		Output("pipe:",
 			ffmpeg.KwArgs{
-				"format":  "s16le",
-				"acodec":  "pcm_s16le",
-				"ac":      audioChannels,
-				"ar":      audioSampleRate,
-				"vn":      "",
-				"sn":      "",
+				"format": "s16le",
+				"acodec": "pcm_s16le",
+				"ac":     audioChannels,
+				"ar":     audioSampleRate,
+				"vn":     "",
+				"sn":     "",
 			}).
 		Silent(true).
 		SetFfmpegPath(as.ffmpegPath).
@@ -702,26 +738,36 @@ func (vp *VideoPlayer) startLoop() {
 
 		// 渲染
 		imgData := rawRGBAToColorData(buf, vp.outWidth, vp.outHeight)
-		vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
+		if useSixel {
+			vp.sixelRenderer.Render(imgData, vp.exposure, vp.attenuation)
+		} else {
+			vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
+		}
 
 		// 构建输出
 		outputBuf.Reset()
-		imageStr := vp.renderer.String()
-		lines := strings.Split(imageStr, "\n")
+		if useSixel {
+			// Sixel 模式：全屏画布，图像已在内部居中嵌入
+			// 直接输出在左上角 (1,1)
+			outputBuf.WriteString(vp.sixelRenderer.String())
+		} else {
+			imageStr := vp.renderer.String()
+			lines := strings.Split(imageStr, "\n")
 
-		for i, line := range lines {
-			if line == "" {
-				continue
+			for i, line := range lines {
+				if line == "" {
+					continue
+				}
+				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
+					vp.startRow+i+1, vp.startCol+1, line))
 			}
-			outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
-				vp.startRow+i+1, vp.startCol+1, line))
-		}
 
-		// 清除右侧空白
-		if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
-			clearStartCol := vp.startCol + vp.charW + 1
-			for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
-				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
+			// 清除右侧空白
+			if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
+				clearStartCol := vp.startCol + vp.charW + 1
+				for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
+					outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
+				}
 			}
 		}
 
