@@ -9,7 +9,6 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -36,9 +35,8 @@ func getFFmpegPath() string {
 	return "./ffmpeg"
 }
 
-// ==================== 视频流解码 ====================
+// ==================== 视频流探测 ====================
 
-// decodeVideo 探测视频信息
 func probeVideo(filename string) (*VideoInfo, error) {
 	probeData, err := ffmpeg.Probe(filename)
 	if err != nil {
@@ -162,35 +160,33 @@ func rawRGBAToColorData(raw []byte, width, height int) *ColorData {
 	return &ColorData{width, height, gray, r, g, b}
 }
 
-// ==================== 视频播放渲染 ====================
+// ==================== 视频播放器 ====================
 
 type VideoPlayer struct {
+	filename    string
 	videoInfo   *VideoInfo
-	frameReader io.ReadCloser
+
 	charW       int
 	charH       int
-	quit        chan struct{}
-	done        chan struct{}
+	quit        chan struct{}  // 外部通知停止
+	done        chan struct{}  // 播放结束信号
+
 	fps         float64
 	frameTime   time.Duration
 	exposure    float64
 	attenuation float64
+
 	termWidth   int
 	termHeight  int
-	startRow    int
-	startCol    int
+	startRow   int
+	startCol   int
 
-	renderer  *BrailleRenderer
-	buf       []byte
-	frameSize int
-
-	// 统计
-	frameCount int
+	renderer    *BrailleRenderer
 }
 
-func NewVideoPlayer(videoInfo *VideoInfo, frameReader io.ReadCloser, termWidth, termHeight int) *VideoPlayer {
-	charW := videoInfo.Width / 2
-	charH := videoInfo.Height / 4
+func NewVideoPlayer(filename string, info *VideoInfo, termWidth, termHeight int) *VideoPlayer {
+	charW := info.Width / 2
+	charH := info.Height / 4
 
 	startCol := (termWidth - charW) / 2
 	startRow := (termHeight - charH) / 2
@@ -201,18 +197,17 @@ func NewVideoPlayer(videoInfo *VideoInfo, frameReader io.ReadCloser, termWidth, 
 		startRow = 0
 	}
 
-	fps := videoInfo.FPS
+	fps := info.FPS
 	if fps <= 0 {
 		fps = 30
 	}
-	// 限制最大帧率
 	if fps > 60 {
 		fps = 60
 	}
 
 	return &VideoPlayer{
-		videoInfo:   videoInfo,
-		frameReader: frameReader,
+		filename:    filename,
+		videoInfo:   info,
 		charW:       charW,
 		charH:       charH,
 		quit:        make(chan struct{}),
@@ -226,26 +221,51 @@ func NewVideoPlayer(videoInfo *VideoInfo, frameReader io.ReadCloser, termWidth, 
 		startRow:    startRow,
 		startCol:    startCol,
 		renderer:    NewBrailleRenderer(charW, charH),
-		buf:         make([]byte, videoInfo.Width*videoInfo.Height*4),
-		frameSize:   videoInfo.Width * videoInfo.Height * 4,
 	}
 }
 
-// Play 同步播放视频
-func (vp *VideoPlayer) Play() {
+// launchDecoder 启动 ffmpeg 解码进程，返回 frame reader
+func (vp *VideoPlayer) launchDecoder() io.ReadCloser {
+	ffmpegPath := getFFmpegPath()
+	pr, pw := io.Pipe()
+
+	stream := ffmpeg.Input(vp.filename).
+		Output("pipe:",
+			ffmpeg.KwArgs{
+				"format":   "rawvideo",
+				"pix_fmt":  "rgba",
+				"s":        fmt.Sprintf("%dx%d", vp.videoInfo.Width, vp.videoInfo.Height),
+				"an":       "",
+				"sn":       "",
+			}).
+		Silent(true).
+		SetFfmpegPath(ffmpegPath).
+		WithOutput(pw)
+
+	go func() {
+		err := stream.Run()
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("ffmpeg 错误: %v", err))
+		} else {
+			pw.Close()
+		}
+	}()
+
+	return pr
+}
+
+// startLoop 循环播放，直到用户退出
+func (vp *VideoPlayer) startLoop() {
 	defer close(vp.done)
 
-	// 信号监听
+	// 信号监听（只处理 SIGWINCH，退出信号由按键处理）
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGWINCH, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(sigCh, syscall.SIGWINCH)
 	defer signal.Stop(sigCh)
 
-	// fps 计时器
-	fpsTicker := time.NewTicker(vp.frameTime)
-	defer fpsTicker.Stop()
-
-	// 键盘输入 goroutine（使用 raw mode 读取单个按键）
+	// 键盘输入 goroutine
 	keyCh := make(chan byte, 10)
+
 	go func() {
 		defer func() { recover() }()
 
@@ -262,7 +282,7 @@ func (vp *VideoPlayer) Play() {
 				close(keyCh)
 				return
 			}
-			// ESC 检测
+			// ESC 检测：区分 ESC 键和转义序列
 			if b == 27 {
 				type readResult struct {
 					b   byte
@@ -292,7 +312,6 @@ func (vp *VideoPlayer) Play() {
 						}
 					}
 				case <-time.After(50 * time.Millisecond):
-					// 超时 → 单独的 ESC 键
 				}
 			}
 
@@ -303,95 +322,117 @@ func (vp *VideoPlayer) Play() {
 		}
 	}()
 
-	// 渲染缓冲区
-	var outputBuf strings.Builder
-	outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
+	frameSize := vp.videoInfo.Width * vp.videoInfo.Height * 4
 
-	vp.frameCount = 0
-
-	// 主循环
+	// 主循环（循环播放）
 	for {
 		select {
 		case <-vp.quit:
 			return
-		case sig := <-sigCh:
-			switch sig {
-			case syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP:
-				return
-			case syscall.SIGWINCH:
-				// 窗口大小变化
-				newSize, err := getTerminalSize()
-				if err != nil {
-					continue
-				}
-				charW := vp.videoInfo.Width / 2
-				charH := vp.videoInfo.Height / 4
-				newStartCol := (newSize.Width - charW) / 2
-				newStartRow := (newSize.Height - charH) / 2
-				if newStartCol < 0 {
-					newStartCol = 0
-				}
-				if newStartRow < 0 {
-					newStartRow = 0
-				}
-				vp.termWidth = newSize.Width
-				vp.termHeight = newSize.Height
-				vp.startCol = newStartCol
-				vp.startRow = newStartRow
-			}
-		case key, ok := <-keyCh:
-			if !ok {
-				return
-			}
-			if key == 'q' || key == 'Q' || key == 27 {
-				return
-			}
 		default:
 		}
 
-		// 读取一帧 RGBA 数据
-		n, err := io.ReadFull(vp.frameReader, vp.buf)
-		if err != nil || n != vp.frameSize {
-			return // 视频结束
-		}
+		// 启动解码器
+		frameReader := vp.launchDecoder()
+		fpsTicker := time.NewTicker(vp.frameTime)
 
-		// 转换 raw RGBA → ColorData
-		imgData := rawRGBAToColorData(vp.buf, vp.videoInfo.Width, vp.videoInfo.Height)
+		var outputBuf strings.Builder
+		outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
-		// 渲染
-		vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
+		// 每次循环开始时清屏，防止上一轮的残留
+		fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 
-		// 构建输出
-		outputBuf.Reset()
-		imageStr := vp.renderer.String()
-		lines := strings.Split(imageStr, "\n")
+		// 读取帧循环
+	frameLoop:
+		for {
+			select {
+			case <-vp.quit:
+				fpsTicker.Stop()
+				frameReader.Close()
+				return
+			case sig := <-sigCh:
+				if sig == syscall.SIGWINCH {
+					// 窗口变化：重新计算居中位置，清屏
+					newSize, err := getTerminalSize()
+					if err != nil {
+						continue
+					}
+					newCharW := vp.videoInfo.Width / 2
+					newCharH := vp.videoInfo.Height / 4
+					newStartCol := (newSize.Width - newCharW) / 2
+					newStartRow := (newSize.Height - newCharH) / 2
+					if newStartCol < 0 {
+						newStartCol = 0
+					}
+					if newStartRow < 0 {
+						newStartRow = 0
+					}
+					vp.termWidth = newSize.Width
+					vp.termHeight = newSize.Height
+					vp.startCol = newStartCol
+					vp.startRow = newStartRow
 
-		for i, line := range lines {
-			if line == "" {
-				continue
+					// 清屏消除残留
+					fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
+				}
+			case key, ok := <-keyCh:
+				if !ok {
+					fpsTicker.Stop()
+					frameReader.Close()
+					return
+				}
+				if key == 'q' || key == 'Q' || key == 27 {
+					fpsTicker.Stop()
+					frameReader.Close()
+					return
+				}
+			default:
 			}
-			outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
-				vp.startRow+i+1, vp.startCol+1, line))
-		}
 
-		// 清除右侧空白
-		if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
-			clearStartCol := vp.startCol + vp.charW + 1
-			for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
-				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
+			// 读取一帧
+			buf := make([]byte, frameSize)
+			n, err := io.ReadFull(frameReader, buf)
+			if err != nil || n != frameSize {
+				// 视频结束 → 跳出帧循环，重新启动
+				fpsTicker.Stop()
+				frameReader.Close()
+				break frameLoop
 			}
+
+			// 渲染
+			imgData := rawRGBAToColorData(buf, vp.videoInfo.Width, vp.videoInfo.Height)
+			vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
+
+			// 构建输出
+			outputBuf.Reset()
+			imageStr := vp.renderer.String()
+			lines := strings.Split(imageStr, "\n")
+
+			for i, line := range lines {
+				if line == "" {
+					continue
+				}
+				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
+					vp.startRow+i+1, vp.startCol+1, line))
+			}
+
+			// 清除右侧空白
+			if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
+				clearStartCol := vp.startCol + vp.charW + 1
+				for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
+					outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
+				}
+			}
+
+			// 底部提示
+			outputBuf.WriteString(fmt.Sprintf("\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
+				vp.termHeight, RESET_COLORS))
+
+			fmt.Print(outputBuf.String())
+
+			// 等待下一个帧时间
+			<-fpsTicker.C
 		}
-
-		// 底部提示
-		outputBuf.WriteString(fmt.Sprintf("\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
-			vp.termHeight, RESET_COLORS))
-
-		fmt.Print(outputBuf.String())
-
-		vp.frameCount++
-
-		// 等待下一个帧时间
-		<-fpsTicker.C
 	}
 }
 
@@ -414,8 +455,7 @@ func playVideo(filename string) error {
 	// 获取终端尺寸
 	termSize, err := getTerminalSize()
 	if err != nil {
-		fmt.Printf("获取终端尺寸失败: %v，使用默认 80x24\n", err)
-		termSize = &TerminalSize{Width: 80, Height: 24}
+		return fmt.Errorf("获取终端尺寸失败: %v", err)
 	}
 
 	// 进入 alternate screen
@@ -428,7 +468,6 @@ func playVideo(filename string) error {
 		fmt.Print(LEAVE_ALTERNATE)
 	}()
 
-	// 显示加载信息
 	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 	fmt.Printf("\033[%d;%dH\033[90m正在探测视频...%s",
 		termSize.Height/2, termSize.Width/2-10, RESET_COLORS)
@@ -439,9 +478,6 @@ func playVideo(filename string) error {
 		return fmt.Errorf("视频探测失败: %v", err)
 	}
 
-	// 清屏
-	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
-
 	// 计算输出尺寸
 	outWidth, outHeight := calculateOutputSize(
 		info.Width, info.Height,
@@ -450,75 +486,17 @@ func playVideo(filename string) error {
 	info.Width = outWidth
 	info.Height = outHeight
 
-	// 启动 FFmpeg 解码进程
-	ffmpegPath := getFFmpegPath()
-	pr, pw := io.Pipe()
-
-	stream := ffmpeg.Input(filename).
-		Output("pipe:",
-			ffmpeg.KwArgs{
-				"format":   "rawvideo",
-				"pix_fmt":  "rgba",
-				"s":        fmt.Sprintf("%dx%d", info.Width, info.Height),
-				"an":       "",
-				"sn":       "",
-			}).
-		Silent(true).
-		SetFfmpegPath(ffmpegPath).
-		WithOutput(pw)
-
-	go func() {
-		err := stream.Run()
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("ffmpeg 错误: %v", err))
-		} else {
-			pw.Close()
-		}
-	}()
+	// 创建播放器
+	player := NewVideoPlayer(filename, info, termSize.Width, termSize.Height)
 
 	// 设置键盘 raw 模式
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
-		pr.Close()
 		return fmt.Errorf("无法设置 raw 模式: %v", err)
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-	player := NewVideoPlayer(info, pr, termSize.Width, termSize.Height)
-
-	// 窗口大小变化监听
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGWINCH)
-	defer signal.Stop(sigCh)
-
-	var mu sync.Mutex
-	go func() {
-		for range sigCh {
-			mu.Lock()
-			newSize, err := getTerminalSize()
-			if err != nil {
-				mu.Unlock()
-				continue
-			}
-			charW := info.Width / 2
-			charH := info.Height / 4
-			newStartCol := (newSize.Width - charW) / 2
-			newStartRow := (newSize.Height - charH) / 2
-			if newStartCol < 0 {
-				newStartCol = 0
-			}
-			if newStartRow < 0 {
-				newStartRow = 0
-			}
-			player.termWidth = newSize.Width
-			player.termHeight = newSize.Height
-			player.startCol = newStartCol
-			player.startRow = newStartRow
-			mu.Unlock()
-		}
-	}()
-
-	player.Play()
+	player.startLoop()
 
 	return nil
 }
