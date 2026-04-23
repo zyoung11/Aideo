@@ -485,7 +485,6 @@ func main() {
 	)
 	fmt.Printf("输出像素: %dx%d\n", outWidth, outHeight)
 
-	fmt.Println("缩放图像...")
 	scaledData := resizeImageBilinear(imgData, outWidth, outHeight)
 
 	charW := outWidth / 2
@@ -493,7 +492,6 @@ func main() {
 	fmt.Printf("渲染尺寸: %dx%d 字符 (Braille 2×4, 共 %d 像素)\n",
 		charW, charH, charW*charH*8)
 
-	fmt.Println("渲染 Braille 八分块艺术...")
 	renderer := NewBrailleRenderer(charW, charH)
 	renderer.Render(scaledData, 1.0, 0.85)
 
@@ -558,8 +556,6 @@ func main() {
 					// 如果是 '[' 或 'O' 或 'M'，则是转义序列，不是 ESC 键
 					// 'M' 是鼠标事件
 					if next == '[' || next == 'O' || next == 'M' {
-						// 跳过整个转义序列
-						// 简单处理：跳过直到遇到字母或 ~
 						i++ // 跳过 ESC 后面的字符
 						for i < n && !isTerminator(buf[i]) {
 							i++
