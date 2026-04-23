@@ -147,7 +147,6 @@ func rawRGBAToColorData(raw []byte, width, height int) *ColorData {
 			pr := raw[offset]
 			pg := raw[offset+1]
 			pb := raw[offset+2]
-			// raw[offset+3] 是 alpha，忽略
 
 			r[idx] = pr
 			g[idx] = pg
@@ -164,12 +163,15 @@ func rawRGBAToColorData(raw []byte, width, height int) *ColorData {
 
 type VideoPlayer struct {
 	filename    string
-	videoInfo   *VideoInfo
-
+	srcWidth    int       // 原始视频宽度（探测时获得）
+	srcHeight   int       // 原始视频高度（探测时获得）
+	outWidth    int       // 当前解码输出宽度
+	outHeight   int       // 当前解码输出高度
 	charW       int
 	charH       int
-	quit        chan struct{}  // 外部通知停止
-	done        chan struct{}  // 播放结束信号
+
+	quit        chan struct{}
+	done        chan struct{}
 
 	fps         float64
 	frameTime   time.Duration
@@ -178,15 +180,22 @@ type VideoPlayer struct {
 
 	termWidth   int
 	termHeight  int
-	startRow   int
-	startCol   int
+	startRow    int
+	startCol    int
 
-	renderer    *BrailleRenderer
+	renderer     *BrailleRenderer
+	resizeNeeded bool // 窗口变化标记，下一轮循环重新解码
 }
 
-func NewVideoPlayer(filename string, info *VideoInfo, termWidth, termHeight int) *VideoPlayer {
-	charW := info.Width / 2
-	charH := info.Height / 4
+func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
+	// 初始计算输出尺寸
+	outWidth, outHeight := calculateOutputSize(
+		srcWidth, srcHeight,
+		termWidth, termHeight,
+	)
+
+	charW := outWidth / 2
+	charH := outHeight / 4
 
 	startCol := (termWidth - charW) / 2
 	startRow := (termHeight - charH) / 2
@@ -197,24 +206,19 @@ func NewVideoPlayer(filename string, info *VideoInfo, termWidth, termHeight int)
 		startRow = 0
 	}
 
-	fps := info.FPS
-	if fps <= 0 {
-		fps = 30
-	}
-	if fps > 60 {
-		fps = 60
-	}
-
 	return &VideoPlayer{
-		filename:    filename,
-		videoInfo:   info,
-		charW:       charW,
-		charH:       charH,
-		quit:        make(chan struct{}),
-		done:        make(chan struct{}),
-		fps:         fps,
-		frameTime:   time.Duration(float64(time.Second) / fps),
-		exposure:    1.0,
+		filename:  filename,
+		srcWidth:  srcWidth,
+		srcHeight: srcHeight,
+		outWidth:  outWidth,
+		outHeight: outHeight,
+		charW:     charW,
+		charH:     charH,
+		quit:      make(chan struct{}),
+		done:      make(chan struct{}),
+		fps:       30,
+		frameTime: time.Second / 30,
+		exposure:  1.0,
 		attenuation: 0.85,
 		termWidth:   termWidth,
 		termHeight:  termHeight,
@@ -222,6 +226,40 @@ func NewVideoPlayer(filename string, info *VideoInfo, termWidth, termHeight int)
 		startCol:    startCol,
 		renderer:    NewBrailleRenderer(charW, charH),
 	}
+}
+
+// updateTerminalSize 窗口变化时重新计算输出尺寸和居中位置
+func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
+	vp.termWidth = newWidth
+	vp.termHeight = newHeight
+
+	newOutW, newOutH := calculateOutputSize(
+		vp.srcWidth, vp.srcHeight,
+		newWidth, newHeight,
+	)
+
+	// 如果尺寸变了，标记需要重新解码
+	if newOutW != vp.outWidth || newOutH != vp.outHeight {
+		vp.outWidth = newOutW
+		vp.outHeight = newOutH
+		vp.charW = newOutW / 2
+		vp.charH = newOutH / 4
+		vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
+		vp.resizeNeeded = true
+	} else {
+		vp.resizeNeeded = false
+	}
+
+	newStartCol := (newWidth - vp.charW) / 2
+	newStartRow := (newHeight - vp.charH) / 2
+	if newStartCol < 0 {
+		newStartCol = 0
+	}
+	if newStartRow < 0 {
+		newStartRow = 0
+	}
+	vp.startCol = newStartCol
+	vp.startRow = newStartRow
 }
 
 // launchDecoder 启动 ffmpeg 解码进程，返回 frame reader
@@ -234,7 +272,7 @@ func (vp *VideoPlayer) launchDecoder() io.ReadCloser {
 			ffmpeg.KwArgs{
 				"format":   "rawvideo",
 				"pix_fmt":  "rgba",
-				"s":        fmt.Sprintf("%dx%d", vp.videoInfo.Width, vp.videoInfo.Height),
+				"s":        fmt.Sprintf("%dx%d", vp.outWidth, vp.outHeight),
 				"an":       "",
 				"sn":       "",
 			}).
@@ -258,14 +296,13 @@ func (vp *VideoPlayer) launchDecoder() io.ReadCloser {
 func (vp *VideoPlayer) startLoop() {
 	defer close(vp.done)
 
-	// 信号监听（只处理 SIGWINCH，退出信号由按键处理）
+	// 信号监听
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGWINCH)
 	defer signal.Stop(sigCh)
 
 	// 键盘输入 goroutine
 	keyCh := make(chan byte, 10)
-
 	go func() {
 		defer func() { recover() }()
 
@@ -282,7 +319,6 @@ func (vp *VideoPlayer) startLoop() {
 				close(keyCh)
 				return
 			}
-			// ESC 检测：区分 ESC 键和转义序列
 			if b == 27 {
 				type readResult struct {
 					b   byte
@@ -322,9 +358,9 @@ func (vp *VideoPlayer) startLoop() {
 		}
 	}()
 
-	frameSize := vp.videoInfo.Width * vp.videoInfo.Height * 4
+	var outputBuf strings.Builder
 
-	// 主循环（循环播放）
+	// 主循环（循环播放，窗口变化时重新解码）
 	for {
 		select {
 		case <-vp.quit:
@@ -334,15 +370,14 @@ func (vp *VideoPlayer) startLoop() {
 
 		// 启动解码器
 		frameReader := vp.launchDecoder()
+		frameSize := vp.outWidth * vp.outHeight * 4
 		fpsTicker := time.NewTicker(vp.frameTime)
 
-		var outputBuf strings.Builder
 		outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
-		// 每次循环开始时清屏，防止上一轮的残留
+		// 清屏
 		fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 
-		// 读取帧循环
 	frameLoop:
 		for {
 			select {
@@ -350,31 +385,16 @@ func (vp *VideoPlayer) startLoop() {
 				fpsTicker.Stop()
 				frameReader.Close()
 				return
-			case sig := <-sigCh:
-				if sig == syscall.SIGWINCH {
-					// 窗口变化：重新计算居中位置，清屏
-					newSize, err := getTerminalSize()
-					if err != nil {
-						continue
-					}
-					newCharW := vp.videoInfo.Width / 2
-					newCharH := vp.videoInfo.Height / 4
-					newStartCol := (newSize.Width - newCharW) / 2
-					newStartRow := (newSize.Height - newCharH) / 2
-					if newStartCol < 0 {
-						newStartCol = 0
-					}
-					if newStartRow < 0 {
-						newStartRow = 0
-					}
-					vp.termWidth = newSize.Width
-					vp.termHeight = newSize.Height
-					vp.startCol = newStartCol
-					vp.startRow = newStartRow
-
-					// 清屏消除残留
-					fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
+			case <-sigCh:
+				// 窗口变化：关闭当前解码器，重新计算尺寸，外层循环重新启动
+				newSize, err := getTerminalSize()
+				if err != nil {
+					continue
 				}
+				vp.updateTerminalSize(newSize.Width, newSize.Height)
+				fpsTicker.Stop()
+				frameReader.Close()
+				break frameLoop
 			case key, ok := <-keyCh:
 				if !ok {
 					fpsTicker.Stop()
@@ -393,14 +413,14 @@ func (vp *VideoPlayer) startLoop() {
 			buf := make([]byte, frameSize)
 			n, err := io.ReadFull(frameReader, buf)
 			if err != nil || n != frameSize {
-				// 视频结束 → 跳出帧循环，重新启动
+				// 视频结束 → 循环重新播放
 				fpsTicker.Stop()
 				frameReader.Close()
 				break frameLoop
 			}
 
 			// 渲染
-			imgData := rawRGBAToColorData(buf, vp.videoInfo.Width, vp.videoInfo.Height)
+			imgData := rawRGBAToColorData(buf, vp.outWidth, vp.outHeight)
 			vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
 
 			// 构建输出
@@ -444,11 +464,6 @@ func (vp *VideoPlayer) Stop() {
 	}
 }
 
-// Wait 等待播放结束
-func (vp *VideoPlayer) Wait() {
-	<-vp.done
-}
-
 // ==================== 播放入口 ====================
 
 func playVideo(filename string) error {
@@ -472,22 +487,16 @@ func playVideo(filename string) error {
 	fmt.Printf("\033[%d;%dH\033[90m正在探测视频...%s",
 		termSize.Height/2, termSize.Width/2-10, RESET_COLORS)
 
-	// 探测视频信息
+	// 探测视频信息（获取原始尺寸）
 	info, err := probeVideo(filename)
 	if err != nil {
 		return fmt.Errorf("视频探测失败: %v", err)
 	}
 
-	// 计算输出尺寸
-	outWidth, outHeight := calculateOutputSize(
-		info.Width, info.Height,
-		termSize.Width, termSize.Height,
-	)
-	info.Width = outWidth
-	info.Height = outHeight
-
-	// 创建播放器
-	player := NewVideoPlayer(filename, info, termSize.Width, termSize.Height)
+	// 创建播放器（传入原始尺寸，内部会根据终端尺寸计算输出尺寸）
+	player := NewVideoPlayer(filename, info.Width, info.Height, termSize.Width, termSize.Height)
+	player.fps = info.FPS
+	player.frameTime = time.Duration(float64(time.Second) / info.FPS)
 
 	// 设置键盘 raw 模式
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
