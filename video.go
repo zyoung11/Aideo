@@ -1,8 +1,7 @@
 package main
 
 import (
-	"bufio"
-	"encoding/binary"
+		"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -460,6 +459,20 @@ func (as *audioStreamer) Close() {
 	}
 }
 
+// noopAudioStreamer 是一个静默的音频流，用于无音轨的视频，避免 speaker 相关死锁
+type noopAudioStreamer struct{}
+
+func (n *noopAudioStreamer) Stream(samples [][2]float64) (int, bool) {
+	for i := range samples {
+		samples[i][0] = 0
+		samples[i][1] = 0
+	}
+	return len(samples), true
+}
+
+func (n *noopAudioStreamer) Err() error { return nil }
+func (n *noopAudioStreamer) Close()     {}
+
 // ==================== 播放循环 ====================
 
 // startLoop 循环播放，使用双缓冲 decoder 实现无缝循环
@@ -471,61 +484,43 @@ func (vp *VideoPlayer) startLoop() {
 	signal.Notify(sigCh, syscall.SIGWINCH)
 	defer signal.Stop(sigCh)
 
-	// 键盘输入 goroutine
+	// 键盘输入 goroutine — 使用 os.Stdin.Read（非缓冲），参考 main.go 中图片模式的实现
 	keyCh := make(chan byte, 10)
-	keyDone := make(chan struct{})
 	go func() {
 		defer func() { recover() }()
-		defer close(keyDone)
 
-		oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
-		if err != nil {
-			return
-		}
-		defer term.Restore(int(os.Stdin.Fd()), oldState)
-
-		reader := bufio.NewReader(os.Stdin)
+		buf := make([]byte, 3)
 		for {
-			b, err := reader.ReadByte()
-			if err != nil {
+			n, err := os.Stdin.Read(buf)
+			if err != nil || n == 0 {
 				close(keyCh)
 				return
 			}
-			if b == 27 {
-				type readResult struct {
-					b   byte
-					err error
-				}
-				ch := make(chan readResult, 1)
-				go func() {
-					nb, ne := reader.ReadByte()
-					ch <- readResult{nb, ne}
-				}()
 
-				select {
-				case r := <-ch:
-					if r.err == nil {
-						next := r.b
-						if next == '[' || next == 'O' || next == 'M' {
-							for {
-								rb, re := reader.ReadByte()
-								if re != nil {
-									break
-								}
-								if (rb >= 'A' && rb <= 'Z') || (rb >= 'a' && rb <= 'z') || rb == '~' {
-									break
-								}
+			for i := 0; i < n; i++ {
+				b := buf[i]
+
+				// ESC 或转义序列处理
+				if b == 27 && i+1 < n {
+					next := buf[i+1]
+					if next == '[' || next == 'O' || next == 'M' {
+						i += 2
+						for i < n {
+							ch := buf[i]
+							i++
+							if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || ch == '~' {
+								break
 							}
-							continue
 						}
+						continue
 					}
-				case <-time.After(50 * time.Millisecond):
 				}
-			}
 
-			select {
-			case keyCh <- b:
-			default:
+				// 普通按键直接发送
+				select {
+				case keyCh <- b:
+				default:
+				}
 			}
 		}
 	}()
@@ -534,13 +529,29 @@ func (vp *VideoPlayer) startLoop() {
 	var outputBuf strings.Builder
 	outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
-	// 启动音频播放
-	audioStream := newAudioStreamer(vp.filename)
+	// 检测视频是否有音频流
+	hasAudio := hasAudioStream(vp.filename)
+
+	// 根据是否有音频选择合适的音频流
+	var audioStream beep.Streamer
+	var closer func()
+	if hasAudio {
+		s := newAudioStreamer(vp.filename)
+		audioStream = s
+		closer = func() { s.Close() }
+	} else {
+		s := &noopAudioStreamer{}
+		audioStream = s
+		closer = func() { s.Close() }
+	}
+
+	// 初始化 speaker 并播放音频
+	speakerInitialized := false
 	err := speaker.Init(beep.SampleRate(audioSampleRate), audioSampleRate/10)
 	if err == nil {
+		speakerInitialized = true
 		speaker.Play(beep.Seq(audioStream, beep.Callback(func() {})))
 	}
-	defer speaker.Close()
 
 	// 启动第一个视频解码器
 	currentDec := vp.spawnVideoDecoder()
@@ -553,28 +564,59 @@ func (vp *VideoPlayer) startLoop() {
 	fpsTicker := time.NewTicker(vp.frameTime)
 	defer fpsTicker.Stop()
 
+	// 窗口 resize 防抖
+	var resizePending bool
+	resizeTimer := time.NewTimer(0)
+	if !resizeTimer.Stop() {
+		<-resizeTimer.C
+	}
+	defer resizeTimer.Stop()
+
 	// 主帧循环
 	for {
 		select {
 		case <-vp.quit:
-			audioStream.Close()
+			closer()
+			if speakerInitialized {
+				speaker.Close()
+			}
 			currentDec.close()
 			nextDec.close()
 			return
 		case <-sigCh:
+			// 标记 resize 待处理，通过防抖避免频繁重建
+			resizePending = true
+			resizeTimer.Reset(200 * time.Millisecond)
+			continue
+		case <-resizeTimer.C:
+			if !resizePending {
+				continue
+			}
+			resizePending = false
+
 			// 窗口变化：丢弃所有解码器，重新开始
-			audioStream.Close()
+			closer()
 			currentDec.close()
 			nextDec.close()
 			vp.updateTerminalSizeFromSigwinch()
 			// 重新计算 frameSize
 			frameSize = vp.outWidth * vp.outHeight * 4
 			outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
-			audioStream = newAudioStreamer(vp.filename)
-			err = speaker.Init(beep.SampleRate(audioSampleRate), audioSampleRate/10)
-			if err == nil {
-				speaker.Play(beep.Seq(audioStream, beep.Callback(func() {})))
+
+			// 重新创建音频流（不重新 Init speaker，只在第一次初始化）
+			if hasAudio {
+				s := newAudioStreamer(vp.filename)
+				audioStream = s
+				closer = func() { s.Close() }
+				if speakerInitialized {
+					speaker.Play(beep.Seq(audioStream, beep.Callback(func() {})))
+				}
+			} else {
+				s := &noopAudioStreamer{}
+				audioStream = s
+				closer = func() { s.Close() }
 			}
+
 			currentDec = vp.spawnVideoDecoder()
 			nextDec = vp.spawnVideoDecoder()
 			// 清屏消除残留
@@ -582,13 +624,19 @@ func (vp *VideoPlayer) startLoop() {
 			continue
 		case key, ok := <-keyCh:
 			if !ok {
-				audioStream.Close()
+				closer()
+				if speakerInitialized {
+					speaker.Close()
+				}
 				currentDec.close()
 				nextDec.close()
 				return
 			}
 			if key == 'q' || key == 'Q' || key == 27 {
-				audioStream.Close()
+				closer()
+				if speakerInitialized {
+					speaker.Close()
+				}
 				currentDec.close()
 				nextDec.close()
 				return
@@ -655,6 +703,35 @@ func (vp *VideoPlayer) updateTerminalSizeFromSigwinch() {
 		return
 	}
 	vp.updateTerminalSize(newSize.Width, newSize.Height)
+}
+
+// ==================== 音频流检测 ====================
+
+func hasAudioStream(filename string) bool {
+	probeData, err := ffmpeg.Probe(filename)
+	if err != nil {
+		// 无法探测，默认有音频（安全处理）
+		return true
+	}
+
+	type ProbeStream struct {
+		CodecType string `json:"codec_type"`
+	}
+	type ProbeResult struct {
+		Streams []ProbeStream `json:"streams"`
+	}
+
+	var probe ProbeResult
+	if err := json.Unmarshal([]byte(probeData), &probe); err != nil {
+		return true
+	}
+
+	for _, s := range probe.Streams {
+		if s.CodecType == "audio" {
+			return true
+		}
+	}
+	return false
 }
 
 // ==================== 播放入口 ====================
