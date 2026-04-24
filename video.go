@@ -692,8 +692,8 @@ func (vp *VideoPlayer) startLoop() {
 				frameCount++
 			}
 
-			// 清屏消除残留
-			fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
+			// 清屏 + 定位光标到左上角 (1,1)
+			fmt.Print(CLEAR_SCREEN + "\x1b[1;1H")
 			continue
 		case key, ok := <-keyCh:
 			if !ok {
@@ -747,8 +747,9 @@ func (vp *VideoPlayer) startLoop() {
 		// 构建输出
 		outputBuf.Reset()
 		if useSixel {
-			// Sixel 模式：全屏画布，图像已在内部居中嵌入
-			// 直接输出在左上角 (1,1)
+			// Sixel 模式：先定位光标到左上角 (1,1)，再输出图像
+			// 图像已在 buildSixel 内部居中嵌入画布
+			outputBuf.WriteString("\x1b[1;1H")
 			outputBuf.WriteString(vp.sixelRenderer.String())
 		} else {
 			imageStr := vp.renderer.String()

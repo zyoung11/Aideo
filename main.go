@@ -153,8 +153,9 @@ func main() {
 	// 渲染图像
 	var imageStr string
 	if useSixel {
-		// Sixel 模式：全屏画布，直接输出在左上角 (1,1)
+		// Sixel 模式：全屏画布，先定位光标到左上角 (1,1)，再输出图像
 		// 图像已在 buildSixel 内部居中嵌入画布
+		fmt.Printf("\x1b[1;1H")
 		imageStr = sixelRenderer.String()
 		fmt.Print(imageStr)
 	} else {
@@ -289,12 +290,12 @@ func main() {
 					brailleRenderer.Render(scaledData, 1.0, 0.85)
 				}
 
-				// 清屏
-				fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
+				// 清屏 + 定位光标到左上角 (1,1)
+				fmt.Print(CLEAR_SCREEN + "\x1b[1;1H")
 
 				// 渲染图像
 				if useSixel {
-					// Sixel 全屏画布，输出在左上角
+					// Sixel 全屏画布，直接输出（光标已在 1;1）
 					fmt.Print(sixelRenderer.String())
 				} else {
 					// Braille 模式：计算居中位置
