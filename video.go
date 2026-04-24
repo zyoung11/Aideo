@@ -196,6 +196,9 @@ type VideoPlayer struct {
 	prevKittyID uint32
 	cellW       int
 	cellH       int
+
+	kittyBuf   bytes.Buffer // 复用 Kitty 渲染缓冲区
+	frameBuf   []byte        // 复用帧读取缓冲区
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -264,6 +267,18 @@ func (vp *VideoPlayer) initProto() {
 	}
 	if vp.startRow < 0 {
 		vp.startRow = 0
+	}
+
+	// 预分配 Kitty 渲染缓冲区：rawSize ~ outWidth*outHeight*4,
+	// 压缩后 ~60%, base64 后 ~x4/3, 加上转义序列开销
+	// 预分配能避免每帧 bytes.Buffer 动态扩容
+	if vp.proto == timage.ProtocolKitty {
+		rawFrameSize := vp.outWidth * vp.outHeight * 4
+		estimatedOutput := rawFrameSize * 3 / 4 + 4096 // 预估 base64+开销
+		if estimatedOutput > 512*1024 {
+			estimatedOutput = 512 * 1024
+		}
+		vp.kittyBuf.Grow(estimatedOutput)
 	}
 }
 
@@ -564,17 +579,18 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte, outputBuf *bytes.Buffer) {
 		vp.termHeight, RESET_COLORS)
 }
 
-func (vp *VideoPlayer) renderKittyFrame(raw []byte, outputBuf *bytes.Buffer) {
-	outputBuf.Reset()
-	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
-	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
-	newID := timage.EncodeKittyFrame(outputBuf, img, vp.charW, vp.charH)
+func (vp *VideoPlayer) renderKittyFrame(raw []byte) {
+	vp.kittyBuf.Reset()
+	fmt.Fprintf(&vp.kittyBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
+	// 直接编码 raw RGBA 字节，跳过 image.RGBA 创建和 draw.Draw
+	newID := timage.EncodeKittyFrameRaw(&vp.kittyBuf, raw, vp.outWidth, vp.outHeight, vp.charW, vp.charH)
 	if vp.prevKittyID != 0 && vp.prevKittyID != newID {
-		timage.DeleteKittyFrame(outputBuf, vp.prevKittyID)
+		timage.DeleteKittyFrame(&vp.kittyBuf, vp.prevKittyID)
 	}
 	vp.prevKittyID = newID
-	fmt.Fprintf(outputBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
+	fmt.Fprintf(&vp.kittyBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
 		vp.termHeight, RESET_COLORS)
+	os.Stdout.Write(vp.kittyBuf.Bytes())
 }
 
 func (vp *VideoPlayer) cleanupFrame() {
@@ -749,7 +765,10 @@ func (vp *VideoPlayer) startLoop() {
 				framesToCatch = 0
 			}
 
-			catchUpBuf := make([]byte, frameSize)
+			if cap(vp.frameBuf) < frameSize {
+				vp.frameBuf = make([]byte, frameSize)
+			}
+			catchUpBuf := vp.frameBuf[:frameSize]
 			for i := 0; i < framesToCatch; i++ {
 				n, err := io.ReadFull(currentDec.reader, catchUpBuf)
 				if err != nil || n != frameSize {
@@ -791,8 +810,11 @@ func (vp *VideoPlayer) startLoop() {
 		default:
 		}
 
-		// 读取一帧
-		buf := make([]byte, frameSize)
+		// 读取一帧（复用缓冲区，避免每帧大块分配）
+		if cap(vp.frameBuf) < frameSize {
+			vp.frameBuf = make([]byte, frameSize)
+		}
+		buf := vp.frameBuf[:frameSize]
 		n, err := io.ReadFull(currentDec.reader, buf)
 		if err != nil || n != frameSize {
 			// 当前视频结束 → 无缝切换到下一个 decoder
@@ -818,9 +840,7 @@ func (vp *VideoPlayer) startLoop() {
 			vp.renderSixelFrame(buf, &b)
 			os.Stdout.Write(b.Bytes())
 		case timage.ProtocolKitty:
-			var b bytes.Buffer
-			vp.renderKittyFrame(buf, &b)
-			os.Stdout.Write(b.Bytes())
+			vp.renderKittyFrame(buf)
 		default:
 			vp.renderAsciiFrame(buf, &outputBuf)
 		}

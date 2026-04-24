@@ -98,6 +98,29 @@ type DisplayResult struct {
 
 var kittyImageID uint32 = uint32(os.Getpid()<<16) + uint32(time.Now().UnixMicro()&0xFFFF)
 
+// kittyZlibPool 复用 zlib.Writer，减少每帧的分配开销
+var kittyZlibPool = sync.Pool{
+	New: func() interface{} {
+		w, _ := zlib.NewWriterLevel(nil, zlib.BestSpeed)
+		return w
+	},
+}
+
+// kittyCompressPool 复用压缩用的 bytes.Buffer
+var kittyCompressPool = sync.Pool{
+	New: func() interface{} {
+		return new(bytes.Buffer)
+	},
+}
+
+// kittyBase64Pool 复用 base64 编码缓冲区，避免每帧分配大 []byte
+var kittyBase64Pool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 256*1024) // 256KB 初始容量
+		return buf
+	},
+}
+
 var termGetSize = func(fd int) (int, int, error) {
 	return term.GetSize(fd)
 }
@@ -506,53 +529,138 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 	var compressed bool
 	var compData []byte
 	if len(data) > 1024 {
-		var buf bytes.Buffer
-		z, _ := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
-		z.Write(data)
-		z.Close()
+		buf := kittyCompressPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		zw := kittyZlibPool.Get().(*zlib.Writer)
+		zw.Reset(buf)
+		zw.Write(data)
+		zw.Close()
 		compData = buf.Bytes()
 		compressed = true
+		kittyZlibPool.Put(zw)
+		kittyCompressPool.Put(buf)
 	} else {
 		compData = data
 	}
 
-	encoded := base64.StdEncoding.EncodeToString(compData)
+	// Base64 编码到池化缓冲区，避免 string 分配
+	encLen := base64.StdEncoding.EncodedLen(len(compData))
+	base64Raw := kittyBase64Pool.Get().([]byte)
+	if cap(base64Raw) < encLen {
+		base64Raw = make([]byte, encLen)
+	}
+	base64Buf := base64Raw[:encLen]
+	base64.StdEncoding.Encode(base64Buf, compData)
 
-	var control string
+	// 控制头部
 	if compressed {
-		control = fmt.Sprintf("a=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2,o=z",
+		fmt.Fprintf(w, "\x1b_Ga=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2,o=z",
 			imageID, pixelW, pixelH, c, r)
 	} else {
-		control = fmt.Sprintf("a=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
+		fmt.Fprintf(w, "\x1b_Ga=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
 			imageID, pixelW, pixelH, c, r)
 	}
 
-	chunkSize := 4096
-	first := true
-	for i := 0; i < len(encoded); i += chunkSize {
-		end := i + chunkSize
-		if end > len(encoded) {
-			end = len(encoded)
+	// 分块发送
+	for i := 0; i < encLen; i += 4096 {
+		end := i + 4096
+		if end > encLen {
+			end = encLen
 		}
-		chunk := encoded[i:end]
+		chunk := base64Buf[i:end]
 
-		var seq string
-		if first {
-			first = false
-			if end < len(encoded) {
-				seq = fmt.Sprintf("\x1b_G%s,m=1;%s\x1b\\", control, chunk)
+		if i == 0 {
+			// 第一块：接在已有的控制头部后面
+			if i+4096 < encLen {
+				fmt.Fprintf(w, ",m=1;%s\x1b\\", chunk)
 			} else {
-				seq = fmt.Sprintf("\x1b_G%s;%s\x1b\\", control, chunk)
+				fmt.Fprintf(w, ";%s\x1b\\", chunk)
 			}
 		} else {
-			if end < len(encoded) {
-				seq = fmt.Sprintf("\x1b_Gm=1,q=2;%s\x1b\\", chunk)
+			// 后续块：需要完整的 \x1b_G 转义序列
+			if i+4096 < encLen {
+				fmt.Fprintf(w, "\x1b_Gm=1,q=2;%s\x1b\\", chunk)
 			} else {
-				seq = fmt.Sprintf("\x1b_Gm=0,q=2;%s\x1b\\", chunk)
+				fmt.Fprintf(w, "\x1b_Gm=0,q=2;%s\x1b\\", chunk)
 			}
 		}
-		fmt.Fprint(w, seq)
 	}
+
+	kittyBase64Pool.Put(base64Raw[:0])
+	return imageID
+}
+
+// EncodeKittyFrameRaw 直接从原始 RGBA 字节编码 Kitty 图像，跳过 image.RGBA 创建和 draw.Draw
+// data 是 raw RGBA 字节 (4 bytes/pixel, R,G,B,A 顺序)
+func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uint32 {
+	imageID := atomic.AddUint32(&kittyImageID, 1)
+
+	// 1. 压缩（使用池化 Buffer，避免分配）
+	var compressed bool
+	var compData []byte
+
+	if len(data) > 1024 {
+		buf := kittyCompressPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		zw := kittyZlibPool.Get().(*zlib.Writer)
+		zw.Reset(buf)
+		_, _ = zw.Write(data)
+		zw.Close()
+		compData = buf.Bytes()
+		compressed = true
+		kittyZlibPool.Put(zw)
+		kittyCompressPool.Put(buf)
+	} else {
+		compData = data
+	}
+
+	// 2. base64 编码到池化缓冲区（避免 EncodeToString 的 string 分配）
+	encLen := base64.StdEncoding.EncodedLen(len(compData))
+	base64Raw := kittyBase64Pool.Get().([]byte)
+	if cap(base64Raw) < encLen {
+		base64Raw = make([]byte, encLen)
+	}
+	base64Buf := base64Raw[:encLen]
+	base64.StdEncoding.Encode(base64Buf, compData)
+
+	// 3. 发送控制头部
+	if compressed {
+		fmt.Fprintf(w, "\x1b_Ga=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2,o=z",
+			imageID, pixelW, pixelH, c, r)
+	} else {
+		fmt.Fprintf(w, "\x1b_Ga=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
+			imageID, pixelW, pixelH, c, r)
+	}
+
+	// 4. 分块发送（每块 128KB，减少转义序列数量）
+	const chunkSize = 131072
+	for i := 0; i < encLen; i += chunkSize {
+		end := i + chunkSize
+		if end > encLen {
+			end = encLen
+		}
+		chunk := base64Buf[i:end]
+
+		if i == 0 {
+			// 第一块：接在已有的控制头部后面
+			if i+chunkSize < encLen {
+				fmt.Fprintf(w, ",m=1;%s\x1b\\", chunk)
+			} else {
+				fmt.Fprintf(w, ";%s\x1b\\", chunk)
+			}
+		} else {
+			// 后续块：需要完整的 \x1b_G 转义序列
+			if i+chunkSize < encLen {
+				fmt.Fprintf(w, "\x1b_Gm=1,q=2;%s\x1b\\", chunk)
+			} else {
+				fmt.Fprintf(w, "\x1b_Gm=0,q=2;%s\x1b\\", chunk)
+			}
+		}
+	}
+
+	// 5. 归还 base64 缓冲区
+	kittyBase64Pool.Put(base64Raw[:0])
+
 	return imageID
 }
 
