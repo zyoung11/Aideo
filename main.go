@@ -42,7 +42,11 @@ func main() {
 
 	// 如果是视频文件，直接播放视频
 	if isVideoFile(filename) {
-		initVideoPlayback(filename)
+		proto := timage.ProtocolAuto
+		if p, ok := timage.DetectCapableProtocol(); ok {
+			proto = p
+		}
+		initVideoPlayback(filename, proto)
 		return
 	}
 

@@ -8,6 +8,7 @@ import (
 	"image"
 	"image/draw"
 	"image/png"
+	"io"
 	"math"
 	"os"
 	"os/signal"
@@ -474,11 +475,20 @@ func analyzeDominant(img image.Image) (int, int, int) {
 }
 
 func renderSixel(img image.Image, colors int, dither bool) error {
-	enc := &sixelEncoder{w: os.Stdout, Colors: colors, Dither: dither, Workers: runtime.NumCPU()}
-	return enc.Encode(img)
+	return EncodeSixelFrame(os.Stdout, img, colors, dither)
 }
 
 func renderKitty(img image.Image, widthChars, heightChars int) error {
+	EncodeKittyFrame(os.Stdout, img, widthChars, heightChars)
+	return nil
+}
+
+func EncodeSixelFrame(w io.Writer, img image.Image, colors int, dither bool) error {
+	enc := &sixelEncoder{w: w, Colors: colors, Dither: dither, Workers: runtime.NumCPU()}
+	return enc.Encode(img)
+}
+
+func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 	bounds := img.Bounds()
 	pixelW := bounds.Dx()
 	pixelH := bounds.Dy()
@@ -491,15 +501,11 @@ func renderKitty(img image.Image, widthChars, heightChars int) error {
 
 	var compressed bool
 	var compData []byte
-
 	if len(data) > 1024 {
 		var buf bytes.Buffer
-		w, err := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
-		if err != nil {
-			return err
-		}
-		w.Write(data)
-		w.Close()
+		z, _ := zlib.NewWriterLevel(&buf, zlib.BestSpeed)
+		z.Write(data)
+		z.Close()
 		compData = buf.Bytes()
 		compressed = true
 	} else {
@@ -511,10 +517,10 @@ func renderKitty(img image.Image, widthChars, heightChars int) error {
 	var control string
 	if compressed {
 		control = fmt.Sprintf("a=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2,o=z",
-			imageID, pixelW, pixelH, widthChars, heightChars)
+			imageID, pixelW, pixelH, c, r)
 	} else {
 		control = fmt.Sprintf("a=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
-			imageID, pixelW, pixelH, widthChars, heightChars)
+			imageID, pixelW, pixelH, c, r)
 	}
 
 	chunkSize := 4096
@@ -541,9 +547,13 @@ func renderKitty(img image.Image, widthChars, heightChars int) error {
 				seq = fmt.Sprintf("\x1b_Gm=0,q=2;%s\x1b\\", chunk)
 			}
 		}
-		fmt.Print(seq)
+		fmt.Fprint(w, seq)
 	}
-	return nil
+	return imageID
+}
+
+func DeleteKittyFrame(w io.Writer, id uint32) {
+	fmt.Fprintf(w, "\x1b_Ga=d,d=i,i=%d\x1b\\", id)
 }
 
 // encodePNG is unused but kept for potential iTerm2 support; suppress unused warning.

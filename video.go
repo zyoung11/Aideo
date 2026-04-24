@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
 	"io"
 	"math"
 	"os"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	timage "Aideo/image"
 
 	"github.com/gopxl/beep/v2"
 	"github.com/gopxl/beep/v2/speaker"
@@ -187,7 +190,9 @@ type VideoPlayer struct {
 	startRow   int
 	startCol   int
 
-	renderer *BrailleRenderer
+	renderer    *BrailleRenderer
+	proto       timage.Protocol
+	prevKittyID uint32
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -486,6 +491,63 @@ func (n *noopAudioStreamer) Close()     {}
 
 // ==================== 播放循环 ====================
 
+func rawBytesToRGBA(raw []byte, w, h int) *image.RGBA {
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	copy(img.Pix, raw)
+	return img
+}
+
+func (vp *VideoPlayer) renderAsciiFrame(raw []byte, outputBuf *strings.Builder) {
+	imgData := rawRGBAToColorData(raw, vp.outWidth, vp.outHeight)
+	vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
+
+	imageStr := vp.renderer.String()
+	lines := strings.Split(imageStr, "\n")
+
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
+			vp.startRow+i+1, vp.startCol+1, line))
+	}
+
+	if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
+		clearStartCol := vp.startCol + vp.charW + 1
+		for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
+			outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
+		}
+	}
+}
+
+func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
+	fmt.Print("\033[2J")
+	fmt.Printf("\033[%d;%dH", vp.startRow, vp.startCol)
+	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
+	timage.EncodeSixelFrame(os.Stdout, img, 255, false)
+}
+
+func (vp *VideoPlayer) renderKittyFrame(raw []byte) {
+	if vp.prevKittyID != 0 {
+		timage.DeleteKittyFrame(os.Stdout, vp.prevKittyID)
+	}
+	fmt.Printf("\033[%d;%dH", vp.startRow, vp.startCol)
+	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
+	vp.prevKittyID = timage.EncodeKittyFrame(os.Stdout, img, vp.charW, vp.charH)
+}
+
+func (vp *VideoPlayer) cleanupFrame() {
+	switch vp.proto {
+	case timage.ProtocolKitty:
+		if vp.prevKittyID != 0 {
+			timage.DeleteKittyFrame(os.Stdout, vp.prevKittyID)
+		}
+		fmt.Print("\033[2J\033[3J\033[H")
+	case timage.ProtocolSixel:
+		fmt.Print("\033[2J\033[3J\033[H")
+	}
+}
+
 // startLoop 循环播放，使用双缓冲 decoder 实现无缝循环
 func (vp *VideoPlayer) startLoop() {
 	defer close(vp.done)
@@ -596,6 +658,7 @@ func (vp *VideoPlayer) startLoop() {
 			}
 			currentDec.close()
 			nextDec.close()
+			vp.cleanupFrame()
 			return
 		case <-sigCh:
 			// 标记 resize 待处理，通过防抖避免频繁重建
@@ -671,6 +734,7 @@ func (vp *VideoPlayer) startLoop() {
 				}
 				currentDec.close()
 				nextDec.close()
+				vp.cleanupFrame()
 				return
 			}
 			if key == 'q' || key == 'Q' || key == 27 {
@@ -680,6 +744,7 @@ func (vp *VideoPlayer) startLoop() {
 				}
 				currentDec.close()
 				nextDec.close()
+				vp.cleanupFrame()
 				return
 			}
 		default:
@@ -704,29 +769,15 @@ func (vp *VideoPlayer) startLoop() {
 		// 帧计数（用于 resize seek）
 		frameCount++
 
-		// 渲染
-		imgData := rawRGBAToColorData(buf, vp.outWidth, vp.outHeight)
-		vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
-
-		// 构建输出
 		outputBuf.Reset()
-		imageStr := vp.renderer.String()
-		lines := strings.Split(imageStr, "\n")
 
-		for i, line := range lines {
-			if line == "" {
-				continue
-			}
-			outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
-				vp.startRow+i+1, vp.startCol+1, line))
-		}
-
-		// 清除右侧空白
-		if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
-			clearStartCol := vp.startCol + vp.charW + 1
-			for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
-				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
-			}
+		switch vp.proto {
+		case timage.ProtocolSixel:
+			vp.renderSixelFrame(buf)
+		case timage.ProtocolKitty:
+			vp.renderKittyFrame(buf)
+		default:
+			vp.renderAsciiFrame(buf, &outputBuf)
 		}
 
 		// 底部提示
@@ -780,39 +831,40 @@ func hasAudioStream(filename string) bool {
 
 // ==================== 播放入口 ====================
 
-func playVideo(filename string) error {
-	// 获取终端尺寸
+func playVideo(filename string, proto timage.Protocol) error {
 	termSize, err := getTerminalSize()
 	if err != nil {
 		return fmt.Errorf("获取终端尺寸失败: %v", err)
 	}
 
-	// 进入 alternate screen
-	fmt.Print(ENTER_ALTERNATE)
+	useProto := proto != timage.ProtocolAuto
+	if !useProto {
+		fmt.Print(ENTER_ALTERNATE)
+	}
 	fmt.Print(HIDE_CURSOR)
 	fmt.Print(DISABLE_MOUSE)
 	defer func() {
 		fmt.Print(ENABLE_MOUSE)
 		fmt.Print(SHOW_CURSOR)
-		fmt.Print(LEAVE_ALTERNATE)
+		if !useProto {
+			fmt.Print(LEAVE_ALTERNATE)
+		}
 	}()
 
 	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 	fmt.Printf("\033[%d;%dH\033[90m正在探测视频...%s",
 		termSize.Height/2, termSize.Width/2-10, RESET_COLORS)
 
-	// 探测视频信息
 	info, err := probeVideo(filename)
 	if err != nil {
 		return fmt.Errorf("视频探测失败: %v", err)
 	}
 
-	// 创建播放器
 	player := NewVideoPlayer(filename, info.Width, info.Height, termSize.Width, termSize.Height)
 	player.fps = info.FPS
 	player.frameTime = time.Duration(float64(time.Second) / info.FPS)
+	player.proto = proto
 
-	// 设置键盘 raw 模式
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
 		return fmt.Errorf("无法设置 raw 模式: %v", err)
@@ -835,7 +887,7 @@ func isVideoFile(filename string) bool {
 
 // ==================== 视频播放入口（供 main.go 调用） ====================
 
-func initVideoPlayback(filename string) {
+func initVideoPlayback(filename string, proto timage.Protocol) {
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Print(ENABLE_MOUSE)
@@ -846,7 +898,7 @@ func initVideoPlayback(filename string) {
 		}
 	}()
 
-	err := playVideo(filename)
+	err := playVideo(filename, proto)
 	if err != nil {
 		fmt.Print(ENABLE_MOUSE)
 		fmt.Print(SHOW_CURSOR)
