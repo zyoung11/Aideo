@@ -97,27 +97,23 @@ func main() {
 
 	// 按模式初始化渲染
 	if useSixel {
-		// Sixel 全屏画布尺寸 = 终端物理像素
-		// 图像按比例缩放，居中嵌入画布
-		canvasW, canvasH := getTerminalPixelSize(termSize.Width, termSize.Height)
-		// 计算图像在该画布中的缩放尺寸
+		// Sixel 模式：只创建图像尺寸的画布，然后定位光标居中
 		outWidth, outHeight = calculateSixelOutputSize(
 			imgData.Width, imgData.Height,
 			termSize.Width, termSize.Height,
 		)
-		fmt.Printf("终端像素: %dx%d, 图像渲染: %dx%d\n", canvasW, canvasH, outWidth, outHeight)
+		fmt.Printf("图像渲染: %dx%d 像素\n", outWidth, outHeight)
 
 		scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
 
-		// Sixel 画布填满整个终端，图像居中嵌入
-		sixelRenderer = NewSixelRenderer(canvasW, canvasH)
-		sixelRenderer.setImagePlacement(outWidth, outHeight)
+		// 创建与图像尺寸相同的画布（不需要全屏画布）
+		sixelRenderer = NewSixelRenderer(outWidth, outHeight)
 		sixelRenderer.Render(scaledData, 1.0, 0.85)
 
-		// 六角形模式下 charW/charH 不再用于居中，仅用于显示信息
-		charW = canvasW
-		charH = canvasH
-		fmt.Printf("Sixel 画布: %dx%d 像素\n", canvasW, canvasH)
+		// 计算字符尺寸用于光标定位
+		charW = (outWidth + defaultCellPixelW - 1) / defaultCellPixelW
+		charH = (outHeight + defaultCellPixelH - 1) / defaultCellPixelH
+		fmt.Printf("Sixel 图像: %dx%d 像素, 约 %dx%d 字符\n", outWidth, outHeight, charW, charH)
 	} else {
 		outWidth, outHeight = calculateOutputSize(
 			imgData.Width, imgData.Height,
@@ -153,9 +149,18 @@ func main() {
 	// 渲染图像
 	var imageStr string
 	if useSixel {
-		// Sixel 模式：全屏画布，先定位光标到左上角 (1,1)，再输出图像
-		// 图像已在 buildSixel 内部居中嵌入画布
-		fmt.Printf("\x1b[1;1H")
+		// Sixel 模式：计算居中位置并输出
+		startCol := (termSize.Width - charW) / 2
+		startRow := (termSize.Height - charH) / 2
+		if startCol < 1 {
+			startCol = 1
+		}
+		if startRow < 1 {
+			startRow = 1
+		}
+		// 清屏并定位光标到居中位置
+		fmt.Print(CLEAR_SCREEN)
+		fmt.Printf("\x1b[%d;%dH", startRow, startCol)
 		imageStr = sixelRenderer.String()
 		fmt.Print(imageStr)
 	} else {

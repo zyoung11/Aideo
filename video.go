@@ -193,22 +193,21 @@ type VideoPlayer struct {
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
 	var (
-		canvasW, canvasH    int
 		outWidth, outHeight int
 		charW, charH        int
 	)
 
-	canvasW, canvasH = getTerminalPixelSize(termWidth, termHeight)
-
 	if useSixel {
 		outWidth, outHeight = calculateSixelOutputSize(srcWidth, srcHeight, termWidth, termHeight)
+		// Sixel 模式：charW/charH 是图像像素尺寸转换为字符尺寸，用于光标定位
+		charW = (outWidth + defaultCellPixelW - 1) / defaultCellPixelW
+		charH = (outHeight + defaultCellPixelH - 1) / defaultCellPixelH
 	} else {
 		outWidth, outHeight = calculateOutputSize(srcWidth, srcHeight, termWidth, termHeight)
+		// Braille 模式下需要字符网格尺寸用于居中
+		charW = outWidth / 2
+		charH = outHeight / 4
 	}
-
-	// Braille 模式下需要字符网格尺寸用于居中
-	charW = outWidth / 2
-	charH = outHeight / 4
 
 	startCol := (termWidth - charW) / 2
 	startRow := (termHeight - charH) / 2
@@ -220,29 +219,22 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 	}
 
 	vp := &VideoPlayer{
-		filename:    filename,
-		srcWidth:    srcWidth,
-		srcHeight:   srcHeight,
-		outWidth:    outWidth,
-		outHeight:   outHeight,
-		charW:       charW,
-		charH:       charH,
-		quit:        make(chan struct{}),
-		done:        make(chan struct{}),
-		fps:         30,
-		frameTime:   time.Second / 30,
-		exposure:    1.0,
-		attenuation: 0.85,
-		termWidth:   termWidth,
-		termHeight:  termHeight,
-		startRow:    startRow,
-		startCol:    startCol,
+		filename:   filename,
+		srcWidth:   srcWidth,
+		srcHeight:  srcHeight,
+		outWidth:   outWidth,
+		outHeight:  outHeight,
+		charW:      charW,
+		charH:      charH,
+		termWidth:  termWidth,
+		termHeight: termHeight,
+		startRow:   startRow,
+		startCol:   startCol,
 	}
 
 	if useSixel {
-		// Sixel 渲染器使用全屏画布，图像居中嵌入
-		vp.sixelRenderer = NewSixelRenderer(canvasW, canvasH)
-		vp.sixelRenderer.setImagePlacement(outWidth, outHeight)
+		// Sixel 渲染器使用图像尺寸画布（不需要全屏）
+		vp.sixelRenderer = NewSixelRenderer(outWidth, outHeight)
 	} else {
 		vp.renderer = NewBrailleRenderer(charW, charH)
 	}
@@ -255,8 +247,6 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	vp.termWidth = newWidth
 	vp.termHeight = newHeight
 
-	canvasW, canvasH := getTerminalPixelSize(newWidth, newHeight)
-
 	if useSixel {
 		newOutW, newOutH := calculateSixelOutputSize(
 			vp.srcWidth, vp.srcHeight,
@@ -264,8 +254,11 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 		)
 		vp.outWidth = newOutW
 		vp.outHeight = newOutH
-		vp.sixelRenderer = NewSixelRenderer(canvasW, canvasH)
-		vp.sixelRenderer.setImagePlacement(newOutW, newOutH)
+		// 更新字符尺寸用于光标定位
+		vp.charW = (newOutW + defaultCellPixelW - 1) / defaultCellPixelW
+		vp.charH = (newOutH + defaultCellPixelH - 1) / defaultCellPixelH
+		// 重新创建Sixel渲染器（图像尺寸画布）
+		vp.sixelRenderer = NewSixelRenderer(newOutW, newOutH)
 	} else {
 		newOutW, newOutH := calculateOutputSize(
 			vp.srcWidth, vp.srcHeight,
@@ -747,9 +740,9 @@ func (vp *VideoPlayer) startLoop() {
 		// 构建输出
 		outputBuf.Reset()
 		if useSixel {
-			// Sixel 模式：先定位光标到左上角 (1,1)，再输出图像
-			// 图像已在 buildSixel 内部居中嵌入画布
-			outputBuf.WriteString("\x1b[1;1H")
+			// Sixel 模式：定位光标到居中位置，再输出图像
+			outputBuf.WriteString(fmt.Sprintf("\x1b[%d;%dH",
+				vp.startRow+1, vp.startCol+1))
 			outputBuf.WriteString(vp.sixelRenderer.String())
 		} else {
 			imageStr := vp.renderer.String()
