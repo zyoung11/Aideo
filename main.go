@@ -2,10 +2,16 @@ package main
 
 import (
 	"fmt"
+	"image"
+	"image/draw"
+	_ "image/jpeg"
+	_ "image/png"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+
+	timage "Aideo/image"
 
 	"golang.org/x/term"
 )
@@ -40,21 +46,36 @@ func main() {
 		return
 	}
 
+	protocol, hasProtocol := timage.DetectCapableProtocol()
+	if hasProtocol {
+		img, err := loadImageAsRGBA(filename)
+		if err != nil {
+			fmt.Printf("错误: %v\n", err)
+			os.Exit(1)
+		}
+		cfg := timage.DefaultConfig()
+		cfg.Img = img
+		cfg.ForceProtocol = protocol
+		_, err = timage.ShowImage(cfg)
+		timage.ClearImage(protocol)
+		if err != nil {
+			fmt.Printf("错误: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
 	termSize, err := getTerminalSize()
 	if err != nil {
 		fmt.Printf("获取终端尺寸失败: %v，使用默认 80x24\n", err)
 		termSize = &TerminalSize{Width: 80, Height: 24}
 	}
 
-	fmt.Printf("终端尺寸: %dx%d\n", termSize.Width, termSize.Height)
-
-	fmt.Printf("加载图像: %s\n", filename)
 	imgData, err := loadImage(filename)
 	if err != nil {
 		fmt.Printf("错误: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("原始尺寸: %dx%d\n", imgData.Width, imgData.Height)
 
 	var (
 		outWidth, outHeight int
@@ -67,14 +88,10 @@ func main() {
 		imgData.Width, imgData.Height,
 		termSize.Width, termSize.Height,
 	)
-	fmt.Printf("输出像素: %dx%d\n", outWidth, outHeight)
-
 	scaledData = resizeImageBilinear(imgData, outWidth, outHeight)
 
 	charW = outWidth / 2
 	charH = outHeight / 4
-	fmt.Printf("渲染尺寸: %dx%d 字符 (Braille 2×4, 共 %d 像素)\n",
-		charW, charH, charW*charH*8)
 
 	brailleRenderer = NewBrailleRenderer(charW, charH)
 	brailleRenderer.Render(scaledData, 1.0, 0.85)
@@ -254,4 +271,22 @@ func main() {
 			// 忽略其他所有输入
 		}
 	}
+}
+
+func loadImageAsRGBA(filename string) (*image.RGBA, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("无法打开文件: %v", err)
+	}
+	defer file.Close()
+
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return nil, fmt.Errorf("解码图像失败: %v", err)
+	}
+
+	bounds := img.Bounds()
+	rgba := image.NewRGBA(bounds)
+	draw.Draw(rgba, rgba.Bounds(), img, bounds.Min, draw.Src)
+	return rgba, nil
 }

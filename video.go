@@ -222,6 +222,8 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 		termHeight: termHeight,
 		startRow:   startRow,
 		startCol:   startCol,
+		quit:       make(chan struct{}),
+		done:       make(chan struct{}),
 	}
 
 	vp.renderer = NewBrailleRenderer(charW, charH)

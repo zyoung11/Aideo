@@ -4,6 +4,7 @@ go 1.26.2
 
 require (
 	github.com/gopxl/beep/v2 v2.1.1
+	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646
 	github.com/soniakeys/quant v1.0.0
 	github.com/u2takey/ffmpeg-go v0.5.0
 	golang.org/x/term v0.42.0
