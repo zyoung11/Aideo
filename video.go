@@ -242,6 +242,21 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 	return vp
 }
 
+// maxVideoDim 根据终端字符尺寸和单元格像素计算视频输出分辨率上限
+// 目标：尽量填满终端，Kitty 模式下最大 1920 像素
+func maxVideoDim(termChars, cellPx int) int {
+	termPx := (termChars - 2) * cellPx
+	// 约占终端宽度的 95%，留少量边距
+	maxPx := termPx * 95 / 100
+	if maxPx > 1920 {
+		maxPx = 1920
+	}
+	if maxPx < 320 {
+		maxPx = 320
+	}
+	return maxPx
+}
+
 func (vp *VideoPlayer) initProto() {
 	if vp.proto == timage.ProtocolAuto {
 		return
@@ -258,6 +273,9 @@ func (vp *VideoPlayer) initProto() {
 		vp.termWidth, vp.termHeight,
 		vp.cellW, vp.cellH,
 	)
+	// 动态限制分辨率：基于终端实际尺寸，大终端不超过 800 像素
+	maxPx := maxVideoDim(vp.termWidth, vp.cellW)
+	vp.outWidth, vp.outHeight = capOutputSize(vp.outWidth, vp.outHeight, maxPx)
 	vp.charW = (vp.outWidth + vp.cellW - 1) / vp.cellW
 	vp.charH = (vp.outHeight + vp.cellH - 1) / vp.cellH
 	vp.startCol = (vp.termWidth - vp.charW) / 2
@@ -269,14 +287,13 @@ func (vp *VideoPlayer) initProto() {
 		vp.startRow = 0
 	}
 
-	// 预分配 Kitty 渲染缓冲区：rawSize ~ outWidth*outHeight*4,
-	// 压缩后 ~60%, base64 后 ~x4/3, 加上转义序列开销
-	// 预分配能避免每帧 bytes.Buffer 动态扩容
+	// 预分配 Kitty 渲染缓冲区
 	if vp.proto == timage.ProtocolKitty {
-		rawFrameSize := vp.outWidth * vp.outHeight * 4
-		estimatedOutput := rawFrameSize * 3 / 4 + 4096 // 预估 base64+开销
-		if estimatedOutput > 512*1024 {
-			estimatedOutput = 512 * 1024
+		rawFrameSize := vp.outWidth * vp.outHeight * 3 // RGB 3 字节
+		estimatedOutput := rawFrameSize*4/3 + 4096     // base64 开销（约 1.33x）
+		// 增大缓冲区上限以支持更大的视频
+		if estimatedOutput > 4*1024*1024 {
+			estimatedOutput = 4 * 1024 * 1024
 		}
 		vp.kittyBuf.Grow(estimatedOutput)
 	}
@@ -295,6 +312,8 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 		vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
 	} else {
 		newOutW, newOutH = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, newWidth, newHeight, vp.cellW, vp.cellH)
+		maxPx := maxVideoDim(newWidth, vp.cellW)
+		newOutW, newOutH = capOutputSize(newOutW, newOutH, maxPx)
 		vp.charW = (newOutW + vp.cellW - 1) / vp.cellW
 		vp.charH = (newOutH + vp.cellH - 1) / vp.cellH
 	}
@@ -311,6 +330,27 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	}
 	vp.startCol = newStartCol
 	vp.startRow = newStartRow
+}
+
+// capOutputSize 限制输出分辨率最大边长，保持宽高比
+func capOutputSize(w, h, maxPx int) (int, int) {
+	if w <= maxPx && h <= maxPx {
+		return w, h
+	}
+	if w > h {
+		h = h * maxPx / w
+		w = maxPx
+	} else {
+		w = w * maxPx / h
+		h = maxPx
+	}
+	if w < 4 {
+		w = 4
+	}
+	if h < 4 {
+		h = 4
+	}
+	return w, h
 }
 
 // ==================== 视频解码器（双缓冲） ====================

@@ -592,48 +592,79 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 
 // EncodeKittyFrameRaw 直接从原始 RGBA 字节编码 Kitty 图像，跳过 image.RGBA 创建和 draw.Draw
 // data 是 raw RGBA 字节 (4 bytes/pixel, R,G,B,A 顺序)
+// kittyRGBPool 复用 RGBA→RGB 转换的输出缓冲区
+var kittyRGBPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 512*1024) // 512KB 初始容量
+	},
+}
+
+// EncodeKittyFrameRaw 直接从原始 RGBA 字节编码 Kitty 图像
+// data 是 raw RGBA 字节 (4 bytes/pixel, R,G,B,A 顺序)
+// 针对视频优化：自动剥离 alpha 通道使用 RGB(f=24)，不压缩
 func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uint32 {
 	imageID := atomic.AddUint32(&kittyImageID, 1)
 
-	// 1. 压缩（使用池化 Buffer，避免分配）
-	var compressed bool
-	var compData []byte
+	// 1. RGBA → RGB：剥离 alpha 通道，省 25% 数据量
+	rgbLen := pixelW * pixelH * 3
+	rgbRaw := kittyRGBPool.Get().([]byte)
+	if cap(rgbRaw) < rgbLen {
+		rgbRaw = make([]byte, rgbLen)
+	}
+	rgbBuf := rgbRaw[:rgbLen]
 
-	if len(data) > 1024 {
-		buf := kittyCompressPool.Get().(*bytes.Buffer)
-		buf.Reset()
-		zw := kittyZlibPool.Get().(*zlib.Writer)
-		zw.Reset(buf)
-		_, _ = zw.Write(data)
-		zw.Close()
-		compData = buf.Bytes()
-		compressed = true
-		kittyZlibPool.Put(zw)
-		kittyCompressPool.Put(buf)
-	} else {
-		compData = data
+	// 批量拷贝 RGB，跳过 A（优化：4 字节对齐批量处理）
+	src := data
+	dst := rgbBuf
+	srcLen := len(src)
+	// 批量处理 16 像素（64 字节）
+	for i := 0; i+64 <= srcLen; i += 64 {
+		// 每次拷贝 16 像素的 RGB（48 字节）
+		dst[0] = src[0];  dst[1] = src[1];  dst[2] = src[2]
+		dst[3] = src[4];  dst[4] = src[5];  dst[5] = src[6]
+		dst[6] = src[8];  dst[7] = src[9];  dst[8] = src[10]
+		dst[9] = src[12]; dst[10] = src[13]; dst[11] = src[14]
+		dst[12] = src[16]; dst[13] = src[17]; dst[14] = src[18]
+		dst[15] = src[20]; dst[16] = src[21]; dst[17] = src[22]
+		dst[18] = src[24]; dst[19] = src[25]; dst[20] = src[26]
+		dst[21] = src[28]; dst[22] = src[29]; dst[23] = src[30]
+		dst[24] = src[32]; dst[25] = src[33]; dst[26] = src[34]
+		dst[27] = src[36]; dst[28] = src[37]; dst[29] = src[38]
+		dst[30] = src[40]; dst[31] = src[41]; dst[32] = src[42]
+		dst[33] = src[44]; dst[34] = src[45]; dst[35] = src[46]
+		dst[36] = src[48]; dst[37] = src[49]; dst[38] = src[50]
+		dst[39] = src[52]; dst[40] = src[53]; dst[41] = src[54]
+		dst[42] = src[56]; dst[43] = src[57]; dst[44] = src[58]
+		dst[45] = src[60]; dst[46] = src[61]; dst[47] = src[62]
+		src = src[64:]
+		dst = dst[48:]
+	}
+	// 处理剩余的像素
+	for i := 0; i < len(src); i += 4 {
+		dst[0] = src[i]
+		dst[1] = src[i+1]
+		dst[2] = src[i+2]
+		dst = dst[3:]
 	}
 
 	// 2. base64 编码到池化缓冲区（避免 EncodeToString 的 string 分配）
-	encLen := base64.StdEncoding.EncodedLen(len(compData))
+	encLen := base64.StdEncoding.EncodedLen(rgbLen)
 	base64Raw := kittyBase64Pool.Get().([]byte)
 	if cap(base64Raw) < encLen {
 		base64Raw = make([]byte, encLen)
 	}
 	base64Buf := base64Raw[:encLen]
-	base64.StdEncoding.Encode(base64Buf, compData)
+	base64.StdEncoding.Encode(base64Buf, rgbBuf)
 
-	// 3. 发送控制头部
-	if compressed {
-		fmt.Fprintf(w, "\x1b_Ga=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2,o=z",
-			imageID, pixelW, pixelH, c, r)
-	} else {
-		fmt.Fprintf(w, "\x1b_Ga=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
-			imageID, pixelW, pixelH, c, r)
-	}
+	// 归还 RGB 缓冲区
+	kittyRGBPool.Put(rgbRaw[:0])
 
-	// 4. 分块发送（每块 128KB，减少转义序列数量）
-	const chunkSize = 131072
+	// 3. 发送控制头部（f=24 = RGB, 不压缩）
+	fmt.Fprintf(w, "\x1b_Ga=T,f=24,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
+		imageID, pixelW, pixelH, c, r)
+
+	// 4. 分块发送（每块 512KB，减少分块数量）
+	const chunkSize = 524288
 	for i := 0; i < encLen; i += chunkSize {
 		end := i + chunkSize
 		if end > encLen {
@@ -642,14 +673,12 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 		chunk := base64Buf[i:end]
 
 		if i == 0 {
-			// 第一块：接在已有的控制头部后面
 			if i+chunkSize < encLen {
 				fmt.Fprintf(w, ",m=1;%s\x1b\\", chunk)
 			} else {
 				fmt.Fprintf(w, ";%s\x1b\\", chunk)
 			}
 		} else {
-			// 后续块：需要完整的 \x1b_G 转义序列
 			if i+chunkSize < encLen {
 				fmt.Fprintf(w, "\x1b_Gm=1,q=2;%s\x1b\\", chunk)
 			} else {
