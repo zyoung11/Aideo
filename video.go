@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -193,6 +194,8 @@ type VideoPlayer struct {
 	renderer    *BrailleRenderer
 	proto       timage.Protocol
 	prevKittyID uint32
+	cellW       int
+	cellH       int
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -236,20 +239,52 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 	return vp
 }
 
+func (vp *VideoPlayer) initProto() {
+	if vp.proto == timage.ProtocolAuto {
+		return
+	}
+	vp.cellW, vp.cellH = timage.CellPixels()
+	if vp.cellW < 1 {
+		vp.cellW = 8
+	}
+	if vp.cellH < 1 {
+		vp.cellH = 16
+	}
+	vp.outWidth, vp.outHeight = calculateOutputSizeCells(
+		vp.srcWidth, vp.srcHeight,
+		vp.termWidth, vp.termHeight,
+		vp.cellW, vp.cellH,
+	)
+	vp.charW = (vp.outWidth + vp.cellW - 1) / vp.cellW
+	vp.charH = (vp.outHeight + vp.cellH - 1) / vp.cellH
+	vp.startCol = (vp.termWidth - vp.charW) / 2
+	vp.startRow = (vp.termHeight - vp.charH) / 2
+	if vp.startCol < 0 {
+		vp.startCol = 0
+	}
+	if vp.startRow < 0 {
+		vp.startRow = 0
+	}
+}
+
 // updateTerminalSize 窗口变化时重新计算输出尺寸和居中位置
 func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	vp.termWidth = newWidth
 	vp.termHeight = newHeight
 
-	newOutW, newOutH := calculateOutputSize(
-		vp.srcWidth, vp.srcHeight,
-		newWidth, newHeight,
-	)
+	var newOutW, newOutH int
+	if vp.proto == timage.ProtocolAuto {
+		newOutW, newOutH = calculateOutputSize(vp.srcWidth, vp.srcHeight, newWidth, newHeight)
+		vp.charW = newOutW / 2
+		vp.charH = newOutH / 4
+		vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
+	} else {
+		newOutW, newOutH = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, newWidth, newHeight, vp.cellW, vp.cellH)
+		vp.charW = (newOutW + vp.cellW - 1) / vp.cellW
+		vp.charH = (newOutH + vp.cellH - 1) / vp.cellH
+	}
 	vp.outWidth = newOutW
 	vp.outHeight = newOutH
-	vp.charW = newOutW / 2
-	vp.charH = newOutH / 4
-	vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
 
 	newStartCol := (newWidth - vp.charW) / 2
 	newStartRow := (newHeight - vp.charH) / 2
@@ -520,20 +555,26 @@ func (vp *VideoPlayer) renderAsciiFrame(raw []byte, outputBuf *strings.Builder) 
 	}
 }
 
-func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
-	fmt.Print("\033[2J")
-	fmt.Printf("\033[%d;%dH", vp.startRow, vp.startCol)
+func (vp *VideoPlayer) renderSixelFrame(raw []byte, outputBuf *bytes.Buffer) {
+	outputBuf.Reset()
+	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow, vp.startCol)
 	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
-	timage.EncodeSixelFrame(os.Stdout, img, 255, false)
+	timage.EncodeSixelFrame(outputBuf, img, 255, false)
+	fmt.Fprintf(outputBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
+		vp.termHeight, RESET_COLORS)
 }
 
-func (vp *VideoPlayer) renderKittyFrame(raw []byte) {
-	if vp.prevKittyID != 0 {
-		timage.DeleteKittyFrame(os.Stdout, vp.prevKittyID)
-	}
-	fmt.Printf("\033[%d;%dH", vp.startRow, vp.startCol)
+func (vp *VideoPlayer) renderKittyFrame(raw []byte, outputBuf *bytes.Buffer) {
+	outputBuf.Reset()
+	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow, vp.startCol)
 	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
-	vp.prevKittyID = timage.EncodeKittyFrame(os.Stdout, img, vp.charW, vp.charH)
+	newID := timage.EncodeKittyFrame(outputBuf, img, vp.charW, vp.charH)
+	if vp.prevKittyID != 0 && vp.prevKittyID != newID {
+		timage.DeleteKittyFrame(outputBuf, vp.prevKittyID)
+	}
+	vp.prevKittyID = newID
+	fmt.Fprintf(outputBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
+		vp.termHeight, RESET_COLORS)
 }
 
 func (vp *VideoPlayer) cleanupFrame() {
@@ -773,18 +814,23 @@ func (vp *VideoPlayer) startLoop() {
 
 		switch vp.proto {
 		case timage.ProtocolSixel:
-			vp.renderSixelFrame(buf)
+			var b bytes.Buffer
+			vp.renderSixelFrame(buf, &b)
+			os.Stdout.Write(b.Bytes())
 		case timage.ProtocolKitty:
-			vp.renderKittyFrame(buf)
+			var b bytes.Buffer
+			vp.renderKittyFrame(buf, &b)
+			os.Stdout.Write(b.Bytes())
 		default:
 			vp.renderAsciiFrame(buf, &outputBuf)
 		}
 
-		// 底部提示
-		outputBuf.WriteString(fmt.Sprintf("\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
-			vp.termHeight, RESET_COLORS))
+		if vp.proto == timage.ProtocolAuto {
+			outputBuf.WriteString(fmt.Sprintf("\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
+				vp.termHeight, RESET_COLORS))
 
-		fmt.Print(outputBuf.String())
+			fmt.Print(outputBuf.String())
+		}
 
 		// 等待下一个帧时间
 		<-fpsTicker.C
@@ -864,6 +910,7 @@ func playVideo(filename string, proto timage.Protocol) error {
 	player.fps = info.FPS
 	player.frameTime = time.Duration(float64(time.Second) / info.FPS)
 	player.proto = proto
+	player.initProto()
 
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {

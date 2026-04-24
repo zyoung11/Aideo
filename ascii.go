@@ -421,3 +421,31 @@ func calculateOutputSize(imgWidth, imgHeight, termWidth, termHeight int) (int, i
 
 	return outWidth, outHeight
 }
+
+func calculateOutputSizeCells(imgWidth, imgHeight, termWidth, termHeight, cellW, cellH int) (int, int) {
+	availCharW := termWidth - 2
+	availCharH := termHeight - 2
+
+	availPixelW := availCharW * cellW
+	availPixelH := availCharH * cellH
+
+	imgAspect := float64(imgWidth) / float64(imgHeight)
+	cellAspect := float64(availPixelW) / float64(availPixelH)
+
+	var outWidth, outHeight int
+	if imgAspect > cellAspect {
+		outWidth = availPixelW
+		outHeight = int(math.Round(float64(outWidth) / imgAspect))
+	} else {
+		outHeight = availPixelH
+		outWidth = int(math.Round(float64(outHeight) * imgAspect))
+	}
+
+	if outWidth < 4 {
+		outWidth = 4
+	}
+	if outHeight < 8 {
+		outHeight = 8
+	}
+	return outWidth, outHeight
+}

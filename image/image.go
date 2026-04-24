@@ -390,6 +390,10 @@ func queryCellPixels() (int, int) {
 	return cw, ch
 }
 
+func CellPixels() (int, int) {
+	return queryCellPixels()
+}
+
 func queryTerminalPixels() (int, int) {
 	makeRaw := func() func() {
 		fd := int(os.Stdin.Fd())
