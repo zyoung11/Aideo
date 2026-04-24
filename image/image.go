@@ -613,38 +613,30 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 	}
 	rgbBuf := rgbRaw[:rgbLen]
 
-	// 批量拷贝 RGB，跳过 A（优化：4 字节对齐批量处理）
-	src := data
-	dst := rgbBuf
-	srcLen := len(src)
-	// 批量处理 16 像素（64 字节）
-	for i := 0; i+64 <= srcLen; i += 64 {
-		// 每次拷贝 16 像素的 RGB（48 字节）
-		dst[0] = src[0];  dst[1] = src[1];  dst[2] = src[2]
-		dst[3] = src[4];  dst[4] = src[5];  dst[5] = src[6]
-		dst[6] = src[8];  dst[7] = src[9];  dst[8] = src[10]
-		dst[9] = src[12]; dst[10] = src[13]; dst[11] = src[14]
-		dst[12] = src[16]; dst[13] = src[17]; dst[14] = src[18]
-		dst[15] = src[20]; dst[16] = src[21]; dst[17] = src[22]
-		dst[18] = src[24]; dst[19] = src[25]; dst[20] = src[26]
-		dst[21] = src[28]; dst[22] = src[29]; dst[23] = src[30]
-		dst[24] = src[32]; dst[25] = src[33]; dst[26] = src[34]
-		dst[27] = src[36]; dst[28] = src[37]; dst[29] = src[38]
-		dst[30] = src[40]; dst[31] = src[41]; dst[32] = src[42]
-		dst[33] = src[44]; dst[34] = src[45]; dst[35] = src[46]
-		dst[36] = src[48]; dst[37] = src[49]; dst[38] = src[50]
-		dst[39] = src[52]; dst[40] = src[53]; dst[41] = src[54]
-		dst[42] = src[56]; dst[43] = src[57]; dst[44] = src[58]
-		dst[45] = src[60]; dst[46] = src[61]; dst[47] = src[62]
-		src = src[64:]
-		dst = dst[48:]
+	// 批量拷贝 RGB，跳过 A（优化：8 像素批量处理）
+	// 一次性处理 8 像素，减少循环开销
+	blocks := len(data) / 32
+	j := 0
+	for b := 0; b < blocks; b++ {
+		s := b * 32
+		// 展开循环：每次处理 8 像素
+		rgbBuf[j] = data[s]; rgbBuf[j+1] = data[s+1]; rgbBuf[j+2] = data[s+2]
+		rgbBuf[j+3] = data[s+4]; rgbBuf[j+4] = data[s+5]; rgbBuf[j+5] = data[s+6]
+		rgbBuf[j+6] = data[s+8]; rgbBuf[j+7] = data[s+9]; rgbBuf[j+8] = data[s+10]
+		rgbBuf[j+9] = data[s+12]; rgbBuf[j+10] = data[s+13]; rgbBuf[j+11] = data[s+14]
+		rgbBuf[j+12] = data[s+16]; rgbBuf[j+13] = data[s+17]; rgbBuf[j+14] = data[s+18]
+		rgbBuf[j+15] = data[s+20]; rgbBuf[j+16] = data[s+21]; rgbBuf[j+17] = data[s+22]
+		rgbBuf[j+18] = data[s+24]; rgbBuf[j+19] = data[s+25]; rgbBuf[j+20] = data[s+26]
+		rgbBuf[j+21] = data[s+28]; rgbBuf[j+22] = data[s+29]; rgbBuf[j+23] = data[s+30]
+		j += 24
 	}
 	// 处理剩余的像素
-	for i := 0; i < len(src); i += 4 {
-		dst[0] = src[i]
-		dst[1] = src[i+1]
-		dst[2] = src[i+2]
-		dst = dst[3:]
+	remain := len(data) % 32
+	for i := 0; i < remain; i += 4 {
+		rgbBuf[j] = data[blocks*32+i]
+		rgbBuf[j+1] = data[blocks*32+i+1]
+		rgbBuf[j+2] = data[blocks*32+i+2]
+		j += 3
 	}
 
 	// 2. base64 编码到池化缓冲区（避免 EncodeToString 的 string 分配）
@@ -659,30 +651,74 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 	// 归还 RGB 缓冲区
 	kittyRGBPool.Put(rgbRaw[:0])
 
-	// 3. 发送控制头部（f=24 = RGB, 不压缩）
-	fmt.Fprintf(w, "\x1b_Ga=T,f=24,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
-		imageID, pixelW, pixelH, c, r)
+	// 3. 发送控制头部（f=24 = RGB, 不压缩）- 使用 bytes.Buffer 直接写入
+	bw, ok := w.(*bytes.Buffer)
+	if ok {
+		// 直接写入 buffer，避免 fmt.Fprintf 开销
+		bw.WriteString("\x1b_Ga=T,f=24,i=")
+		writeUint32(bw, imageID)
+		bw.WriteString(",s=")
+		writeUint32(bw, uint32(pixelW))
+		bw.WriteString(",v=")
+		writeUint32(bw, uint32(pixelH))
+		bw.WriteString(",c=")
+		writeUint32(bw, uint32(c))
+		bw.WriteString(",r=")
+		writeUint32(bw, uint32(r))
+		bw.WriteString(",q=2")
+	} else {
+		fmt.Fprintf(w, "\x1b_Ga=T,f=24,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
+			imageID, pixelW, pixelH, c, r)
+	}
 
 	// 4. 分块发送（每块 512KB，减少分块数量）
 	const chunkSize = 524288
-	for i := 0; i < encLen; i += chunkSize {
-		end := i + chunkSize
-		if end > encLen {
-			end = encLen
-		}
-		chunk := base64Buf[i:end]
-
-		if i == 0 {
-			if i+chunkSize < encLen {
-				fmt.Fprintf(w, ",m=1;%s\x1b\\", chunk)
-			} else {
-				fmt.Fprintf(w, ";%s\x1b\\", chunk)
+	if ok {
+		for i := 0; i < encLen; i += chunkSize {
+			end := i + chunkSize
+			if end > encLen {
+				end = encLen
 			}
-		} else {
-			if i+chunkSize < encLen {
-				fmt.Fprintf(w, "\x1b_Gm=1,q=2;%s\x1b\\", chunk)
+			chunk := base64Buf[i:end]
+			if i == 0 {
+				if i+chunkSize < encLen {
+					bw.WriteString(",m=1;")
+				} else {
+					bw.WriteString(";")
+				}
+				bw.Write(chunk)
+				bw.WriteString("\x1b\\")
 			} else {
-				fmt.Fprintf(w, "\x1b_Gm=0,q=2;%s\x1b\\", chunk)
+				bw.WriteString("\x1b_Gm=")
+				if i+chunkSize < encLen {
+					bw.WriteByte('1')
+				} else {
+					bw.WriteByte('0')
+				}
+				bw.WriteString(",q=2;")
+				bw.Write(chunk)
+				bw.WriteString("\x1b\\")
+			}
+		}
+	} else {
+		for i := 0; i < encLen; i += chunkSize {
+			end := i + chunkSize
+			if end > encLen {
+				end = encLen
+			}
+			chunk := base64Buf[i:end]
+			if i == 0 {
+				if i+chunkSize < encLen {
+					fmt.Fprintf(w, ",m=1;%s\x1b\\", chunk)
+				} else {
+					fmt.Fprintf(w, ";%s\x1b\\", chunk)
+				}
+			} else {
+				if i+chunkSize < encLen {
+					fmt.Fprintf(w, "\x1b_Gm=1,q=2;%s\x1b\\", chunk)
+				} else {
+					fmt.Fprintf(w, "\x1b_Gm=0,q=2;%s\x1b\\", chunk)
+				}
 			}
 		}
 	}
@@ -691,6 +727,76 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 	kittyBase64Pool.Put(base64Raw[:0])
 
 	return imageID
+}
+
+// writeUint32 高效写入无符号整数到 buffer
+func writeUint32(b *bytes.Buffer, n uint32) {
+	if n >= 1000000000 {
+		b.WriteByte(byte('0' + n/1000000000%10))
+		b.WriteByte(byte('0' + n/100000000%10))
+		b.WriteByte(byte('0' + n/10000000%10))
+		b.WriteByte(byte('0' + n/1000000%10))
+		b.WriteByte(byte('0' + n/100000%10))
+		b.WriteByte(byte('0' + n/10000%10))
+		b.WriteByte(byte('0' + n/1000%10))
+		b.WriteByte(byte('0' + n/100%10))
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else if n >= 100000000 {
+		b.WriteByte(byte('0' + n/100000000%10))
+		b.WriteByte(byte('0' + n/10000000%10))
+		b.WriteByte(byte('0' + n/1000000%10))
+		b.WriteByte(byte('0' + n/100000%10))
+		b.WriteByte(byte('0' + n/10000%10))
+		b.WriteByte(byte('0' + n/1000%10))
+		b.WriteByte(byte('0' + n/100%10))
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else if n >= 10000000 {
+		b.WriteByte(byte('0' + n/10000000%10))
+		b.WriteByte(byte('0' + n/1000000%10))
+		b.WriteByte(byte('0' + n/100000%10))
+		b.WriteByte(byte('0' + n/10000%10))
+		b.WriteByte(byte('0' + n/1000%10))
+		b.WriteByte(byte('0' + n/100%10))
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else if n >= 1000000 {
+		b.WriteByte(byte('0' + n/1000000%10))
+		b.WriteByte(byte('0' + n/100000%10))
+		b.WriteByte(byte('0' + n/10000%10))
+		b.WriteByte(byte('0' + n/1000%10))
+		b.WriteByte(byte('0' + n/100%10))
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else if n >= 100000 {
+		b.WriteByte(byte('0' + n/100000%10))
+		b.WriteByte(byte('0' + n/10000%10))
+		b.WriteByte(byte('0' + n/1000%10))
+		b.WriteByte(byte('0' + n/100%10))
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else if n >= 10000 {
+		b.WriteByte(byte('0' + n/10000%10))
+		b.WriteByte(byte('0' + n/1000%10))
+		b.WriteByte(byte('0' + n/100%10))
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else if n >= 1000 {
+		b.WriteByte(byte('0' + n/1000%10))
+		b.WriteByte(byte('0' + n/100%10))
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else if n >= 100 {
+		b.WriteByte(byte('0' + n/100%10))
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else if n >= 10 {
+		b.WriteByte(byte('0' + n/10%10))
+		b.WriteByte(byte('0' + n%10))
+	} else {
+		b.WriteByte(byte('0' + n))
+	}
 }
 
 func DeleteKittyFrame(w io.Writer, id uint32) {

@@ -199,6 +199,11 @@ type VideoPlayer struct {
 
 	kittyBuf   bytes.Buffer // 复用 Kitty 渲染缓冲区
 	frameBuf   []byte        // 复用帧读取缓冲区
+
+	// kitty 性能优化
+	kittyFrameCount    int32       // kitty 帧计数器
+	kittyLastTime      time.Time   // 上次 kitty 帧时间
+	kittyTargetFPS     float64     // kitty 目标帧率
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -243,13 +248,13 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 }
 
 // maxVideoDim 根据终端字符尺寸和单元格像素计算视频输出分辨率上限
-// 目标：尽量填满终端，Kitty 模式下最大 1920 像素
+// 目标：尽量填满终端，Kitty 模式下最大 1280 像素（避免性能问题）
 func maxVideoDim(termChars, cellPx int) int {
 	termPx := (termChars - 2) * cellPx
-	// 约占终端宽度的 95%，留少量边距
-	maxPx := termPx * 95 / 100
-	if maxPx > 1920 {
-		maxPx = 1920
+	// 约占终端宽度的 90%，留少量边距
+	maxPx := termPx * 90 / 100
+	if maxPx > 1280 {
+		maxPx = 1280
 	}
 	if maxPx < 320 {
 		maxPx = 320
@@ -296,6 +301,8 @@ func (vp *VideoPlayer) initProto() {
 			estimatedOutput = 4 * 1024 * 1024
 		}
 		vp.kittyBuf.Grow(estimatedOutput)
+		// Kitty 模式默认 24fps，如果卡顿会自动降低
+		vp.kittyTargetFPS = 24
 	}
 }
 
@@ -620,6 +627,24 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte, outputBuf *bytes.Buffer) {
 }
 
 func (vp *VideoPlayer) renderKittyFrame(raw []byte) {
+	// Kitty 帧率限制：追踪实际帧率并动态调整
+	now := time.Now()
+	vp.kittyFrameCount++
+	
+	// 如果设定了目标帧率，等待到合适的时间
+	if vp.kittyTargetFPS > 0 {
+		if vp.kittyLastTime.IsZero() {
+			vp.kittyLastTime = now
+		} else {
+			minFrameInterval := time.Second / time.Duration(vp.kittyTargetFPS)
+			elapsed := now.Sub(vp.kittyLastTime)
+			if elapsed < minFrameInterval {
+				time.Sleep(minFrameInterval - elapsed)
+			}
+			vp.kittyLastTime = time.Now()
+		}
+	}
+	
 	vp.kittyBuf.Reset()
 	fmt.Fprintf(&vp.kittyBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
 	// 直接编码 raw RGBA 字节，跳过 image.RGBA 创建和 draw.Draw
