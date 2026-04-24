@@ -187,8 +187,7 @@ type VideoPlayer struct {
 	startRow   int
 	startCol   int
 
-	renderer      *BrailleRenderer
-	sixelRenderer *SixelRenderer
+	renderer *BrailleRenderer
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -197,17 +196,10 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 		charW, charH        int
 	)
 
-	if useSixel {
-		outWidth, outHeight = calculateSixelOutputSize(srcWidth, srcHeight, termWidth, termHeight)
-		// Sixel 模式：charW/charH 是图像像素尺寸转换为字符尺寸，用于光标定位
-		charW = (outWidth + defaultCellPixelW - 1) / defaultCellPixelW
-		charH = (outHeight + defaultCellPixelH - 1) / defaultCellPixelH
-	} else {
-		outWidth, outHeight = calculateOutputSize(srcWidth, srcHeight, termWidth, termHeight)
-		// Braille 模式下需要字符网格尺寸用于居中
-		charW = outWidth / 2
-		charH = outHeight / 4
-	}
+	outWidth, outHeight = calculateOutputSize(srcWidth, srcHeight, termWidth, termHeight)
+	// Braille 模式下需要字符网格尺寸用于居中
+	charW = outWidth / 2
+	charH = outHeight / 4
 
 	startCol := (termWidth - charW) / 2
 	startRow := (termHeight - charH) / 2
@@ -232,12 +224,7 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 		startCol:   startCol,
 	}
 
-	if useSixel {
-		// Sixel 渲染器使用图像尺寸画布（不需要全屏）
-		vp.sixelRenderer = NewSixelRenderer(outWidth, outHeight)
-	} else {
-		vp.renderer = NewBrailleRenderer(charW, charH)
-	}
+	vp.renderer = NewBrailleRenderer(charW, charH)
 
 	return vp
 }
@@ -247,29 +234,15 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	vp.termWidth = newWidth
 	vp.termHeight = newHeight
 
-	if useSixel {
-		newOutW, newOutH := calculateSixelOutputSize(
-			vp.srcWidth, vp.srcHeight,
-			newWidth, newHeight,
-		)
-		vp.outWidth = newOutW
-		vp.outHeight = newOutH
-		// 更新字符尺寸用于光标定位
-		vp.charW = (newOutW + defaultCellPixelW - 1) / defaultCellPixelW
-		vp.charH = (newOutH + defaultCellPixelH - 1) / defaultCellPixelH
-		// 重新创建Sixel渲染器（图像尺寸画布）
-		vp.sixelRenderer = NewSixelRenderer(newOutW, newOutH)
-	} else {
-		newOutW, newOutH := calculateOutputSize(
-			vp.srcWidth, vp.srcHeight,
-			newWidth, newHeight,
-		)
-		vp.outWidth = newOutW
-		vp.outHeight = newOutH
-		vp.charW = newOutW / 2
-		vp.charH = newOutH / 4
-		vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
-	}
+	newOutW, newOutH := calculateOutputSize(
+		vp.srcWidth, vp.srcHeight,
+		newWidth, newHeight,
+	)
+	vp.outWidth = newOutW
+	vp.outHeight = newOutH
+	vp.charW = newOutW / 2
+	vp.charH = newOutH / 4
+	vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
 
 	newStartCol := (newWidth - vp.charW) / 2
 	newStartRow := (newHeight - vp.charH) / 2
@@ -731,37 +704,26 @@ func (vp *VideoPlayer) startLoop() {
 
 		// 渲染
 		imgData := rawRGBAToColorData(buf, vp.outWidth, vp.outHeight)
-		if useSixel {
-			vp.sixelRenderer.Render(imgData, vp.exposure, vp.attenuation)
-		} else {
-			vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
-		}
+		vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
 
 		// 构建输出
 		outputBuf.Reset()
-		if useSixel {
-			// Sixel 模式：定位光标到居中位置，再输出图像
-			outputBuf.WriteString(fmt.Sprintf("\x1b[%d;%dH",
-				vp.startRow+1, vp.startCol+1))
-			outputBuf.WriteString(vp.sixelRenderer.String())
-		} else {
-			imageStr := vp.renderer.String()
-			lines := strings.Split(imageStr, "\n")
+		imageStr := vp.renderer.String()
+		lines := strings.Split(imageStr, "\n")
 
-			for i, line := range lines {
-				if line == "" {
-					continue
-				}
-				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
-					vp.startRow+i+1, vp.startCol+1, line))
+		for i, line := range lines {
+			if line == "" {
+				continue
 			}
+			outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
+				vp.startRow+i+1, vp.startCol+1, line))
+		}
 
-			// 清除右侧空白
-			if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
-				clearStartCol := vp.startCol + vp.charW + 1
-				for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
-					outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
-				}
+		// 清除右侧空白
+		if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
+			clearStartCol := vp.startCol + vp.charW + 1
+			for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
+				outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
 			}
 		}
 
