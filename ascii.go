@@ -447,5 +447,7 @@ func calculateOutputSizeCells(imgWidth, imgHeight, termWidth, termHeight, cellW,
 	if outHeight < 8 {
 		outHeight = 8
 	}
+	outWidth = (outWidth / cellW) * cellW
+	outHeight = (outHeight / cellH) * cellH
 	return outWidth, outHeight
 }

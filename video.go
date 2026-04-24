@@ -557,7 +557,7 @@ func (vp *VideoPlayer) renderAsciiFrame(raw []byte, outputBuf *strings.Builder) 
 
 func (vp *VideoPlayer) renderSixelFrame(raw []byte, outputBuf *bytes.Buffer) {
 	outputBuf.Reset()
-	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow, vp.startCol)
+	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
 	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
 	timage.EncodeSixelFrame(outputBuf, img, 255, false)
 	fmt.Fprintf(outputBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
@@ -566,7 +566,7 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte, outputBuf *bytes.Buffer) {
 
 func (vp *VideoPlayer) renderKittyFrame(raw []byte, outputBuf *bytes.Buffer) {
 	outputBuf.Reset()
-	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow, vp.startCol)
+	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
 	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
 	newID := timage.EncodeKittyFrame(outputBuf, img, vp.charW, vp.charH)
 	if vp.prevKittyID != 0 && vp.prevKittyID != newID {
