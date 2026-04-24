@@ -248,14 +248,9 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 }
 
 // maxVideoDim 根据终端字符尺寸和单元格像素计算视频输出分辨率上限
-// 目标：尽量填满终端，Kitty 模式下最大 1280 像素（避免性能问题）
+// 目标：填满整个终端，不做分辨率压缩
 func maxVideoDim(termChars, cellPx int) int {
-	termPx := (termChars - 2) * cellPx
-	// 约占终端宽度的 90%，留少量边距
-	maxPx := termPx * 90 / 100
-	if maxPx > 1280 {
-		maxPx = 1280
-	}
+	maxPx := (termChars - 2) * cellPx
 	if maxPx < 320 {
 		maxPx = 320
 	}
@@ -278,7 +273,7 @@ func (vp *VideoPlayer) initProto() {
 		vp.termWidth, vp.termHeight,
 		vp.cellW, vp.cellH,
 	)
-	// 动态限制分辨率：基于终端实际尺寸，大终端不超过 800 像素
+	// 根据终端尺寸计算输出分辨率上限
 	maxPx := maxVideoDim(vp.termWidth, vp.cellW)
 	vp.outWidth, vp.outHeight = capOutputSize(vp.outWidth, vp.outHeight, maxPx)
 	vp.charW = (vp.outWidth + vp.cellW - 1) / vp.cellW
@@ -296,9 +291,9 @@ func (vp *VideoPlayer) initProto() {
 	if vp.proto == timage.ProtocolKitty {
 		rawFrameSize := vp.outWidth * vp.outHeight * 3 // RGB 3 字节
 		estimatedOutput := rawFrameSize*4/3 + 4096     // base64 开销（约 1.33x）
-		// 增大缓冲区上限以支持更大的视频
-		if estimatedOutput > 4*1024*1024 {
-			estimatedOutput = 4 * 1024 * 1024
+		// 缓冲区上限 16MB，支持 4K 全屏视频
+		if estimatedOutput > 16*1024*1024 {
+			estimatedOutput = 16 * 1024 * 1024
 		}
 		vp.kittyBuf.Grow(estimatedOutput)
 		// Kitty 模式默认 24fps，如果卡顿会自动降低
