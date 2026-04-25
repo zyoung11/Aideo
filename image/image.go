@@ -511,8 +511,19 @@ func renderKitty(img image.Image, widthChars, heightChars int) error {
 }
 
 func EncodeSixelFrame(w io.Writer, img image.Image, colors int, dither bool) error {
-	enc := &sixelEncoder{w: w, Colors: colors, Dither: dither, Workers: runtime.NumCPU()}
-	return enc.Encode(img)
+	return encodeSixel(w, img, colors, dither)
+}
+
+// EncodeSixelFrameRaw 直接从 raw RGBA 字节编码 Sixel，跳过 image.RGBA 创建和拷贝
+// data 是 raw RGBA 字节 (4 bytes/pixel, R,G,B,A 顺序)
+func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int, dither bool) error {
+	// 零拷贝包装：将 raw 字节包装为 *image.RGBA，不分配新内存
+	img := &image.RGBA{
+		Pix:    data,
+		Stride: width * 4,
+		Rect:   image.Rect(0, 0, width, height),
+	}
+	return encodeSixel(w, img, colors, dither)
 }
 
 func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
@@ -826,20 +837,43 @@ func SupportsTrueColor() bool {
 // Sixel 编码器 (从 BM 中提取并通用化)
 // ---------------------------------------------------------------------------
 
-type sixelEncoder struct {
-	w       interface{ Write([]byte) (int, error) }
-	Dither  bool
-	Colors  int
-	Workers int
+// ---------------------------------------------------------------------------
+// Sixel 编码器 — 并行 strip 处理 + 流式 RLE 编码
+// 每个 Worker 复用 flat [colors × width]byte 缓冲区（≈326KB for 720p × 255色）
+// 通过通道回传结果，主 goroutine 保序编码，峰值内存 O(workers × colors × width)
+// ---------------------------------------------------------------------------
+
+// sixelStripState 复用 strip 编码的临时缓冲区
+var sixelStripStatePool = sync.Pool{
+	New: func() interface{} {
+		return &sixelStripState{
+			dirty: make([]int, 0, 64),
+		}
+	},
 }
 
+type sixelStripState struct {
+	buf   []byte  // flat [colors * width]byte  bitmap
+	epoch []uint8 // [colors]uint8 每个颜色的 epoch 标记
+	dirty []int   // 当前 strip 中被写过的颜色索引
+}
+
+// stripJob 表示一个待处理的 Sixel 行
+// yStart/yEnd 是像素行范围（yStart ∈ [0, height)，最多 6 行）
+type stripJob struct {
+	sixelRow int
+	yStart   int
+	yEnd     int
+}
+
+// stripResult 是 Worker 处理完一个 strip 后的结果
 type stripResult struct {
-	startRow int
-	sixelMap [][][]byte
+	sixelRow int
+	state    *sixelStripState // 包含 buf 和 dirty 列表，编码后归还到池
 }
 
-func (e *sixelEncoder) Encode(img image.Image) error {
-	nc := e.Colors
+func encodeSixel(w io.Writer, img image.Image, colors int, dither bool) error {
+	nc := colors
 	if nc < 2 {
 		nc = 255
 	}
@@ -850,246 +884,231 @@ func (e *sixelEncoder) Encode(img image.Image) error {
 		return nil
 	}
 
-	outBuf := bytes.NewBuffer(make([]byte, 0, 65536))
-	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22, 0x31, 0x3b, 0x31})
-
+	// ---- 量化（单线程，不可避免） ----
 	var paletted *image.Paletted
 	if p, ok := img.(*image.Paletted); ok && len(p.Palette) <= nc {
 		paletted = p
 	} else {
 		q := median.Quantizer(nc - 1)
 		paletted = q.Paletted(img)
-		if e.Dither {
+		if dither {
 			draw.FloydSteinberg.Draw(paletted, img.Bounds(), img, image.Point{})
 		}
 	}
 
-	for i, c := range paletted.Palette {
-		r, g, b, _ := c.RGBA()
-		if i >= nc {
-			break
-		}
+	paletteSize := len(paletted.Palette)
+	if paletteSize > nc {
+		paletteSize = nc
+	}
+
+	pix := paletted.Pix
+	stride := paletted.Stride
+
+	// ---- 输出 Sixel 头部 ----
+	estSize := width * height / 2
+	if estSize < 65536 {
+		estSize = 65536
+	}
+	outBuf := bytes.NewBuffer(make([]byte, 0, estSize))
+	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22, 0x31, 0x3b, 0x31})
+	for i := 0; i < paletteSize; i++ {
+		r, g, b, _ := paletted.Palette[i].RGBA()
 		fmt.Fprintf(outBuf, "#%d;2;%d;%d;%d", i+1, r*100/0xFFFF, g*100/0xFFFF, b*100/0xFFFF)
 	}
 
-	sixelRows := (height + 5) / 6
-	workers := e.Workers
-	if workers <= 0 {
-		workers = runtime.NumCPU()
+	// ---- 并行 strip 处理（交错发送/接收，避免死锁） ----
+	totalSixelRows := (height + 5) / 6
+	workers := runtime.NumCPU()
+	if workers > totalSixelRows {
+		workers = totalSixelRows
 	}
-	if workers > sixelRows {
-		workers = sixelRows
+	if workers < 1 {
+		workers = 1
 	}
-	rowsPerWorker := (sixelRows + workers - 1) / workers
+
+	// 使用足够大的缓冲避免死锁：主 goroutine 先发送一批任务，
+	// 然后交错执行「发一个任务 / 收一个结果」，保证 resultCh 不会填满
+	jobCh := make(chan stripJob, workers)
+	resultCh := make(chan stripResult, workers)
 
 	var wg sync.WaitGroup
-	resultChan := make(chan stripResult, workers)
-
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func(workerID int) {
+		go func() {
 			defer wg.Done()
-			startRow := workerID * rowsPerWorker
-			endRow := startRow + rowsPerWorker
-			if endRow > sixelRows {
-				endRow = sixelRows
+			for job := range jobCh {
+				st := sixelStripStatePool.Get().(*sixelStripState)
+				stripCap := nc * width
+				if cap(st.buf) < stripCap {
+					st.buf = make([]byte, stripCap)
+				}
+				st.buf = st.buf[:stripCap]
+				if cap(st.epoch) < nc {
+					st.epoch = make([]uint8, nc)
+				} else {
+					st.epoch = st.epoch[:nc]
+				}
+				clear(st.epoch)
+				dirty := st.dirty[:0]
+
+				for dy := job.yStart; dy < job.yEnd; dy++ {
+					bit := byte(1 << (dy - job.yStart))
+					rowOffset := dy * stride
+					for x := 0; x < width; x++ {
+						idx := int(pix[rowOffset+x])
+						if idx >= nc {
+							continue
+						}
+						if st.epoch[idx] != 1 {
+							st.epoch[idx] = 1
+							dirty = append(dirty, idx)
+							clear(st.buf[idx*width : (idx+1)*width])
+						}
+						st.buf[idx*width+x] |= bit
+					}
+				}
+
+				st.dirty = dirty
+				resultCh <- stripResult{sixelRow: job.sixelRow, state: st}
 			}
-			if startRow >= endRow {
-				return
-			}
-			e.processStrip(img, paletted, startRow, endRow, width, height, nc, resultChan)
-		}(i)
+		}()
 	}
 
-	go func() {
-		wg.Wait()
-		close(resultChan)
-	}()
+	// 先发送一批任务（保证 Worker 初始不会空闲）
+	jobsSent := 0
+	for ; jobsSent < workers && jobsSent < totalSixelRows; jobsSent++ {
+		yStart := jobsSent * 6
+		yEnd := yStart + 6
+		if yEnd > height {
+			yEnd = height
+		}
+		jobCh <- stripJob{sixelRow: jobsSent, yStart: yStart, yEnd: yEnd}
+	}
 
-	e.encodeSixelRows(outBuf, resultChan, sixelRows, width, len(paletted.Palette))
+	// 交错执行：发一个任务 → 收一个结果 → 编码 → 继续
+	makeJob := func(sixelRow int) stripJob {
+		yStart := sixelRow * 6
+		yEnd := yStart + 6
+		if yEnd > height {
+			yEnd = height
+		}
+		return stripJob{sixelRow: sixelRow, yStart: yStart, yEnd: yEnd}
+	}
 
+	nextRow := 0
+	pending := make(map[int]*sixelStripState)
+	recvCount := 0
+
+	for recvCount < totalSixelRows {
+		if jobsSent < totalSixelRows {
+			// 还有任务待发：select 确保不会同时阻塞在 jobCh 和 resultCh
+			select {
+			case jobCh <- makeJob(jobsSent):
+				jobsSent++
+			case res := <-resultCh:
+				recvCount++
+				processStripResult(outBuf, res, &nextRow, pending, width)
+			}
+		} else {
+			// 所有任务已发完，只收结果
+			res := <-resultCh
+			recvCount++
+			processStripResult(outBuf, res, &nextRow, pending, width)
+		}
+	}
+
+	close(jobCh)
+	wg.Wait()
+
+	// Sixel 终止符
 	outBuf.Write([]byte{0x1b, 0x5c})
-	_, err := outBuf.WriteTo(&writerAdapter{w: e.w})
+
+	_, err := outBuf.WriteTo(w)
 	return err
 }
 
-type writerAdapter struct {
-	w interface{ Write([]byte) (int, error) }
-}
-
-func (a *writerAdapter) Write(p []byte) (int, error) {
-	return a.w.Write(p)
-}
-
-func (e *sixelEncoder) processStrip(img image.Image, paletted *image.Paletted, startRow, endRow, width, totalHeight, nc int, resultChan chan<- stripResult) {
-	sixelRows := endRow - startRow
-
-	sixelMap := make([][][]byte, sixelRows)
-	for z := 0; z < sixelRows; z++ {
-		sixelMap[z] = make([][]byte, nc)
-		for c := 0; c < nc; c++ {
-			sixelMap[z][c] = make([]byte, width)
-		}
-	}
-
-	startY := startRow * 6
-	endY := endRow * 6
-	if endY > totalHeight {
-		endY = totalHeight
-	}
-
-	switch src := img.(type) {
-	case *image.RGBA:
-		pix := src.Pix
-		stride := src.Stride
-		for y := startY; y < endY; y++ {
-			rowStart := y * stride
-			z := y/6 - startRow
-			bit := byte(y % 6)
-			if y >= paletted.Bounds().Dy() {
-				continue
-			}
-			for x := 0; x < width; x++ {
-				if x >= paletted.Bounds().Dx() {
-					continue
-				}
-				offset := rowStart + x*4
-				if pix[offset+3] != 255 {
-					continue
-				}
-				idx := int(paletted.ColorIndexAt(x, y))
-				if idx < 0 || idx >= nc {
-					continue
-				}
-				sixelMap[z][idx][x] |= 1 << bit
-			}
-		}
-	default:
-		imgBounds := img.Bounds()
-		for y := startY; y < endY; y++ {
-			z := y/6 - startRow
-			bit := byte(y % 6)
-			if y >= paletted.Bounds().Dy() {
-				continue
-			}
-			for x := 0; x < width; x++ {
-				if x >= paletted.Bounds().Dx() {
-					continue
-				}
-				_, _, _, a := img.At(x+imgBounds.Min.X, y+imgBounds.Min.Y).RGBA()
-				if a != 0xFFFF {
-					continue
-				}
-				idx := int(paletted.ColorIndexAt(x, y))
-				if idx < 0 || idx >= nc {
-					continue
-				}
-				sixelMap[z][idx][x] |= 1 << bit
-			}
-		}
-	}
-
-	resultChan <- stripResult{
-		startRow: startRow,
-		sixelMap: sixelMap,
-	}
-}
-
-func (e *sixelEncoder) encodeSixelRows(outBuf *bytes.Buffer, resultChan <-chan stripResult, totalRows, width, paletteSize int) {
-	orderedResults := make([][][]byte, totalRows)
-
-	for res := range resultChan {
-		for i, colorData := range res.sixelMap {
-			rowIdx := res.startRow + i
-			if rowIdx < totalRows {
-				orderedResults[rowIdx] = colorData
-			}
-		}
-	}
-
-	tempBuf := make([]byte, 0, 256)
-	for z := 0; z < totalRows; z++ {
-		if z > 0 {
-			outBuf.WriteByte(0x2d)
-		}
-		if z >= len(orderedResults) || orderedResults[z] == nil {
-			continue
-		}
-		colorData := orderedResults[z]
-
-		for colorIdx := 0; colorIdx < paletteSize; colorIdx++ {
-			sixelRow := colorData[colorIdx]
-
-			hasData := false
-			for x := 0; x < width; x++ {
-				if sixelRow[x] != 0 {
-					hasData = true
-					break
-				}
-			}
-			if !hasData {
-				continue
-			}
-
-			outBuf.WriteByte(0x24)
-			outBuf.WriteByte(0x23)
-
-			colorNum := colorIdx + 1
-			if colorNum >= 100 {
-				outBuf.Write([]byte{
-					byte(0x30 + colorNum/100),
-					byte(0x30 + (colorNum%100)/10),
-					byte(0x30 + colorNum%10),
-				})
-			} else if colorNum >= 10 {
-				outBuf.Write([]byte{
-					byte(0x30 + colorNum/10),
-					byte(0x30 + colorNum%10),
-				})
+// processStripResult 保序处理一个 strip 结果：如果顺序正确立即编码，否则暂存
+func processStripResult(outBuf *bytes.Buffer, res stripResult, nextRow *int, pending map[int]*sixelStripState, width int) {
+	if res.sixelRow == *nextRow {
+		encodeStrip(outBuf, res.state, res.sixelRow, width)
+		*nextRow++
+		for {
+			if st, ok := pending[*nextRow]; ok {
+				encodeStrip(outBuf, st, *nextRow, width)
+				delete(pending, *nextRow)
+				*nextRow++
 			} else {
-				outBuf.WriteByte(byte(0x30 + colorNum))
-			}
-
-			var lastCh byte
-			runCount := 0
-			for x := 0; x <= width; x++ {
-				var ch byte
-				if x < width {
-					ch = sixelRow[x]
-				} else {
-					ch = 0xff
-				}
-				if ch != lastCh || runCount == 255 {
-					if runCount > 0 {
-						sixelChar := lastCh + 63
-						tempBuf = tempBuf[:0]
-						if runCount > 1 {
-							tempBuf = append(tempBuf, 0x21)
-							if runCount >= 100 {
-								tempBuf = append(tempBuf,
-									byte(0x30+runCount/100),
-									byte(0x30+(runCount%100)/10),
-									byte(0x30+runCount%10),
-								)
-							} else if runCount >= 10 {
-								tempBuf = append(tempBuf,
-									byte(0x30+runCount/10),
-									byte(0x30+runCount%10),
-								)
-							} else {
-								tempBuf = append(tempBuf, byte(0x30+runCount))
-							}
-						}
-						tempBuf = append(tempBuf, sixelChar)
-						outBuf.Write(tempBuf)
-					}
-					lastCh = ch
-					runCount = 1
-				} else {
-					runCount++
-				}
+				break
 			}
 		}
+	} else {
+		pending[res.sixelRow] = res.state
+	}
+}
+
+// encodeStrip RLE 编码一个 strip 的所有颜色行到 outBuf，然后归还 state 到池
+func encodeStrip(outBuf *bytes.Buffer, st *sixelStripState, sixelRow, width int) {
+	if st == nil {
+		return
+	}
+
+	if sixelRow > 0 {
+		outBuf.WriteByte(0x2d) // '-' 分隔 strip
+	}
+
+	for _, c := range st.dirty {
+		base := c * width
+		row := st.buf[base : base+width]
+
+		outBuf.WriteByte(0x24) // '$'
+		outBuf.WriteByte(0x23) // '#'
+		writeSixelNum(outBuf, c+1)
+
+		var lastCh byte
+		runCount := 0
+		for x := 0; x <= width; x++ {
+			var ch byte
+			if x < width {
+				ch = row[x]
+			} else {
+				ch = 0xff
+			}
+			if ch != lastCh || runCount == 255 {
+				if runCount > 0 {
+					sixelChar := lastCh + 63
+					if runCount > 1 {
+						outBuf.WriteByte(0x21) // '!'
+						writeSixelNum(outBuf, runCount)
+					}
+					outBuf.WriteByte(sixelChar)
+				}
+				lastCh = ch
+				runCount = 1
+			} else {
+				runCount++
+			}
+		}
+	}
+
+	st.dirty = st.dirty[:0]
+	sixelStripStatePool.Put(st)
+}
+
+// writeSixelNum 高效写入 Sixel 数字（颜色编号或游程长度）到 buffer
+func writeSixelNum(b *bytes.Buffer, n int) {
+	if n >= 100 {
+		b.Write([]byte{
+			byte(0x30 + n/100),
+			byte(0x30 + (n%100)/10),
+			byte(0x30 + n%10),
+		})
+	} else if n >= 10 {
+		b.Write([]byte{
+			byte(0x30 + n/10),
+			byte(0x30 + n%10),
+		})
+	} else {
+		b.WriteByte(byte(0x30 + n))
 	}
 }
 

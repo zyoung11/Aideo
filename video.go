@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"image"
 	"io"
 	"math"
 	"os"
@@ -198,6 +197,7 @@ type VideoPlayer struct {
 	cellH       int
 
 	kittyBuf   bytes.Buffer // 复用 Kitty 渲染缓冲区
+	sixelBuf   bytes.Buffer // 复用 Sixel 渲染缓冲区
 	frameBuf   []byte        // 复用帧读取缓冲区
 
 	// kitty 性能优化
@@ -583,12 +583,6 @@ func (n *noopAudioStreamer) Close()     {}
 
 // ==================== 播放循环 ====================
 
-func rawBytesToRGBA(raw []byte, w, h int) *image.RGBA {
-	img := image.NewRGBA(image.Rect(0, 0, w, h))
-	copy(img.Pix, raw)
-	return img
-}
-
 func (vp *VideoPlayer) renderAsciiFrame(raw []byte, outputBuf *strings.Builder) {
 	imgData := rawRGBAToColorData(raw, vp.outWidth, vp.outHeight)
 	vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
@@ -612,27 +606,28 @@ func (vp *VideoPlayer) renderAsciiFrame(raw []byte, outputBuf *strings.Builder) 
 	}
 }
 
-func (vp *VideoPlayer) renderSixelFrame(raw []byte, outputBuf *bytes.Buffer) {
-	outputBuf.Reset()
-	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
-	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
-	timage.EncodeSixelFrame(outputBuf, img, 255, false)
+func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
+	vp.sixelBuf.Reset()
+	fmt.Fprintf(&vp.sixelBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
+	// 直接编码 raw RGBA 字节，跳过 image.RGBA 创建和拷贝
+	timage.EncodeSixelFrameRaw(&vp.sixelBuf, raw, vp.outWidth, vp.outHeight, 255, false)
 
 	// 清除图像右侧的残留区域
 	if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
 		clearStartCol := vp.startCol + vp.charW + 1
 		for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
-			fmt.Fprintf(outputBuf, "\033[%d;%dH\033[K", row, clearStartCol)
+			fmt.Fprintf(&vp.sixelBuf, "\033[%d;%dH\033[K", row, clearStartCol)
 		}
 	}
 
 	// 清除图像下方的残留区域
 	if vp.startRow+vp.charH < vp.termHeight {
-		fmt.Fprintf(outputBuf, "\033[%d;1H\033[J", vp.startRow+vp.charH+1)
+		fmt.Fprintf(&vp.sixelBuf, "\033[%d;1H\033[J", vp.startRow+vp.charH+1)
 	}
 
-	fmt.Fprintf(outputBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
+	fmt.Fprintf(&vp.sixelBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
 		vp.termHeight, RESET_COLORS)
+	os.Stdout.Write(vp.sixelBuf.Bytes())
 }
 
 func (vp *VideoPlayer) renderKittyFrame(raw []byte) {
@@ -910,9 +905,7 @@ func (vp *VideoPlayer) startLoop() {
 
 		switch vp.proto {
 		case timage.ProtocolSixel:
-			var b bytes.Buffer
-			vp.renderSixelFrame(buf, &b)
-			os.Stdout.Write(b.Bytes())
+			vp.renderSixelFrame(buf)
 		case timage.ProtocolKitty:
 			vp.renderKittyFrame(buf)
 		default:
