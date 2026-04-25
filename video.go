@@ -617,6 +617,20 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte, outputBuf *bytes.Buffer) {
 	fmt.Fprintf(outputBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
 	img := rawBytesToRGBA(raw, vp.outWidth, vp.outHeight)
 	timage.EncodeSixelFrame(outputBuf, img, 255, false)
+
+	// 清除图像右侧的残留区域
+	if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
+		clearStartCol := vp.startCol + vp.charW + 1
+		for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
+			fmt.Fprintf(outputBuf, "\033[%d;%dH\033[K", row, clearStartCol)
+		}
+	}
+
+	// 清除图像下方的残留区域
+	if vp.startRow+vp.charH < vp.termHeight {
+		fmt.Fprintf(outputBuf, "\033[%d;1H\033[J", vp.startRow+vp.charH+1)
+	}
+
 	fmt.Fprintf(outputBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
 		vp.termHeight, RESET_COLORS)
 }
