@@ -204,6 +204,11 @@ type VideoPlayer struct {
 	kittyFrameCount    int32       // kitty 帧计数器
 	kittyLastTime      time.Time   // 上次 kitty 帧时间
 	kittyTargetFPS     float64     // kitty 目标帧率
+
+	// 实时帧率统计
+	fpsAccum           int64
+	fpsAccumStart      time.Time
+	displayFPS         float64
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -625,8 +630,7 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 		fmt.Fprintf(&vp.sixelBuf, "\033[%d;1H\033[J", vp.startRow+vp.charH+1)
 	}
 
-	fmt.Fprintf(&vp.sixelBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
-		vp.termHeight, RESET_COLORS)
+	fmt.Fprintf(&vp.sixelBuf, "%s", vp.statusLine())
 	os.Stdout.Write(vp.sixelBuf.Bytes())
 }
 
@@ -657,8 +661,7 @@ func (vp *VideoPlayer) renderKittyFrame(raw []byte) {
 		timage.DeleteKittyFrame(&vp.kittyBuf, vp.prevKittyID)
 	}
 	vp.prevKittyID = newID
-	fmt.Fprintf(&vp.kittyBuf, "\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
-		vp.termHeight, RESET_COLORS)
+	fmt.Fprintf(&vp.kittyBuf, "%s", vp.statusLine())
 	os.Stdout.Write(vp.kittyBuf.Bytes())
 }
 
@@ -672,6 +675,28 @@ func (vp *VideoPlayer) cleanupFrame() {
 	case timage.ProtocolSixel:
 		fmt.Print("\033[2J\033[3J\033[H")
 	}
+}
+
+// updateFPS 每帧调用，累计帧数并更新实时帧率（每 500ms 刷新一次）
+func (vp *VideoPlayer) updateFPS() {
+	vp.fpsAccum++
+	now := time.Now()
+	if vp.fpsAccumStart.IsZero() {
+		vp.fpsAccumStart = now
+		return
+	}
+	elapsed := now.Sub(vp.fpsAccumStart)
+	if elapsed >= 500*time.Millisecond {
+		vp.displayFPS = float64(vp.fpsAccum) / elapsed.Seconds()
+		vp.fpsAccum = 0
+		vp.fpsAccumStart = now
+	}
+}
+
+// statusLine 返回底部状态栏，显示分辨率与实时帧率
+func (vp *VideoPlayer) statusLine() string {
+	return fmt.Sprintf("\033[%d;1H\033[90m[ q退出 | %dx%d | %.1ffps ]\033[K%s",
+		vp.termHeight, vp.outWidth, vp.outHeight, vp.displayFPS, RESET_COLORS)
 }
 
 // startLoop 循环播放，使用双缓冲 decoder 实现无缝循环
@@ -901,6 +926,8 @@ func (vp *VideoPlayer) startLoop() {
 		// 帧计数（用于 resize seek）
 		frameCount++
 
+		vp.updateFPS()
+
 		outputBuf.Reset()
 
 		switch vp.proto {
@@ -913,8 +940,7 @@ func (vp *VideoPlayer) startLoop() {
 		}
 
 		if vp.proto == timage.ProtocolAuto {
-			outputBuf.WriteString(fmt.Sprintf("\033[%d;1H\033[90m[ 按 q 退出 ]\033[K%s",
-				vp.termHeight, RESET_COLORS))
+			outputBuf.WriteString(vp.statusLine())
 
 			fmt.Print(outputBuf.String())
 		}
