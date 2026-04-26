@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"image"
+	"image/color"
 	"image/draw"
 	"image/png"
 	"io"
@@ -514,16 +515,52 @@ func EncodeSixelFrame(w io.Writer, img image.Image, colors int, dither bool) err
 	return encodeSixel(w, img, colors, dither)
 }
 
-// EncodeSixelFrameRaw 直接从 raw RGBA 字节编码 Sixel，跳过 image.RGBA 创建和拷贝
-// data 是 raw RGBA 字节 (4 bytes/pixel, R,G,B,A 顺序)
-func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int, dither bool) error {
-	// 零拷贝包装：将 raw 字节包装为 *image.RGBA，不分配新内存
-	img := &image.RGBA{
-		Pix:    data,
-		Stride: width * 4,
-		Rect:   image.Rect(0, 0, width, height),
+// ---- 快速均匀量化（8×8×4 = 256 色，纯位运算，无 LUT，O(n)） ----
+var uniform256Palette []color.Color
+var uniform256Once sync.Once
+
+func initUniform256() {
+	uniform256Palette = make([]color.Color, 256)
+	for ri := 0; ri < 8; ri++ {
+		for gi := 0; gi < 8; gi++ {
+			for bi := 0; bi < 4; bi++ {
+				idx := ri<<5 | gi<<2 | bi
+				uniform256Palette[idx] = color.RGBA{
+					uint8(ri * 255 / 7),
+					uint8(gi * 255 / 7),
+					uint8(bi * 255 / 3),
+					255,
+				}
+			}
+		}
 	}
-	return encodeSixel(w, img, colors, dither)
+}
+
+// quantizeUniform 用均匀 8×8×4 色块量化 raw RGBA 像素
+// idx = (R>>5)<<5 | (G>>5)<<2 | (B>>6) — 纯位运算，每像素 O(1)
+func quantizeUniform(data []byte, width, height int) *image.Paletted {
+	uniform256Once.Do(initUniform256)
+	pi := image.NewPaletted(image.Rect(0, 0, width, height), uniform256Palette)
+	dst := pi.Pix
+	si := 0
+	for i := range dst {
+		r := data[si]
+		g := data[si+1]
+		b := data[si+2]
+		si += 4
+		dst[i] = (r>>5)<<5 | (g>>5)<<2 | (b>>6)
+	}
+	return pi
+}
+
+// EncodeSixelFrameRaw 直接从 raw RGBA 字节编码 Sixel
+// 使用均匀量化（O(n)，纯位运算）+ 并行 strip 编码
+func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int, dither bool) error {
+	if width == 0 || height == 0 {
+		return nil
+	}
+	paletted := quantizeUniform(data, width, height)
+	return encodePaletted(w, paletted, width, height, 256)
 }
 
 func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
@@ -877,14 +914,11 @@ func encodeSixel(w io.Writer, img image.Image, colors int, dither bool) error {
 	if nc < 2 {
 		nc = 255
 	}
-
 	bounds := img.Bounds()
 	width, height := bounds.Dx(), bounds.Dy()
 	if width == 0 || height == 0 {
 		return nil
 	}
-
-	// ---- 量化（单线程，不可避免） ----
 	var paletted *image.Paletted
 	if p, ok := img.(*image.Paletted); ok && len(p.Palette) <= nc {
 		paletted = p
@@ -895,14 +929,18 @@ func encodeSixel(w io.Writer, img image.Image, colors int, dither bool) error {
 			draw.FloydSteinberg.Draw(paletted, img.Bounds(), img, image.Point{})
 		}
 	}
+	return encodePaletted(w, paletted, width, height, nc)
+}
+
+// encodePaletted 编码已量化的 Paletted 图像为 Sixel（并行 strip 处理 + 流式 RLE）
+func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int) error {
+	pix := paletted.Pix
+	stride := paletted.Stride
 
 	paletteSize := len(paletted.Palette)
 	if paletteSize > nc {
 		paletteSize = nc
 	}
-
-	pix := paletted.Pix
-	stride := paletted.Stride
 
 	// ---- 输出 Sixel 头部 ----
 	estSize := width * height / 2
