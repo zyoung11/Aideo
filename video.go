@@ -788,8 +788,7 @@ func (vp *VideoPlayer) startLoop() {
 	// 清屏一次（只在最开始时）
 	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
 
-	fpsTicker := time.NewTicker(vp.frameTime)
-	defer fpsTicker.Stop()
+	playbackStart := time.Now()
 
 	// 窗口 resize 防抖
 	var resizePending bool
@@ -926,6 +925,25 @@ func (vp *VideoPlayer) startLoop() {
 		// 帧计数（用于 resize seek）
 		frameCount++
 
+		// A/V 同步：如果落后音频超过 1 帧，跳过解码帧追到当前音频位置
+		for {
+			expectedTime := playbackStart.Add(time.Duration(float64(frameCount)) * vp.frameTime)
+			if behind := time.Since(expectedTime); behind <= vp.frameTime {
+				break
+			}
+			frameCount++
+			n, err = io.ReadFull(currentDec.reader, buf)
+			if err != nil || n != frameSize {
+				currentDec.close()
+				currentDec = nextDec
+				nextDec = vp.spawnVideoDecoder(0)
+				n, err = io.ReadFull(currentDec.reader, buf)
+				if err != nil || n != frameSize {
+					break
+				}
+			}
+		}
+
 		vp.updateFPS()
 
 		outputBuf.Reset()
@@ -945,8 +963,11 @@ func (vp *VideoPlayer) startLoop() {
 			fmt.Print(outputBuf.String())
 		}
 
-		// 等待下一个帧时间
-		<-fpsTicker.C
+		// 如果超前于音频，等待到正确的展示时间再渲染
+		expectedTime := playbackStart.Add(time.Duration(float64(frameCount)) * vp.frameTime)
+		if remaining := time.Until(expectedTime); remaining > 0 {
+			time.Sleep(remaining)
+		}
 	}
 }
 
