@@ -536,37 +536,57 @@ func initUniform256() {
 	}
 }
 
-// Bayer 4×4 有序抖动矩阵
-var bayer4 = [16]uint8{
-	0, 8, 2, 10,
-	12, 4, 14, 6,
-	3, 11, 1, 9,
-	15, 7, 13, 5,
+// Bayer 4×4 有序抖动 — 预计算每位置的偏移量，消除内层乘法
+var ditherRG = [16]int8{
+	-15, 1, -11, 5,
+	9, -7, 13, -3,
+	-9, 7, -13, 3,
+	15, -1, 11, -5,
+}
+var ditherB = [16]int8{
+	-30, 2, -22, 10,
+	18, -14, 26, -6,
+	-18, 14, -26, 6,
+	30, -2, 22, -10,
+}
+
+var cachedPaletted *image.Paletted
+var cachedPalW, cachedPalH int
+
+// getPalettedBuffer 返回一个可复用的 Paletted，避免每帧分配 Pix 缓冲区
+func getPalettedBuffer(w, h int) *image.Paletted {
+	uniform256Once.Do(initUniform256)
+	if cachedPaletted != nil && cachedPalW == w && cachedPalH == h {
+		return cachedPaletted
+	}
+	cachedPaletted = image.NewPaletted(image.Rect(0, 0, w, h), uniform256Palette)
+	cachedPalW, cachedPalH = w, h
+	return cachedPaletted
 }
 
 // quantizeUniform 用均匀 8×8×4 色块 + Bayer 有序抖动量化 raw RGBA
-// 抖动将量化误差分散到邻近像素，视觉上消除色带
 // idx = (R_idx<<5) | (G_idx<<2) | B_idx — 纯位运算，每像素 O(1)
 func quantizeUniform(data []byte, width, height int) *image.Paletted {
-	uniform256Once.Do(initUniform256)
-	pi := image.NewPaletted(image.Rect(0, 0, width, height), uniform256Palette)
+	pi := getPalettedBuffer(width, height)
 	dst := pi.Pix
+
+	// 预计算各行 Bayer 偏移在行首一次，避免内层计算
+	// bayerRowRG[y&3][x] = ditherRG[x%4] （但只需4个值，用固定表即可）
+
 	si := 0
 	di := 0
 	for y := 0; y < height; y++ {
-		yb := y & 3
+		yb4 := (y & 3) << 2
 		for x := 0; x < width; x++ {
-			r := int(data[si])
-			g := int(data[si+1])
-			b := int(data[si+2])
+			idx := yb4 | (x & 3)
+			r := int(data[si]) + int(ditherRG[idx])
+			g := int(data[si+1]) + int(ditherRG[idx])
+			b := int(data[si+2]) + int(ditherB[idx])
 			si += 4
 
-			t := int(bayer4[(yb<<2)|(x&3)])
-			// 将 Bayer 阈值 0..15 映射到 ±15 (R/G) 和 ±30 (B)
-			// 加到原始值上使邻近像素落在不同色块，消除硬边界
-			ri := (r + t*2 - 15) >> 5
-			gi := (g + t*2 - 15) >> 5
-			bi := (b + t*4 - 30) >> 6
+			ri := r >> 5
+			gi := g >> 5
+			bi := b >> 6
 
 			if ri < 0 {
 				ri = 0
@@ -989,7 +1009,14 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22, 0x31, 0x3b, 0x31})
 	for i := 0; i < paletteSize; i++ {
 		r, g, b, _ := paletted.Palette[i].RGBA()
-		fmt.Fprintf(outBuf, "#%d;2;%d;%d;%d", i+1, r*100/0xFFFF, g*100/0xFFFF, b*100/0xFFFF)
+		outBuf.WriteByte('#')
+		writeSixelNum(outBuf, i+1)
+		outBuf.WriteString(";2;")
+		writeSixelNum(outBuf, int(r*100/0xFFFF))
+		outBuf.WriteByte(';')
+		writeSixelNum(outBuf, int(g*100/0xFFFF))
+		outBuf.WriteByte(';')
+		writeSixelNum(outBuf, int(b*100/0xFFFF))
 	}
 
 	// ---- 并行 strip 处理（交错发送/接收，避免死锁） ----
@@ -1027,9 +1054,10 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 				clear(st.epoch)
 				dirty := st.dirty[:0]
 
-				for dy := job.yStart; dy < job.yEnd; dy++ {
-					bit := byte(1 << (dy - job.yStart))
-					rowOffset := dy * stride
+				rowOffset := job.yStart * stride
+				nRows := job.yEnd - job.yStart
+				for dy := 0; dy < nRows; dy++ {
+					bit := byte(1 << dy)
 					for x := 0; x < width; x++ {
 						idx := int(pix[rowOffset+x])
 						if idx >= nc {
@@ -1042,6 +1070,7 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 						}
 						st.buf[idx*width+x] |= bit
 					}
+					rowOffset += stride
 				}
 
 				st.dirty = dirty
