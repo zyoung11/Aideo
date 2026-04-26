@@ -536,19 +536,57 @@ func initUniform256() {
 	}
 }
 
-// quantizeUniform 用均匀 8×8×4 色块量化 raw RGBA 像素
-// idx = (R>>5)<<5 | (G>>5)<<2 | (B>>6) — 纯位运算，每像素 O(1)
+// Bayer 4×4 有序抖动矩阵
+var bayer4 = [16]uint8{
+	0, 8, 2, 10,
+	12, 4, 14, 6,
+	3, 11, 1, 9,
+	15, 7, 13, 5,
+}
+
+// quantizeUniform 用均匀 8×8×4 色块 + Bayer 有序抖动量化 raw RGBA
+// 抖动将量化误差分散到邻近像素，视觉上消除色带
+// idx = (R_idx<<5) | (G_idx<<2) | B_idx — 纯位运算，每像素 O(1)
 func quantizeUniform(data []byte, width, height int) *image.Paletted {
 	uniform256Once.Do(initUniform256)
 	pi := image.NewPaletted(image.Rect(0, 0, width, height), uniform256Palette)
 	dst := pi.Pix
 	si := 0
-	for i := range dst {
-		r := data[si]
-		g := data[si+1]
-		b := data[si+2]
-		si += 4
-		dst[i] = (r>>5)<<5 | (g>>5)<<2 | (b>>6)
+	di := 0
+	for y := 0; y < height; y++ {
+		yb := y & 3
+		for x := 0; x < width; x++ {
+			r := int(data[si])
+			g := int(data[si+1])
+			b := int(data[si+2])
+			si += 4
+
+			t := int(bayer4[(yb<<2)|(x&3)])
+			// 将 Bayer 阈值 0..15 映射到 ±15 (R/G) 和 ±30 (B)
+			// 加到原始值上使邻近像素落在不同色块，消除硬边界
+			ri := (r + t*2 - 15) >> 5
+			gi := (g + t*2 - 15) >> 5
+			bi := (b + t*4 - 30) >> 6
+
+			if ri < 0 {
+				ri = 0
+			} else if ri > 7 {
+				ri = 7
+			}
+			if gi < 0 {
+				gi = 0
+			} else if gi > 7 {
+				gi = 7
+			}
+			if bi < 0 {
+				bi = 0
+			} else if bi > 3 {
+				bi = 3
+			}
+
+			dst[di] = uint8(ri<<5 | gi<<2 | bi)
+			di++
+		}
 	}
 	return pi
 }
