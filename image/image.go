@@ -276,7 +276,11 @@ func ShowImage(cfg DisplayConfig) (*DisplayResult, error) {
 		case ProtocolKitty:
 			err = renderKitty(scaled, imageCols, imageRows)
 		default:
-			err = renderSixel(scaled, cfg.SixelColors, cfg.SixelDither)
+			bounds := scaled.Bounds()
+			w, h := bounds.Dx(), bounds.Dy()
+			rgba := image.NewRGBA(bounds)
+			draw.Draw(rgba, bounds, scaled, bounds.Min, draw.Src)
+			err = EncodeSixelRGBA(os.Stdout, rgba.Pix, w, h, 256)
 		}
 		if err != nil {
 			return nil, fmt.Errorf("render: %v", err)
@@ -587,6 +591,15 @@ func nearestPaletteLevel(nc int) int {
 		}
 	}
 	return paletteLevels[len(paletteLevels)-1]
+}
+
+func EncodeSixelRGBA(w io.Writer, data []byte, width, height, colors int) error {
+	if width == 0 || height == 0 {
+		return nil
+	}
+	nc := nearestPaletteLevel(colors)
+	pal := getSixelPalette(nc)
+	return encodeSixelFromRGBA(w, data, width, height, pal, nil)
 }
 
 func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int, dither bool, cache *SixelFrameCache) error {
