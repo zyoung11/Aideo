@@ -550,67 +550,6 @@ var ditherB = [16]int8{
 	30, -2, 22, -10,
 }
 
-var cachedPaletted *image.Paletted
-var cachedPalW, cachedPalH int
-
-// getPalettedBuffer 返回一个可复用的 Paletted，避免每帧分配 Pix 缓冲区
-func getPalettedBuffer(w, h int) *image.Paletted {
-	uniform256Once.Do(initUniform256)
-	if cachedPaletted != nil && cachedPalW == w && cachedPalH == h {
-		return cachedPaletted
-	}
-	cachedPaletted = image.NewPaletted(image.Rect(0, 0, w, h), uniform256Palette)
-	cachedPalW, cachedPalH = w, h
-	return cachedPaletted
-}
-
-// quantizeUniform 用均匀 8×8×4 色块 + Bayer 有序抖动量化 raw RGBA
-// idx = (R_idx<<5) | (G_idx<<2) | B_idx — 纯位运算，每像素 O(1)
-func quantizeUniform(data []byte, width, height int) *image.Paletted {
-	pi := getPalettedBuffer(width, height)
-	dst := pi.Pix
-
-	// 预计算各行 Bayer 偏移在行首一次，避免内层计算
-	// bayerRowRG[y&3][x] = ditherRG[x%4] （但只需4个值，用固定表即可）
-
-	si := 0
-	di := 0
-	for y := 0; y < height; y++ {
-		yb4 := (y & 3) << 2
-		for x := 0; x < width; x++ {
-			idx := yb4 | (x & 3)
-			r := int(data[si]) + int(ditherRG[idx])
-			g := int(data[si+1]) + int(ditherRG[idx])
-			b := int(data[si+2]) + int(ditherB[idx])
-			si += 4
-
-			ri := r >> 5
-			gi := g >> 5
-			bi := b >> 6
-
-			if ri < 0 {
-				ri = 0
-			} else if ri > 7 {
-				ri = 7
-			}
-			if gi < 0 {
-				gi = 0
-			} else if gi > 7 {
-				gi = 7
-			}
-			if bi < 0 {
-				bi = 0
-			} else if bi > 3 {
-				bi = 3
-			}
-
-			dst[di] = uint8(ri<<5 | gi<<2 | bi)
-			di++
-		}
-	}
-	return pi
-}
-
 // EncodeSixelFrameRaw 直接从 raw RGBA 字节编码 Sixel
 // 使用均匀量化（O(n)，纯位运算）+ 并行 strip 编码
 // cache 为帧间缓存，传 nil 表示不使用缓存
@@ -618,8 +557,7 @@ func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int
 	if width == 0 || height == 0 {
 		return nil
 	}
-	paletted := quantizeUniform(data, width, height)
-	return encodePaletted(w, paletted, width, height, 256, cache)
+	return encodeSixelFromRGBA(w, data, width, height, cache)
 }
 
 func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
@@ -703,6 +641,12 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 var kittyRGBPool = sync.Pool{
 	New: func() interface{} {
 		return make([]byte, 512*1024) // 512KB 初始容量
+	},
+}
+
+var sixelRLEBufPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
 	},
 }
 
@@ -984,6 +928,19 @@ func stripPixelHash(pix []uint8, stride int, yStart, yEnd, width int) uint64 {
 	return h
 }
 
+func stripPixelHashRGBA(data []byte, width int, yStart, yEnd int) uint64 {
+	h := uint64(14695981039346656037)
+	rowLen := width * 4
+	for y := yStart; y < yEnd; y++ {
+		row := data[y*rowLen : y*rowLen+rowLen]
+		for _, b := range row {
+			h ^= uint64(b)
+			h *= 1099511628211
+		}
+	}
+	return h
+}
+
 type pendingItem struct {
 	state   *sixelStripState
 	rleData []byte
@@ -1002,6 +959,208 @@ type stripResult struct {
 	sixelRow int
 	state    *sixelStripState
 	rleData  []byte // 缓存命中时直接携带 RLE 数据，state 为 nil
+}
+
+func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *SixelFrameCache) error {
+	nc := 256
+	totalSixelRows := (height + 5) / 6
+	workers := runtime.NumCPU()
+	if workers > totalSixelRows {
+		workers = totalSixelRows
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	estSize := width * height / 2
+	if estSize < 65536 {
+		estSize = 65536
+	}
+	outBuf := bytes.NewBuffer(make([]byte, 0, estSize))
+	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22, 0x31, 0x3b, 0x31})
+	uniform256Once.Do(initUniform256)
+	for i := 0; i < nc; i++ {
+		r, g, b, _ := uniform256Palette[i].RGBA()
+		outBuf.WriteByte('#')
+		writeSixelNum(outBuf, i+1)
+		outBuf.WriteString(";2;")
+		writeSixelNum(outBuf, int(r*100/0xFFFF))
+		outBuf.WriteByte(';')
+		writeSixelNum(outBuf, int(g*100/0xFFFF))
+		outBuf.WriteByte(';')
+		writeSixelNum(outBuf, int(b*100/0xFFFF))
+	}
+
+	jobCh := make(chan stripJob, workers)
+	resultCh := make(chan stripResult, workers)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobCh {
+				nRows := job.yEnd - job.yStart
+				pHash := stripPixelHashRGBA(data, width, job.yStart, job.yEnd)
+
+				if cache != nil {
+					cache.mu.Lock()
+					c := &cache.strips[job.sixelRow]
+					if c.pixelHash == pHash && len(c.rleData) > 0 {
+						rleCopy := make([]byte, len(c.rleData))
+						copy(rleCopy, c.rleData)
+						cache.mu.Unlock()
+						resultCh <- stripResult{sixelRow: job.sixelRow, rleData: rleCopy}
+						continue
+					}
+					cache.mu.Unlock()
+				}
+
+				st := sixelStripStatePool.Get().(*sixelStripState)
+				st.pixelHash = pHash
+				stripCap := nc * width
+				if cap(st.buf) < stripCap {
+					st.buf = make([]byte, stripCap)
+				}
+				st.buf = st.buf[:stripCap]
+				if cap(st.seen) < nc {
+					st.seen = make([]uint16, nc)
+				} else {
+					st.seen = st.seen[:nc]
+				}
+				st.epoch++
+				if st.epoch == 0 {
+					clear(st.seen)
+					st.epoch = 1
+				}
+				clear(st.buf[:stripCap])
+				dirty := st.dirty[:0]
+
+				rowOffset := job.yStart * width * 4
+				for dy := 0; dy < nRows; dy++ {
+					yb4 := ((job.yStart + dy) & 3) << 2
+					bit := byte(1 << dy)
+					for x := 0; x < width; x++ {
+						bayerIdx := yb4 | (x & 3)
+						pi := rowOffset + x*4
+						r := int(data[pi]) + int(ditherRG[bayerIdx])
+						g := int(data[pi+1]) + int(ditherRG[bayerIdx])
+						b := int(data[pi+2]) + int(ditherB[bayerIdx])
+
+						ri := r >> 5
+						gi := g >> 5
+						bi := b >> 6
+						if ri < 0 {
+							ri = 0
+						} else if ri > 7 {
+							ri = 7
+						}
+						if gi < 0 {
+							gi = 0
+						} else if gi > 7 {
+							gi = 7
+						}
+						if bi < 0 {
+							bi = 0
+						} else if bi > 3 {
+							bi = 3
+						}
+						ci := ri<<5 | gi<<2 | bi
+
+						if st.seen[ci] != st.epoch {
+							st.seen[ci] = st.epoch
+							dirty = append(dirty, ci)
+						}
+						st.buf[ci*width+x] |= bit
+					}
+					rowOffset += width * 4
+				}
+
+				st.dirty = dirty
+
+				localBuf := sixelRLEBufPool.Get().(*bytes.Buffer)
+				localBuf.Reset()
+				encodeStrip(localBuf, st, job.sixelRow, width)
+				rleBytes := make([]byte, localBuf.Len())
+				copy(rleBytes, localBuf.Bytes())
+				sixelRLEBufPool.Put(localBuf)
+
+				if cache != nil {
+					cache.mu.Lock()
+					c := &cache.strips[job.sixelRow]
+					c.rleData = append(c.rleData[:0], rleBytes...)
+					c.pixelHash = pHash
+					cache.mu.Unlock()
+				}
+
+				resultCh <- stripResult{sixelRow: job.sixelRow, rleData: rleBytes}
+			}
+		}()
+	}
+
+	jobsSent := 0
+	for ; jobsSent < workers && jobsSent < totalSixelRows; jobsSent++ {
+		yStart := jobsSent * 6
+		yEnd := yStart + 6
+		if yEnd > height {
+			yEnd = height
+		}
+		jobCh <- stripJob{sixelRow: jobsSent, yStart: yStart, yEnd: yEnd}
+	}
+
+	makeJob := func(sixelRow int) stripJob {
+		yStart := sixelRow * 6
+		yEnd := yStart + 6
+		if yEnd > height {
+			yEnd = height
+		}
+		return stripJob{sixelRow: sixelRow, yStart: yStart, yEnd: yEnd}
+	}
+
+	nextRow := 0
+	pending := make(map[int][]byte)
+	recvCount := 0
+
+	flushPending := func() {
+		for {
+			data, ok := pending[nextRow]
+			if !ok {
+				break
+			}
+			outBuf.Write(data)
+			delete(pending, nextRow)
+			nextRow++
+		}
+	}
+
+	for recvCount < totalSixelRows {
+		if jobsSent < totalSixelRows {
+			select {
+			case jobCh <- makeJob(jobsSent):
+				jobsSent++
+			case res := <-resultCh:
+				recvCount++
+				pending[res.sixelRow] = res.rleData
+				if res.sixelRow == nextRow {
+					flushPending()
+				}
+			}
+		} else {
+			res := <-resultCh
+			recvCount++
+			pending[res.sixelRow] = res.rleData
+			if res.sixelRow == nextRow {
+				flushPending()
+			}
+		}
+	}
+
+	close(jobCh)
+	wg.Wait()
+
+	outBuf.Write([]byte{0x1b, 0x5c})
+	_, err := outBuf.WriteTo(w)
+	return err
 }
 
 func encodeSixel(w io.Writer, img image.Image, colors int, dither bool) error {
