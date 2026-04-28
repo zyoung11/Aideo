@@ -912,7 +912,7 @@ func (vp *VideoPlayer) startLoop() {
 		case <-sigCh:
 			// 标记 resize 待处理，通过防抖避免频繁重建
 			resizePending = true
-			resizeTimer.Reset(200 * time.Millisecond)
+			resizeTimer.Reset(300 * time.Millisecond)
 			continue
 		case <-resizeTimer.C:
 			if !resizePending {
@@ -1027,7 +1027,7 @@ func (vp *VideoPlayer) startLoop() {
 		syncLoop:
 		for {
 			expectedTime := playbackStart.Add(time.Duration(float64(frameCount)) * vp.frameTime)
-			if time.Since(expectedTime) <= vp.frameTime {
+			if time.Since(expectedTime) <= vp.frameTime/2 {
 				break
 			}
 			select {
