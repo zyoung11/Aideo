@@ -923,7 +923,7 @@ func (vp *VideoPlayer) startLoop() {
 			currentTime := float64(frameCount) / vp.fps
 
 			// 精确 seek 到当前时间往前 0.15 秒（output 端 -ss 会解码到目标位置输出）
-			seekTime := currentTime - 0.15
+			seekTime := currentTime - 0.05
 			if seekTime < 0 {
 				seekTime = 0
 			}
@@ -950,7 +950,10 @@ func (vp *VideoPlayer) startLoop() {
 			if seekFrame < 0 {
 				seekFrame = 0
 			}
-			frameCount = int64(time.Since(playbackStart).Seconds() * vp.fps)
+			frameCount = int64(seekTime * vp.fps)
+			if frameCount < 0 {
+				frameCount = 0
+			}
 			renderFrame = nil
 
 			drainLoop:
