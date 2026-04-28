@@ -243,6 +243,12 @@ type VideoPlayer struct {
 	fpsAccum           int64
 	fpsAccumStart      time.Time
 	displayFPS         float64
+
+	// 自适应颜色
+	colorCount  int
+	targetFPS   float64
+	adjustFrame int64
+	stableCheck int
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -666,7 +672,7 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 	vp.sixelBuf.Reset()
 	fmt.Fprintf(&vp.sixelBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
 	encStart := time.Now()
-	timage.EncodeSixelFrameRaw(&vp.sixelBuf, raw, vp.outWidth, vp.outHeight, 255, false, vp.sixelCache)
+	timage.EncodeSixelFrameRaw(&vp.sixelBuf, raw, vp.outWidth, vp.outHeight, vp.colorCount, false, vp.sixelCache)
 	encDur := time.Since(encStart)
 
 	// 清除图像右侧的残留区域
@@ -747,7 +753,7 @@ func (vp *VideoPlayer) updateFPS() {
 
 // statusLine 返回底部状态栏，显示分辨率与实时帧率（居中）
 func (vp *VideoPlayer) statusLine(encDur time.Duration) string {
-	text := fmt.Sprintf("[ q退出 | %dx%d | %.1ffps | enc:%.1fms ]", vp.outWidth, vp.outHeight, vp.displayFPS, float64(encDur.Microseconds())/1000)
+	text := fmt.Sprintf("[ q退出 | %dx%d | %dc | %.1ffps | enc:%.1fms ]", vp.outWidth, vp.outHeight, vp.colorCount, vp.displayFPS, float64(encDur.Microseconds())/1000)
 	visW := displayWidth(text)
 	col := (vp.termWidth - visW) / 2
 	if col < 1 {
@@ -1016,6 +1022,38 @@ func (vp *VideoPlayer) startLoop() {
 
 		vp.updateFPS()
 
+		vp.adjustFrame++
+		if vp.adjustFrame >= 90 {
+			vp.adjustFrame = 0
+			if vp.displayFPS < vp.targetFPS-0.5 && vp.colorCount > 8 {
+				levels := []int{8, 16, 32, 64, 128, 256}
+				for i := len(levels) - 1; i >= 0; i-- {
+					if levels[i] < vp.colorCount {
+						vp.colorCount = levels[i]
+						vp.sixelCache = nil
+						vp.adjustFrame = -90
+						vp.stableCheck = 0
+						break
+					}
+				}
+			} else if vp.displayFPS >= vp.targetFPS {
+				vp.stableCheck++
+				if vp.stableCheck >= 4 && vp.colorCount < 256 {
+					levels := []int{8, 16, 32, 64, 128, 256}
+					for _, lvl := range levels {
+						if lvl > vp.colorCount {
+							vp.colorCount = lvl
+							vp.sixelCache = nil
+							vp.stableCheck = 0
+							break
+						}
+					}
+				}
+			} else {
+				vp.stableCheck = 0
+			}
+		}
+
 		outputBuf.Reset()
 
 		switch vp.proto {
@@ -1114,6 +1152,12 @@ func playVideo(filename string, proto timage.Protocol) error {
 	player.fps = info.FPS
 	player.frameTime = time.Duration(float64(time.Second) / info.FPS)
 	player.proto = proto
+	player.colorCount = 64
+	if player.fps > 60 {
+		player.targetFPS = 60
+	} else {
+		player.targetFPS = player.fps
+	}
 	player.initProto()
 
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))

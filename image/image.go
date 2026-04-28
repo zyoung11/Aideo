@@ -49,47 +49,24 @@ type ColorRGB struct {
 }
 
 type Placement struct {
-	// 图像左上角 X 位置（占终端宽度的比例，0.0 = 左边缘，1.0 = 右边缘）
-	Left float64
-	// 图像左上角 Y 位置（占终端高度的比例，0.0 = 上边缘，1.0 = 下边缘）
-	Top float64
-	// 图像宽度（占终端宽度的比例，0.0 ~ 1.0）
-	Width float64
-	// 图像高度（占终端高度的比例，0.0 ~ 1.0）
+	Left   float64
+	Top    float64
+	Width  float64
 	Height float64
 }
 
 type DisplayConfig struct {
-	// 图像数据（RGBA格式）
-	Img *image.RGBA
-
-	// 图像在屏幕中的位置和尺寸（基于终端比例，0.0~1.0）
-	// 如果为 nil，默认居中占满整个屏幕
-	Placement *Placement
-
-	// 保持图像原始纵横比（默认 true）
-	// 为 false 时图像会被拉伸到 Placement 指定的区域
-	KeepAspectRatio bool
-
-	// 距左右边缘的最小留白（字符数）
-	PadCol int
-	// 距上下边缘的最小留白（字符数）
-	PadRow int
-
-	// Sixel 颜色数（默认 255）
-	SixelColors int
-	// Sixel 是否启用抖动
-	SixelDither bool
-
-	// 强制协议（0=自动检测）
-	ForceProtocol Protocol
-
-	// 是否分析封面主色调（默认 true）
+	Img                 *image.RGBA
+	Placement           *Placement
+	KeepAspectRatio     bool
+	PadCol              int
+	PadRow              int
+	SixelColors         int
+	SixelDither         bool
+	ForceProtocol       Protocol
 	DisableColorAnalysis bool
-
-	// 终端字符像素尺寸（0=自动检测）
-	CellW int
-	CellH int
+	CellW               int
+	CellH               int
 }
 
 type DisplayResult struct {
@@ -99,7 +76,6 @@ type DisplayResult struct {
 
 var kittyImageID uint32 = uint32(os.Getpid()<<16) + uint32(time.Now().UnixMicro()&0xFFFF)
 
-// kittyZlibPool 复用 zlib.Writer，减少每帧的分配开销
 var kittyZlibPool = sync.Pool{
 	New: func() interface{} {
 		w, _ := zlib.NewWriterLevel(nil, zlib.BestSpeed)
@@ -107,17 +83,15 @@ var kittyZlibPool = sync.Pool{
 	},
 }
 
-// kittyCompressPool 复用压缩用的 bytes.Buffer
 var kittyCompressPool = sync.Pool{
 	New: func() interface{} {
 		return new(bytes.Buffer)
 	},
 }
 
-// kittyBase64Pool 复用 base64 编码缓冲区，避免每帧分配大 []byte
 var kittyBase64Pool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 256*1024) // 256KB 初始容量
+		buf := make([]byte, 256*1024)
 		return buf
 	},
 }
@@ -168,7 +142,6 @@ func ShowImage(cfg DisplayConfig) (*DisplayResult, error) {
 		protocol = detectProtocol()
 	}
 
-	// 设 raw 模式以读取键盘
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
@@ -229,7 +202,6 @@ func ShowImage(cfg DisplayConfig) (*DisplayResult, error) {
 			areaPixelH = 10
 		}
 
-		// 先确定目标字符数
 		targetCols := areaPixelW / cellW
 		targetRows := areaPixelH / cellH
 		if targetCols > termW {
@@ -245,7 +217,6 @@ func ShowImage(cfg DisplayConfig) (*DisplayResult, error) {
 			targetRows = 1
 		}
 
-		// 缩放目标像素对齐到 cell 整数倍
 		targetPixelW := targetCols * cellW
 		targetPixelH := targetRows * cellH
 
@@ -258,7 +229,6 @@ func ShowImage(cfg DisplayConfig) (*DisplayResult, error) {
 
 		finalW, finalH := scaled.Bounds().Dx(), scaled.Bounds().Dy()
 
-		// 像素 → 字符（向上取整）
 		imageCols := (finalW + cellW - 1) / cellW
 		imageRows := (finalH + cellH - 1) / cellH
 		if imageCols > targetCols {
@@ -318,7 +288,6 @@ func ShowImage(cfg DisplayConfig) (*DisplayResult, error) {
 				fmt.Printf("\x1b[%d;%dH\x1b[K", row, fillCol)
 			}
 		}
-		// 清除图像下方区域，防止 Sixel 残余像素
 		if startRow+imageRows < termH {
 			fmt.Printf("\x1b[%d;%dH\x1b[J", startRow+imageRows, startCol)
 		}
@@ -398,7 +367,6 @@ func queryCellPixels() (int, int) {
 	if termW <= 0 || termH <= 0 {
 		return 8, 16
 	}
-	// 先查询终端总像素尺寸，然后除以字符数得到单元格像素
 	pixelW, pixelH := queryTerminalPixels()
 	if pixelW <= 0 || pixelH <= 0 || termW <= 0 {
 		return 8, 16
@@ -515,99 +483,119 @@ func EncodeSixelFrame(w io.Writer, img image.Image, colors int, dither bool) err
 	return encodeSixel(w, img, colors, dither)
 }
 
-// ---- 快速均匀量化（8×8×4 = 256 色，纯位运算，无 LUT，O(n)） ----
-var uniform256Palette []color.Color
-var uniform256Once sync.Once
+var bayer4x4 = [16]int8{0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}
 
-var uniform64Palette []color.Color
-var uniform64Once sync.Once
+func makeDither(levels int) [16]int8 {
+	step := 256 / (levels - 1)
+	var d [16]int8
+	for i, v := range bayer4x4 {
+		d[i] = int8((int(v) - 8) * step / 16)
+	}
+	return d
+}
 
-func initUniform64() {
-	uniform64Palette = make([]color.Color, 64)
-	for ri := 0; ri < 4; ri++ {
-		for gi := 0; gi < 4; gi++ {
-			for bi := 0; bi < 4; bi++ {
-				idx := ri<<4 | gi<<2 | bi
-				uniform64Palette[idx] = color.RGBA{
-					uint8(ri * 255 / 3),
-					uint8(gi * 255 / 3),
-					uint8(bi * 255 / 3),
+type sixelPalette struct {
+	nc     int
+	colors []color.Color
+	lutR   [16][256]uint8
+	lutG   [16][256]uint8
+	lutB   [16][256]uint8
+}
+
+func newSixelPalette(rBits, gBits, bBits int) *sixelPalette {
+	rLevels := 1 << rBits
+	gLevels := 1 << gBits
+	bLevels := 1 << bBits
+	nc := rLevels * gLevels * bLevels
+	gShift := bBits
+	rShift := gBits + bBits
+
+	p := &sixelPalette{nc: nc, colors: make([]color.Color, nc)}
+	for ri := 0; ri < rLevels; ri++ {
+		for gi := 0; gi < gLevels; gi++ {
+			for bi := 0; bi < bLevels; bi++ {
+				p.colors[ri<<rShift|gi<<gShift|bi] = color.RGBA{
+					uint8(ri * 255 / (rLevels - 1)),
+					uint8(gi * 255 / (gLevels - 1)),
+					uint8(bi * 255 / (bLevels - 1)),
 					255,
 				}
 			}
 		}
 	}
-}
 
-func initUniform256() {
-	uniform256Palette = make([]color.Color, 256)
-	for ri := 0; ri < 8; ri++ {
-		for gi := 0; gi < 8; gi++ {
-			for bi := 0; bi < 4; bi++ {
-				idx := ri<<5 | gi<<2 | bi
-				uniform256Palette[idx] = color.RGBA{
-					uint8(ri * 255 / 7),
-					uint8(gi * 255 / 7),
-					uint8(bi * 255 / 3),
-					255,
-				}
-			}
-		}
-	}
-}
+	dR := makeDither(rLevels)
+	dG := makeDither(gLevels)
+	dB := makeDither(bLevels)
 
-// Bayer 4×4 有序抖动 — 预计算每位置的偏移量，消除内层乘法
-var ditherRG = [16]int8{
-	-15, 1, -11, 5,
-	9, -7, 13, -3,
-	-9, 7, -13, 3,
-	15, -1, 11, -5,
-}
-var ditherB = [16]int8{
-	-30, 2, -22, 10,
-	18, -14, 26, -6,
-	-18, 14, -26, 6,
-	30, -2, 22, -10,
-}
-
-var dither64 = [16]int8{
-	-32, 2, -24, 10,
-	20, -16, 28, -4,
-	-20, 16, -28, 4,
-	32, -2, 24, -10,
-}
-
-var quantLUT_R [16][256]uint8
-var quantLUT_G [16][256]uint8
-var quantLUT_B [16][256]uint8
-var quantLUTOnce sync.Once
-
-func initQuantLUT() {
 	for b := 0; b < 16; b++ {
-		d := int(dither64[b])
 		for v := 0; v < 256; v++ {
-			s := v + d
+			s := v + int(dR[b])
 			if s < 0 {
 				s = 0
 			} else if s > 255 {
 				s = 255
 			}
-			q := uint8(s >> 6)
-			quantLUT_R[b][v] = q << 4
-			quantLUT_G[b][v] = q << 2
-			quantLUT_B[b][v] = q
+			p.lutR[b][v] = uint8(s>>(8-rBits)) << rShift
+
+			s = v + int(dG[b])
+			if s < 0 {
+				s = 0
+			} else if s > 255 {
+				s = 255
+			}
+			p.lutG[b][v] = uint8(s>>(8-gBits)) << gShift
+
+			s = v + int(dB[b])
+			if s < 0 {
+				s = 0
+			} else if s > 255 {
+				s = 255
+			}
+			p.lutB[b][v] = uint8(s >> (8 - bBits))
 		}
 	}
+	return p
 }
 
-// EncodeSixelFrameRaw 直接从 raw RGBA 字节编码 Sixel
-// 使用均匀量化（O(n)，纯位运算）+ 并行 strip 编码
-// cache 为帧间缓存，传 nil 表示不使用缓存
+var paletteLevels = []int{8, 16, 32, 64, 128, 256}
+var paletteBits = [][3]int{{1, 1, 1}, {2, 1, 1}, {2, 2, 1}, {2, 2, 2}, {3, 2, 2}, {3, 3, 2}}
+var paletteCache = make(map[int]*sixelPalette)
+var paletteCacheMu sync.Mutex
+
+func getSixelPalette(nc int) *sixelPalette {
+	paletteCacheMu.Lock()
+	defer paletteCacheMu.Unlock()
+	if p, ok := paletteCache[nc]; ok {
+		return p
+	}
+	for i, lvl := range paletteLevels {
+		if lvl == nc {
+			bits := paletteBits[i]
+			p := newSixelPalette(bits[0], bits[1], bits[2])
+			paletteCache[nc] = p
+			return p
+		}
+	}
+	return nil
+}
+
+func nearestPaletteLevel(nc int) int {
+	for _, lvl := range paletteLevels {
+		if lvl >= nc {
+			return lvl
+		}
+	}
+	return paletteLevels[len(paletteLevels)-1]
+}
+
 func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int, dither bool, cache *SixelFrameCache) error {
 	if width == 0 || height == 0 {
 		return nil
 	}
-	return encodeSixelFromRGBA(w, data, width, height, cache)
+	nc := nearestPaletteLevel(colors)
+	pal := getSixelPalette(nc)
+	return encodeSixelFromRGBA(w, data, width, height, pal, cache)
 }
 
 func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
@@ -638,7 +626,6 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 		compData = data
 	}
 
-	// Base64 编码到池化缓冲区，避免 string 分配
 	encLen := base64.StdEncoding.EncodedLen(len(compData))
 	base64Raw := kittyBase64Pool.Get().([]byte)
 	if cap(base64Raw) < encLen {
@@ -647,7 +634,6 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 	base64Buf := base64Raw[:encLen]
 	base64.StdEncoding.Encode(base64Buf, compData)
 
-	// 控制头部
 	if compressed {
 		fmt.Fprintf(w, "\x1b_Ga=T,f=32,i=%d,s=%d,v=%d,c=%d,r=%d,q=2,o=z",
 			imageID, pixelW, pixelH, c, r)
@@ -656,7 +642,6 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 			imageID, pixelW, pixelH, c, r)
 	}
 
-	// 分块发送
 	for i := 0; i < encLen; i += 4096 {
 		end := i + 4096
 		if end > encLen {
@@ -665,14 +650,12 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 		chunk := base64Buf[i:end]
 
 		if i == 0 {
-			// 第一块：接在已有的控制头部后面
 			if i+4096 < encLen {
 				fmt.Fprintf(w, ",m=1;%s\x1b\\", chunk)
 			} else {
 				fmt.Fprintf(w, ";%s\x1b\\", chunk)
 			}
 		} else {
-			// 后续块：需要完整的 \x1b_G 转义序列
 			if i+4096 < encLen {
 				fmt.Fprintf(w, "\x1b_Gm=1,q=2;%s\x1b\\", chunk)
 			} else {
@@ -685,12 +668,9 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 	return imageID
 }
 
-// EncodeKittyFrameRaw 直接从原始 RGBA 字节编码 Kitty 图像，跳过 image.RGBA 创建和 draw.Draw
-// data 是 raw RGBA 字节 (4 bytes/pixel, R,G,B,A 顺序)
-// kittyRGBPool 复用 RGBA→RGB 转换的输出缓冲区
 var kittyRGBPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 512*1024) // 512KB 初始容量
+		return make([]byte, 512*1024)
 	},
 }
 
@@ -700,13 +680,9 @@ var sixelRLEBufPool = sync.Pool{
 	},
 }
 
-// EncodeKittyFrameRaw 直接从原始 RGBA 字节编码 Kitty 图像
-// data 是 raw RGBA 字节 (4 bytes/pixel, R,G,B,A 顺序)
-// 针对视频优化：自动剥离 alpha 通道使用 RGB(f=24)，不压缩
 func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uint32 {
 	imageID := atomic.AddUint32(&kittyImageID, 1)
 
-	// 1. RGBA → RGB：剥离 alpha 通道，省 25% 数据量
 	rgbLen := pixelW * pixelH * 3
 	rgbRaw := kittyRGBPool.Get().([]byte)
 	if cap(rgbRaw) < rgbLen {
@@ -714,24 +690,36 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 	}
 	rgbBuf := rgbRaw[:rgbLen]
 
-	// 批量拷贝 RGB，跳过 A（优化：8 像素批量处理）
-	// 一次性处理 8 像素，减少循环开销
 	blocks := len(data) / 32
 	j := 0
 	for b := 0; b < blocks; b++ {
 		s := b * 32
-		// 展开循环：每次处理 8 像素
-		rgbBuf[j] = data[s]; rgbBuf[j+1] = data[s+1]; rgbBuf[j+2] = data[s+2]
-		rgbBuf[j+3] = data[s+4]; rgbBuf[j+4] = data[s+5]; rgbBuf[j+5] = data[s+6]
-		rgbBuf[j+6] = data[s+8]; rgbBuf[j+7] = data[s+9]; rgbBuf[j+8] = data[s+10]
-		rgbBuf[j+9] = data[s+12]; rgbBuf[j+10] = data[s+13]; rgbBuf[j+11] = data[s+14]
-		rgbBuf[j+12] = data[s+16]; rgbBuf[j+13] = data[s+17]; rgbBuf[j+14] = data[s+18]
-		rgbBuf[j+15] = data[s+20]; rgbBuf[j+16] = data[s+21]; rgbBuf[j+17] = data[s+22]
-		rgbBuf[j+18] = data[s+24]; rgbBuf[j+19] = data[s+25]; rgbBuf[j+20] = data[s+26]
-		rgbBuf[j+21] = data[s+28]; rgbBuf[j+22] = data[s+29]; rgbBuf[j+23] = data[s+30]
+		rgbBuf[j] = data[s]
+		rgbBuf[j+1] = data[s+1]
+		rgbBuf[j+2] = data[s+2]
+		rgbBuf[j+3] = data[s+4]
+		rgbBuf[j+4] = data[s+5]
+		rgbBuf[j+5] = data[s+6]
+		rgbBuf[j+6] = data[s+8]
+		rgbBuf[j+7] = data[s+9]
+		rgbBuf[j+8] = data[s+10]
+		rgbBuf[j+9] = data[s+12]
+		rgbBuf[j+10] = data[s+13]
+		rgbBuf[j+11] = data[s+14]
+		rgbBuf[j+12] = data[s+16]
+		rgbBuf[j+13] = data[s+17]
+		rgbBuf[j+14] = data[s+18]
+		rgbBuf[j+15] = data[s+20]
+		rgbBuf[j+16] = data[s+21]
+		rgbBuf[j+17] = data[s+22]
+		rgbBuf[j+18] = data[s+24]
+		rgbBuf[j+19] = data[s+25]
+		rgbBuf[j+20] = data[s+26]
+		rgbBuf[j+21] = data[s+28]
+		rgbBuf[j+22] = data[s+29]
+		rgbBuf[j+23] = data[s+30]
 		j += 24
 	}
-	// 处理剩余的像素
 	remain := len(data) % 32
 	for i := 0; i < remain; i += 4 {
 		rgbBuf[j] = data[blocks*32+i]
@@ -740,7 +728,6 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 		j += 3
 	}
 
-	// 2. base64 编码到池化缓冲区（避免 EncodeToString 的 string 分配）
 	encLen := base64.StdEncoding.EncodedLen(rgbLen)
 	base64Raw := kittyBase64Pool.Get().([]byte)
 	if cap(base64Raw) < encLen {
@@ -749,13 +736,10 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 	base64Buf := base64Raw[:encLen]
 	base64.StdEncoding.Encode(base64Buf, rgbBuf)
 
-	// 归还 RGB 缓冲区
 	kittyRGBPool.Put(rgbRaw[:0])
 
-	// 3. 发送控制头部（f=24 = RGB, 不压缩）- 使用 bytes.Buffer 直接写入
 	bw, ok := w.(*bytes.Buffer)
 	if ok {
-		// 直接写入 buffer，避免 fmt.Fprintf 开销
 		bw.WriteString("\x1b_Ga=T,f=24,i=")
 		writeUint32(bw, imageID)
 		bw.WriteString(",s=")
@@ -772,7 +756,6 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 			imageID, pixelW, pixelH, c, r)
 	}
 
-	// 4. 分块发送（每块 512KB，减少分块数量）
 	const chunkSize = 524288
 	if ok {
 		for i := 0; i < encLen; i += chunkSize {
@@ -824,13 +807,10 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 		}
 	}
 
-	// 5. 归还 base64 缓冲区
 	kittyBase64Pool.Put(base64Raw[:0])
-
 	return imageID
 }
 
-// writeUint32 高效写入无符号整数到 buffer
 func writeUint32(b *bytes.Buffer, n uint32) {
 	if n >= 1000000000 {
 		b.WriteByte(byte('0' + n/1000000000%10))
@@ -904,7 +884,6 @@ func DeleteKittyFrame(w io.Writer, id uint32) {
 	fmt.Fprintf(w, "\x1b_Ga=d,d=i,i=%d\x1b\\", id)
 }
 
-// encodePNG is unused but kept for potential iTerm2 support; suppress unused warning.
 var _ = encodePNG
 
 func encodePNG(img image.Image) []byte {
@@ -923,17 +902,6 @@ func SupportsTrueColor() bool {
 	return false
 }
 
-// ---------------------------------------------------------------------------
-// Sixel 编码器 (从 BM 中提取并通用化)
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Sixel 编码器 — 并行 strip 处理 + 流式 RLE 编码
-// 每个 Worker 复用 flat [colors × width]byte 缓冲区（≈326KB for 720p × 255色）
-// 通过通道回传结果，主 goroutine 保序编码，峰值内存 O(workers × colors × width)
-// ---------------------------------------------------------------------------
-
-// sixelStripState 复用 strip 编码的临时缓冲区
 var sixelStripStatePool = sync.Pool{
 	New: func() interface{} {
 		return &sixelStripState{
@@ -943,11 +911,11 @@ var sixelStripStatePool = sync.Pool{
 }
 
 type sixelStripState struct {
-	buf       []byte   // flat [colors * width]byte bitmap
-	seen      []uint16 // [colors]uint16 每个颜色的 epoch 标记
-	epoch     uint16   // 当前 strip 的 epoch 序号（自增）
-	dirty     []int    // 当前 strip 中被写过的颜色索引
-	pixelHash uint64   // 本 strip 的像素哈希（用于帧缓存）
+	buf       []byte
+	seen      []uint16
+	epoch     uint16
+	dirty     []int
+	pixelHash uint64
 }
 
 type SixelFrameCache struct {
@@ -996,23 +964,20 @@ type pendingItem struct {
 	rleData []byte
 }
 
-// stripJob 表示一个待处理的 Sixel 行
-// yStart/yEnd 是像素行范围（yStart ∈ [0, height)，最多 6 行）
 type stripJob struct {
 	sixelRow int
 	yStart   int
 	yEnd     int
 }
 
-// stripResult 是 Worker 处理完一个 strip 后的结果
 type stripResult struct {
 	sixelRow int
 	state    *sixelStripState
-	rleData  []byte // 缓存命中时直接携带 RLE 数据，state 为 nil
+	rleData  []byte
 }
 
-func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *SixelFrameCache) error {
-	nc := 64
+func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixelPalette, cache *SixelFrameCache) error {
+	nc := pal.nc
 	totalSixelRows := (height + 5) / 6
 	workers := runtime.NumCPU()
 	if workers > totalSixelRows {
@@ -1028,9 +993,8 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 	}
 	outBuf := bytes.NewBuffer(make([]byte, 0, estSize))
 	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22, 0x31, 0x3b, 0x31})
-	uniform64Once.Do(initUniform64)
 	for i := 0; i < nc; i++ {
-		r, g, b, _ := uniform64Palette[i].RGBA()
+		r, g, b, _ := pal.colors[i].RGBA()
 		outBuf.WriteByte('#')
 		writeSixelNum(outBuf, i+1)
 		outBuf.WriteString(";2;")
@@ -1086,15 +1050,13 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 				clear(st.buf[:stripCap])
 				dirty := st.dirty[:0]
 
-				quantLUTOnce.Do(initQuantLUT)
-
 				rowOffset := job.yStart * width * 4
 				for dy := 0; dy < nRows; dy++ {
 					yb4 := ((job.yStart + dy) & 3) << 2
 					bit := byte(1 << dy)
-					r0, r1, r2, r3 := &quantLUT_R[yb4|0], &quantLUT_R[yb4|1], &quantLUT_R[yb4|2], &quantLUT_R[yb4|3]
-					g0, g1, g2, g3 := &quantLUT_G[yb4|0], &quantLUT_G[yb4|1], &quantLUT_G[yb4|2], &quantLUT_G[yb4|3]
-					b0, b1, b2, b3 := &quantLUT_B[yb4|0], &quantLUT_B[yb4|1], &quantLUT_B[yb4|2], &quantLUT_B[yb4|3]
+					r0, r1, r2, r3 := &pal.lutR[yb4|0], &pal.lutR[yb4|1], &pal.lutR[yb4|2], &pal.lutR[yb4|3]
+					g0, g1, g2, g3 := &pal.lutG[yb4|0], &pal.lutG[yb4|1], &pal.lutG[yb4|2], &pal.lutG[yb4|3]
+					b0, b1, b2, b3 := &pal.lutB[yb4|0], &pal.lutB[yb4|1], &pal.lutB[yb4|2], &pal.lutB[yb4|3]
 					pi := rowOffset
 					lim := width &^ 3
 					for x := 0; x < lim; x += 4 {
@@ -1126,7 +1088,7 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 					}
 					for x := lim; x < width; x++ {
 						b := yb4 | (x & 3)
-						ci := int(quantLUT_R[b][data[pi]]) | int(quantLUT_G[b][data[pi+1]]) | int(quantLUT_B[b][data[pi+2]])
+						ci := int(pal.lutR[b][data[pi]]) | int(pal.lutG[b][data[pi+1]]) | int(pal.lutB[b][data[pi+2]])
 						if st.seen[ci] != st.epoch {
 							st.seen[ci] = st.epoch
 							dirty = append(dirty, ci)
@@ -1247,8 +1209,6 @@ func encodeSixel(w io.Writer, img image.Image, colors int, dither bool) error {
 	return encodePaletted(w, paletted, width, height, nc, nil)
 }
 
-// encodePaletted 编码已量化的 Paletted 图像为 Sixel（并行 strip 处理 + 流式 RLE）
-// cache 为帧间缓存，传 nil 表示不使用缓存
 func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int, cache *SixelFrameCache) error {
 	pix := paletted.Pix
 	stride := paletted.Stride
@@ -1258,7 +1218,6 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 		paletteSize = nc
 	}
 
-	// ---- 输出 Sixel 头部 ----
 	estSize := width * height / 2
 	if estSize < 65536 {
 		estSize = 65536
@@ -1277,7 +1236,6 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 		writeSixelNum(outBuf, int(b*100/0xFFFF))
 	}
 
-	// ---- 并行 strip 处理（交错发送/接收，避免死锁） ----
 	totalSixelRows := (height + 5) / 6
 	workers := runtime.NumCPU()
 	if workers > totalSixelRows {
@@ -1287,8 +1245,6 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 		workers = 1
 	}
 
-	// 使用足够大的缓冲避免死锁：主 goroutine 先发送一批任务，
-	// 然后交错执行「发一个任务 / 收一个结果」，保证 resultCh 不会填满
 	jobCh := make(chan stripJob, workers)
 	resultCh := make(chan stripResult, workers)
 
@@ -1357,7 +1313,6 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 		}()
 	}
 
-	// 先发送一批任务（保证 Worker 初始不会空闲）
 	jobsSent := 0
 	for ; jobsSent < workers && jobsSent < totalSixelRows; jobsSent++ {
 		yStart := jobsSent * 6
@@ -1368,7 +1323,6 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 		jobCh <- stripJob{sixelRow: jobsSent, yStart: yStart, yEnd: yEnd}
 	}
 
-	// 交错执行：发一个任务 → 收一个结果 → 编码 → 继续
 	makeJob := func(sixelRow int) stripJob {
 		yStart := sixelRow * 6
 		yEnd := yStart + 6
@@ -1401,9 +1355,7 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 	close(jobCh)
 	wg.Wait()
 
-	// Sixel 终止符
 	outBuf.Write([]byte{0x1b, 0x5c})
-
 	_, err := outBuf.WriteTo(w)
 	return err
 }
@@ -1442,22 +1394,21 @@ func processStripResult(outBuf *bytes.Buffer, res stripResult, nextRow *int, pen
 	}
 }
 
-// encodeStrip RLE 编码一个 strip 的所有颜色行到 outBuf，然后归还 state 到池
 func encodeStrip(outBuf *bytes.Buffer, st *sixelStripState, sixelRow, width int) {
 	if st == nil {
 		return
 	}
 
 	if sixelRow > 0 {
-		outBuf.WriteByte(0x2d) // '-' 分隔 strip
+		outBuf.WriteByte(0x2d)
 	}
 
 	for _, c := range st.dirty {
 		base := c * width
 		row := st.buf[base : base+width]
 
-		outBuf.WriteByte(0x24) // '$'
-		outBuf.WriteByte(0x23) // '#'
+		outBuf.WriteByte(0x24)
+		outBuf.WriteByte(0x23)
 		writeSixelNum(outBuf, c+1)
 
 		var lastCh byte
@@ -1473,7 +1424,7 @@ func encodeStrip(outBuf *bytes.Buffer, st *sixelStripState, sixelRow, width int)
 				if runCount > 0 {
 					sixelChar := lastCh + 63
 					if runCount > 1 {
-						outBuf.WriteByte(0x21) // '!'
+						outBuf.WriteByte(0x21)
 						writeSixelNum(outBuf, runCount)
 					}
 					outBuf.WriteByte(sixelChar)
@@ -1490,7 +1441,6 @@ func encodeStrip(outBuf *bytes.Buffer, st *sixelStripState, sixelRow, width int)
 	sixelStripStatePool.Put(st)
 }
 
-// writeSixelNum 高效写入 Sixel 数字（颜色编号或游程长度）到 buffer
 func writeSixelNum(b *bytes.Buffer, n int) {
 	if n >= 100 {
 		b.Write([]byte{
