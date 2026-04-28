@@ -500,10 +500,12 @@ func makeDither(levels int) [16]int8 {
 
 type sixelPalette struct {
 	nc     int
+	isGray bool
 	colors []color.Color
 	lutR   [16][256]uint8
 	lutG   [16][256]uint8
 	lutB   [16][256]uint8
+	dither [16]int8
 }
 
 func newSixelPalette(rBits, gBits, bBits int) *sixelPalette {
@@ -562,8 +564,21 @@ func newSixelPalette(rBits, gBits, bBits int) *sixelPalette {
 	return p
 }
 
-var paletteLevels = []int{8, 16, 32, 64, 128, 256}
-var paletteBits = [][3]int{{1, 1, 1}, {2, 1, 1}, {2, 2, 1}, {2, 2, 2}, {3, 2, 2}, {3, 3, 2}}
+func newGrayPalette(levels int) *sixelPalette {
+	p := &sixelPalette{nc: levels, isGray: true, colors: make([]color.Color, levels)}
+	for i := 0; i < levels; i++ {
+		v := uint8(i * 255 / (levels - 1))
+		p.colors[i] = color.RGBA{v, v, v, 255}
+	}
+	step := 256 / levels
+	for b := 0; b < 16; b++ {
+		p.dither[b] = int8((int(bayer4x4[b]) - 8) * step / 16)
+	}
+	return p
+}
+
+var paletteLevels = []int{2, 8, 16, 32, 64, 128, 256}
+var paletteBits = [][3]int{{0, 0, 0}, {1, 1, 1}, {2, 1, 1}, {2, 2, 1}, {2, 2, 2}, {3, 2, 2}, {3, 3, 2}}
 var paletteCache = make(map[int]*sixelPalette)
 var paletteCacheMu sync.Mutex
 
@@ -571,6 +586,11 @@ func getSixelPalette(nc int) *sixelPalette {
 	paletteCacheMu.Lock()
 	defer paletteCacheMu.Unlock()
 	if p, ok := paletteCache[nc]; ok {
+		return p
+	}
+	if nc == 2 {
+		p := newGrayPalette(2)
+		paletteCache[nc] = p
 		return p
 	}
 	for i, lvl := range paletteLevels {
@@ -1068,6 +1088,35 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixel
 				dirty := st.dirty[:0]
 
 				rowOffset := job.yStart * width * 4
+			if pal.isGray {
+				shift := 8
+				for n := pal.nc >> 1; n > 0; n >>= 1 {
+					shift--
+				}
+				for dy := 0; dy < nRows; dy++ {
+					yb4 := ((job.yStart + dy) & 3) << 2
+					bit := byte(1 << dy)
+					pi := rowOffset
+					for x := 0; x < width; x++ {
+						bayerIdx := yb4 | (x & 3)
+						gray := (6966*int(data[pi]) + 23436*int(data[pi+1]) + 2366*int(data[pi+2])) >> 15
+						gray += int(pal.dither[bayerIdx])
+						if gray < 0 {
+							gray = 0
+						} else if gray > 255 {
+							gray = 255
+						}
+						ci := gray >> shift
+						if st.seen[ci] != st.epoch {
+							st.seen[ci] = st.epoch
+							dirty = append(dirty, ci)
+						}
+						st.buf[ci*width+x] |= bit
+						pi += 4
+					}
+					rowOffset += width * 4
+				}
+			} else {
 				for dy := 0; dy < nRows; dy++ {
 					yb4 := ((job.yStart + dy) & 3) << 2
 					bit := byte(1 << dy)
@@ -1115,8 +1164,9 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixel
 					}
 					rowOffset += width * 4
 				}
+			}
 
-				st.dirty = dirty
+			st.dirty = dirty
 
 				localBuf := sixelRLEBufPool.Get().(*bytes.Buffer)
 				localBuf.Reset()
