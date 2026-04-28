@@ -473,6 +473,9 @@ func IsKittyAvailable() bool {
 }
 
 func IsSixelAvailable() bool {
+	if term := strings.ToLower(os.Getenv("TERM_PROGRAM")); term == "ghostty" {
+		return false
+	}
 	if term := os.Getenv("TERM_PROGRAM"); term == "foot" || term == "contour" || term == "mintty" || term == "RLogin" {
 		return true
 	}

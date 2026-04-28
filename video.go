@@ -201,22 +201,13 @@ type VideoPlayer struct {
 	startRow   int
 	startCol   int
 
-	renderer    *BrailleRenderer
 	proto       timage.Protocol
-	prevKittyID uint32
 	cellW       int
 	cellH       int
-	hwAccel     string
 
-	kittyBuf   bytes.Buffer // 复用 Kitty 渲染缓冲区
-	sixelBuf   bytes.Buffer // 复用 Sixel 渲染缓冲区
-	frameBuf   []byte        // 复用帧读取缓冲区
+	sixelBuf   bytes.Buffer
+	frameBuf   []byte
 	sixelCache *timage.SixelFrameCache
-
-	// kitty 性能优化
-	kittyFrameCount    int32       // kitty 帧计数器
-	kittyLastTime      time.Time   // 上次 kitty 帧时间
-	kittyTargetFPS     float64     // kitty 目标帧率
 
 	// 实时帧率统计
 	fpsAccum           int64
@@ -228,44 +219,15 @@ type VideoPlayer struct {
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
-	var (
-		outWidth, outHeight int
-		charW, charH        int
-	)
-
-	outWidth, outHeight = calculateOutputSize(srcWidth, srcHeight, termWidth, termHeight)
-	// Braille 模式下需要字符网格尺寸用于居中
-	charW = outWidth / 2
-	charH = outHeight / 4
-
-	startCol := (termWidth - charW) / 2
-	startRow := (termHeight - charH) / 2
-	if startCol < 0 {
-		startCol = 0
-	}
-	if startRow < 0 {
-		startRow = 0
-	}
-
-	vp := &VideoPlayer{
+	return &VideoPlayer{
 		filename:   filename,
 		srcWidth:   srcWidth,
 		srcHeight:  srcHeight,
-		outWidth:   outWidth,
-		outHeight:  outHeight,
-		charW:      charW,
-		charH:      charH,
 		termWidth:  termWidth,
 		termHeight: termHeight,
-		startRow:   startRow,
-		startCol:   startCol,
 		quit:       make(chan struct{}),
 		done:       make(chan struct{}),
 	}
-
-	vp.renderer = NewBrailleRenderer(charW, charH)
-
-	return vp
 }
 
 // maxVideoDim 根据终端字符尺寸和单元格像素计算视频输出分辨率上限
@@ -279,53 +241,20 @@ func maxVideoDim(termChars, cellPx int) int {
 }
 
 func (vp *VideoPlayer) initProto() {
-	if vp.proto == timage.ProtocolAuto {
-		return
-	}
 	vp.cellW, vp.cellH = timage.CellPixels()
-	if vp.cellW < 1 {
-		vp.cellW = 8
-	}
-	if vp.cellH < 1 {
-		vp.cellH = 16
-	}
-	vp.outWidth, vp.outHeight = calculateOutputSizeCells(
-		vp.srcWidth, vp.srcHeight,
-		vp.termWidth, vp.termHeight,
-		vp.cellW, vp.cellH,
-	)
-	// 根据终端尺寸计算输出分辨率上限
+	if vp.cellW < 1 { vp.cellW = 8 }
+	if vp.cellH < 1 { vp.cellH = 16 }
+	vp.outWidth, vp.outHeight = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, vp.termWidth, vp.termHeight, vp.cellW, vp.cellH)
 	maxPx := maxVideoDim(vp.termWidth, vp.cellW)
 	vp.outWidth, vp.outHeight = capOutputSize(vp.outWidth, vp.outHeight, maxPx)
 	vp.charW = (vp.outWidth + vp.cellW - 1) / vp.cellW
 	vp.charH = (vp.outHeight + vp.cellH - 1) / vp.cellH
 	vp.startCol = (vp.termWidth - vp.charW) / 2
+	if vp.startCol < 0 { vp.startCol = 0 }
 	vp.startRow = (vp.termHeight - vp.charH) / 2
-	if vp.startCol < 0 {
-		vp.startCol = 0
-	}
-	if vp.startRow < 0 {
-		vp.startRow = 0
-	}
-
-	// 预分配 Sixel 帧缓存（跳过重编码未变化的 strip）
-	if vp.proto == timage.ProtocolSixel {
-		totalStrips := (vp.outHeight + 5) / 6
-		vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
-	}
-
-	// 预分配 Kitty 渲染缓冲区
-	if vp.proto == timage.ProtocolKitty {
-		rawFrameSize := vp.outWidth * vp.outHeight * 3 // RGB 3 字节
-		estimatedOutput := rawFrameSize*4/3 + 4096     // base64 开销（约 1.33x）
-		// 缓冲区上限 16MB，支持 4K 全屏视频
-		if estimatedOutput > 16*1024*1024 {
-			estimatedOutput = 16 * 1024 * 1024
-		}
-		vp.kittyBuf.Grow(estimatedOutput)
-		// Kitty 模式默认 24fps，如果卡顿会自动降低
-		vp.kittyTargetFPS = 24
-	}
+	if vp.startRow < 0 { vp.startRow = 0 }
+	totalStrips := (vp.outHeight + 5) / 6
+	vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
 }
 
 // updateTerminalSize 窗口变化时重新计算输出尺寸和居中位置
@@ -334,25 +263,16 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	vp.termHeight = newHeight
 
 	var newOutW, newOutH int
-	if vp.proto == timage.ProtocolAuto {
-		newOutW, newOutH = calculateOutputSize(vp.srcWidth, vp.srcHeight, newWidth, newHeight)
-		vp.charW = newOutW / 2
-		vp.charH = newOutH / 4
-		vp.renderer = NewBrailleRenderer(vp.charW, vp.charH)
-	} else {
-		newOutW, newOutH = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, newWidth, newHeight, vp.cellW, vp.cellH)
-		maxPx := maxVideoDim(newWidth, vp.cellW)
-		newOutW, newOutH = capOutputSize(newOutW, newOutH, maxPx)
-		vp.charW = (newOutW + vp.cellW - 1) / vp.cellW
-		vp.charH = (newOutH + vp.cellH - 1) / vp.cellH
-	}
+	newOutW, newOutH = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, newWidth, newHeight, vp.cellW, vp.cellH)
+	maxPx := maxVideoDim(newWidth, vp.cellW)
+	newOutW, newOutH = capOutputSize(newOutW, newOutH, maxPx)
+	vp.charW = (newOutW + vp.cellW - 1) / vp.cellW
+	vp.charH = (newOutH + vp.cellH - 1) / vp.cellH
 	vp.outWidth = newOutW
 	vp.outHeight = newOutH
 
-	if vp.proto == timage.ProtocolSixel {
-		totalStrips := (vp.outHeight + 5) / 6
-		vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
-	}
+	totalStrips := (vp.outHeight + 5) / 6
+	vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
 
 	newStartCol := (newWidth - vp.charW) / 2
 	newStartRow := (newHeight - vp.charH) / 2
@@ -624,28 +544,7 @@ func (n *noopAudioStreamer) Close()     {}
 
 // ==================== 播放循环 ====================
 
-func (vp *VideoPlayer) renderAsciiFrame(raw []byte, outputBuf *strings.Builder) {
-	imgData := rawRGBAToColorData(raw, vp.outWidth, vp.outHeight)
-	vp.renderer.Render(imgData, vp.exposure, vp.attenuation)
 
-	imageStr := vp.renderer.String()
-	lines := strings.Split(imageStr, "\n")
-
-	for i, line := range lines {
-		if line == "" {
-			continue
-		}
-		outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH%s",
-			vp.startRow+i+1, vp.startCol+1, line))
-	}
-
-	if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
-		clearStartCol := vp.startCol + vp.charW + 1
-		for row := vp.startRow + 1; row <= vp.startRow+vp.charH; row++ {
-			outputBuf.WriteString(fmt.Sprintf("\033[%d;%dH\033[K", row, clearStartCol))
-		}
-	}
-}
 
 func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 	vp.sixelBuf.Reset()
@@ -671,47 +570,10 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 	os.Stdout.Write(vp.sixelBuf.Bytes())
 }
 
-func (vp *VideoPlayer) renderKittyFrame(raw []byte) {
-	// Kitty 帧率限制：追踪实际帧率并动态调整
-	now := time.Now()
-	vp.kittyFrameCount++
-	
-	// 如果设定了目标帧率，等待到合适的时间
-	if vp.kittyTargetFPS > 0 {
-		if vp.kittyLastTime.IsZero() {
-			vp.kittyLastTime = now
-		} else {
-			minFrameInterval := time.Second / time.Duration(vp.kittyTargetFPS)
-			elapsed := now.Sub(vp.kittyLastTime)
-			if elapsed < minFrameInterval {
-				time.Sleep(minFrameInterval - elapsed)
-			}
-			vp.kittyLastTime = time.Now()
-		}
-	}
-	
-	vp.kittyBuf.Reset()
-	fmt.Fprintf(&vp.kittyBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
-	// 直接编码 raw RGBA 字节，跳过 image.RGBA 创建和 draw.Draw
-	newID := timage.EncodeKittyFrameRaw(&vp.kittyBuf, raw, vp.outWidth, vp.outHeight, vp.charW, vp.charH)
-	if vp.prevKittyID != 0 && vp.prevKittyID != newID {
-		timage.DeleteKittyFrame(&vp.kittyBuf, vp.prevKittyID)
-	}
-	vp.prevKittyID = newID
-	fmt.Fprintf(&vp.kittyBuf, "%s", vp.statusLine(0))
-	os.Stdout.Write(vp.kittyBuf.Bytes())
-}
+
 
 func (vp *VideoPlayer) cleanupFrame() {
-	switch vp.proto {
-	case timage.ProtocolKitty:
-		if vp.prevKittyID != 0 {
-			timage.DeleteKittyFrame(os.Stdout, vp.prevKittyID)
-		}
-		fmt.Print("\033[2J\033[3J\033[H")
-	case timage.ProtocolSixel:
-		fmt.Print("\033[2J\033[3J\033[H")
-	}
+	fmt.Print("\033[2J\033[3J\033[H")
 }
 
 // updateFPS 每帧调用，累计帧数并更新实时帧率（每 500ms 刷新一次）
@@ -805,9 +667,6 @@ func (vp *VideoPlayer) startLoop() {
 	}()
 
 	frameSize := vp.outWidth * vp.outHeight * 4
-	var outputBuf strings.Builder
-	outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
-
 	hasAudio := hasAudioStream(vp.filename)
 
 	// 根据是否有音频选择合适的音频流
@@ -936,7 +795,6 @@ func (vp *VideoPlayer) startLoop() {
 			vp.updateTerminalSizeFromSigwinch()
 			// 重新计算 frameSize
 			frameSize = vp.outWidth * vp.outHeight * 4
-			outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
 			// 从 seekTime 处启动新的解码器
 			newCurrent := vp.spawnVideoDecoder(seekTime)
@@ -989,7 +847,7 @@ func (vp *VideoPlayer) startLoop() {
 				vp.cleanupFrame()
 				return
 			}
-			if key == 'k' {
+			if key == 'k' && vp.proto == timage.ProtocolSixel {
 				levels := []int{2, 8, 16, 32, 64, 128, 256}
 				for _, lvl := range levels {
 					if lvl > vp.colorCount {
@@ -1000,7 +858,7 @@ func (vp *VideoPlayer) startLoop() {
 				}
 				continue
 			}
-			if key == 'j' {
+			if key == 'j' && vp.proto == timage.ProtocolSixel {
 				levels := []int{2, 8, 16, 32, 64, 128, 256}
 				for i := len(levels) - 1; i >= 0; i-- {
 					if levels[i] < vp.colorCount {
@@ -1049,22 +907,7 @@ func (vp *VideoPlayer) startLoop() {
 			frameCount++
 		}
 
-		outputBuf.Reset()
-
-		switch vp.proto {
-		case timage.ProtocolSixel:
-			vp.renderSixelFrame(renderFrame)
-		case timage.ProtocolKitty:
-			vp.renderKittyFrame(renderFrame)
-		default:
-			vp.renderAsciiFrame(renderFrame, &outputBuf)
-		}
-
-		if vp.proto == timage.ProtocolAuto {
-			outputBuf.WriteString(vp.statusLine(0))
-
-			fmt.Print(outputBuf.String())
-		}
+		vp.renderSixelFrame(renderFrame)
 
 		// 如果超前于音频，等待到正确的展示时间再渲染
 		expectedTime := playbackStart.Add(time.Duration(float64(frameCount)) * vp.frameTime)

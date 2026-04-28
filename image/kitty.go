@@ -166,15 +166,25 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 		j += 3
 	}
 
-	encLen := base64.StdEncoding.EncodedLen(rgbLen)
+	zbuf := kittyCompressPool.Get().(*bytes.Buffer)
+	zbuf.Reset()
+	zw := kittyZlibPool.Get().(*zlib.Writer)
+	zw.Reset(zbuf)
+	zw.Write(rgbBuf)
+	zw.Close()
+	compData := zbuf.Bytes()
+
+	encLen := base64.StdEncoding.EncodedLen(len(compData))
 	base64Raw := kittyBase64Pool.Get().([]byte)
 	if cap(base64Raw) < encLen {
 		base64Raw = make([]byte, encLen)
 	}
 	base64Buf := base64Raw[:encLen]
-	base64.StdEncoding.Encode(base64Buf, rgbBuf)
+	base64.StdEncoding.Encode(base64Buf, compData)
 
 	kittyRGBPool.Put(rgbRaw[:0])
+	kittyZlibPool.Put(zw)
+	kittyCompressPool.Put(zbuf)
 
 	bw, ok := w.(*bytes.Buffer)
 	if ok {
@@ -188,9 +198,9 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 		writeUint32(bw, uint32(c))
 		bw.WriteString(",r=")
 		writeUint32(bw, uint32(r))
-		bw.WriteString(",q=2")
+		bw.WriteString(",q=2,o=z")
 	} else {
-		fmt.Fprintf(w, "\x1b_Ga=T,f=24,i=%d,s=%d,v=%d,c=%d,r=%d,q=2",
+		fmt.Fprintf(w, "\x1b_Ga=T,f=24,i=%d,s=%d,v=%d,c=%d,r=%d,q=2,o=z",
 			imageID, pixelW, pixelH, c, r)
 	}
 

@@ -42,11 +42,11 @@ func main() {
 
 	// 如果是视频文件，直接播放视频
 	if isVideoFile(filename) {
-		proto := timage.ProtocolAuto
-		if p, ok := timage.DetectCapableProtocol(); ok {
-			proto = p
+		if !timage.IsSixelAvailable() {
+			fmt.Println("错误：当前终端不支持 Sixel 协议，无法播放视频")
+			os.Exit(1)
 		}
-		initVideoPlayback(filename, proto)
+		initVideoPlayback(filename, timage.ProtocolSixel)
 		return
 	}
 
