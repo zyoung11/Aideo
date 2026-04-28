@@ -564,6 +564,78 @@ func newSixelPalette(rBits, gBits, bBits int) *sixelPalette {
 	return p
 }
 
+func retroLevels(levels int) []uint8 {
+	lv := make([]uint8, levels)
+	switch levels {
+	case 2:
+		lv[0], lv[1] = 25, 235
+	case 4:
+		lv[0], lv[1], lv[2], lv[3] = 0, 100, 200, 255
+	default:
+		for i := 0; i < levels; i++ {
+			lv[i] = uint8(i * 255 / (levels - 1))
+		}
+	}
+	return lv
+}
+
+func retroBlueLevels(levels int) []uint8 {
+	lv := make([]uint8, levels)
+	switch levels {
+	case 2:
+		lv[0], lv[1] = 15, 170
+	default:
+		for i := 0; i < levels; i++ {
+			lv[i] = uint8(i * 255 / (levels - 1))
+		}
+	}
+	return lv
+}
+
+func newRetroPalette(rBits, gBits, bBits int) *sixelPalette {
+	rLevels := 1 << rBits
+	gLevels := 1 << gBits
+	bLevels := 1 << bBits
+	nc := rLevels * gLevels * bLevels
+	gShift := bBits
+	rShift := gBits + bBits
+
+	p := &sixelPalette{nc: nc, colors: make([]color.Color, nc)}
+	rLv := retroLevels(rLevels)
+	gLv := retroLevels(gLevels)
+	bLv := retroBlueLevels(bLevels)
+	for ri := 0; ri < rLevels; ri++ {
+		for gi := 0; gi < gLevels; gi++ {
+			for bi := 0; bi < bLevels; bi++ {
+				p.colors[ri<<rShift|gi<<gShift|bi] = color.RGBA{
+					rLv[ri], gLv[gi], bLv[bi], 255,
+				}
+			}
+		}
+	}
+
+	dR := makeDither(rLevels)
+	dG := makeDither(gLevels)
+	dB := makeDither(bLevels)
+
+	for b := 0; b < 16; b++ {
+		for v := 0; v < 256; v++ {
+			s := v + int(dR[b])
+			if s < 0 { s = 0 } else if s > 255 { s = 255 }
+			p.lutR[b][v] = uint8(s>>(8-rBits)) << rShift
+
+			s = v + int(dG[b])
+			if s < 0 { s = 0 } else if s > 255 { s = 255 }
+			p.lutG[b][v] = uint8(s>>(8-gBits)) << gShift
+
+			s = v + int(dB[b])
+			if s < 0 { s = 0 } else if s > 255 { s = 255 }
+			p.lutB[b][v] = uint8(s >> (8 - bBits))
+		}
+	}
+	return p
+}
+
 func newGrayPalette(levels int) *sixelPalette {
 	p := &sixelPalette{nc: levels, isGray: true, colors: make([]color.Color, levels)}
 	for i := 0; i < levels; i++ {
@@ -596,7 +668,12 @@ func getSixelPalette(nc int) *sixelPalette {
 	for i, lvl := range paletteLevels {
 		if lvl == nc {
 			bits := paletteBits[i]
-			p := newSixelPalette(bits[0], bits[1], bits[2])
+			var p *sixelPalette
+			if nc == 16 || nc == 32 {
+				p = newRetroPalette(bits[0], bits[1], bits[2])
+			} else {
+				p = newSixelPalette(bits[0], bits[1], bits[2])
+			}
 			paletteCache[nc] = p
 			return p
 		}
