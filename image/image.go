@@ -1096,7 +1096,8 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 					g0, g1, g2, g3 := &quantLUT_G[yb4|0], &quantLUT_G[yb4|1], &quantLUT_G[yb4|2], &quantLUT_G[yb4|3]
 					b0, b1, b2, b3 := &quantLUT_B[yb4|0], &quantLUT_B[yb4|1], &quantLUT_B[yb4|2], &quantLUT_B[yb4|3]
 					pi := rowOffset
-					for x := 0; x < width; x += 4 {
+					lim := width &^ 3
+					for x := 0; x < lim; x += 4 {
 						ci := int(r0[data[pi]]) | int(g0[data[pi+1]]) | int(b0[data[pi+2]])
 						if st.seen[ci] != st.epoch {
 							st.seen[ci] = st.epoch
@@ -1122,6 +1123,16 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 						}
 						st.buf[ci*width+x+3] |= bit
 						pi += 16
+					}
+					for x := lim; x < width; x++ {
+						b := yb4 | (x & 3)
+						ci := int(quantLUT_R[b][data[pi]]) | int(quantLUT_G[b][data[pi+1]]) | int(quantLUT_B[b][data[pi+2]])
+						if st.seen[ci] != st.epoch {
+							st.seen[ci] = st.epoch
+							dirty = append(dirty, ci)
+						}
+						st.buf[ci*width+x] |= bit
+						pi += 4
 					}
 					rowOffset += width * 4
 				}
