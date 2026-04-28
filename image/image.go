@@ -1005,7 +1005,11 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixel
 		estSize = 65536
 	}
 	outBuf := bytes.NewBuffer(make([]byte, 0, estSize))
-	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22, 0x31, 0x3b, 0x31})
+	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22})
+	writeSixelNum(outBuf, width)
+	outBuf.WriteByte(';')
+	writeSixelNum(outBuf, height)
+	outBuf.Write([]byte{0x3b, 0x31, 0x3b, 0x31})
 	for i := 0; i < nc; i++ {
 		r, g, b, _ := pal.colors[i].RGBA()
 		outBuf.WriteByte('#')
@@ -1236,7 +1240,11 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 		estSize = 65536
 	}
 	outBuf := bytes.NewBuffer(make([]byte, 0, estSize))
-	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22, 0x31, 0x3b, 0x31})
+	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22})
+	writeSixelNum(outBuf, width)
+	outBuf.WriteByte(';')
+	writeSixelNum(outBuf, height)
+	outBuf.Write([]byte{0x3b, 0x31, 0x3b, 0x31})
 	for i := 0; i < paletteSize; i++ {
 		r, g, b, _ := paletted.Palette[i].RGBA()
 		outBuf.WriteByte('#')
