@@ -577,6 +577,24 @@ var dither64 = [16]int8{
 	32, -2, 24, -10,
 }
 
+var quantLUT [16][256]uint8
+var quantLUTOnce sync.Once
+
+func initQuantLUT() {
+	for b := 0; b < 16; b++ {
+		d := int(dither64[b])
+		for v := 0; v < 256; v++ {
+			s := v + d
+			if s < 0 {
+				s = 0
+			} else if s > 255 {
+				s = 255
+			}
+			quantLUT[b][v] = uint8(s >> 6)
+		}
+	}
+}
+
 // EncodeSixelFrameRaw 直接从 raw RGBA 字节编码 Sixel
 // 使用均匀量化（O(n)，纯位运算）+ 并行 strip 编码
 // cache 为帧间缓存，传 nil 表示不使用缓存
@@ -1063,37 +1081,16 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 				clear(st.buf[:stripCap])
 				dirty := st.dirty[:0]
 
+				quantLUTOnce.Do(initQuantLUT)
+
 				rowOffset := job.yStart * width * 4
 				for dy := 0; dy < nRows; dy++ {
 					yb4 := ((job.yStart + dy) & 3) << 2
 					bit := byte(1 << dy)
 					for x := 0; x < width; x++ {
-						bayerIdx := yb4 | (x & 3)
+						lt := &quantLUT[yb4|(x&3)]
 						pi := rowOffset + x*4
-						r := int(data[pi]) + int(dither64[bayerIdx])
-						g := int(data[pi+1]) + int(dither64[bayerIdx])
-						b := int(data[pi+2]) + int(dither64[bayerIdx])
-
-						ri := r >> 6
-						gi := g >> 6
-						bi := b >> 6
-						if ri < 0 {
-							ri = 0
-						} else if ri > 3 {
-							ri = 3
-						}
-						if gi < 0 {
-							gi = 0
-						} else if gi > 3 {
-							gi = 3
-						}
-						if bi < 0 {
-							bi = 0
-						} else if bi > 3 {
-							bi = 3
-						}
-						ci := ri<<4 | gi<<2 | bi
-
+						ci := int(lt[data[pi]])<<4 | int(lt[data[pi+1]])<<2 | int(lt[data[pi+2]])
 						if st.seen[ci] != st.epoch {
 							st.seen[ci] = st.epoch
 							dirty = append(dirty, ci)
