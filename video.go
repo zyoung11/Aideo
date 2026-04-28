@@ -693,10 +693,28 @@ func (vp *VideoPlayer) updateFPS() {
 	}
 }
 
-// statusLine 返回底部状态栏，显示分辨率与实时帧率
+// statusLine 返回底部状态栏，显示分辨率与实时帧率（居中）
 func (vp *VideoPlayer) statusLine() string {
-	return fmt.Sprintf("\033[%d;1H\033[90m[ q退出 | %dx%d | %.1ffps ]\033[K%s",
-		vp.termHeight, vp.outWidth, vp.outHeight, vp.displayFPS, RESET_COLORS)
+	text := fmt.Sprintf("[ q退出 | %dx%d | %.1ffps ]", vp.outWidth, vp.outHeight, vp.displayFPS)
+	visW := displayWidth(text)
+	col := (vp.termWidth - visW) / 2
+	if col < 1 {
+		col = 1
+	}
+	return fmt.Sprintf("\033[%d;%dH\033[90m%s\033[K%s",
+		vp.termHeight, col, text, RESET_COLORS)
+}
+
+func displayWidth(s string) int {
+	w := 0
+	for _, r := range s {
+		if r >= 0x2E80 && r <= 0x9FFF || r >= 0xF900 && r <= 0xFAFF || r >= 0xFF01 && r <= 0xFF60 {
+			w += 2
+		} else {
+			w += 1
+		}
+	}
+	return w
 }
 
 // startLoop 循环播放，使用双缓冲 decoder 实现无缝循环
