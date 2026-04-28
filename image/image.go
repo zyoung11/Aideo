@@ -577,7 +577,9 @@ var dither64 = [16]int8{
 	32, -2, 24, -10,
 }
 
-var quantLUT [16][256]uint8
+var quantLUT_R [16][256]uint8
+var quantLUT_G [16][256]uint8
+var quantLUT_B [16][256]uint8
 var quantLUTOnce sync.Once
 
 func initQuantLUT() {
@@ -590,7 +592,10 @@ func initQuantLUT() {
 			} else if s > 255 {
 				s = 255
 			}
-			quantLUT[b][v] = uint8(s >> 6)
+			q := uint8(s >> 6)
+			quantLUT_R[b][v] = q << 4
+			quantLUT_G[b][v] = q << 2
+			quantLUT_B[b][v] = q
 		}
 	}
 }
@@ -1087,15 +1092,36 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 				for dy := 0; dy < nRows; dy++ {
 					yb4 := ((job.yStart + dy) & 3) << 2
 					bit := byte(1 << dy)
-					for x := 0; x < width; x++ {
-						lt := &quantLUT[yb4|(x&3)]
-						pi := rowOffset + x*4
-						ci := int(lt[data[pi]])<<4 | int(lt[data[pi+1]])<<2 | int(lt[data[pi+2]])
+					r0, r1, r2, r3 := &quantLUT_R[yb4|0], &quantLUT_R[yb4|1], &quantLUT_R[yb4|2], &quantLUT_R[yb4|3]
+					g0, g1, g2, g3 := &quantLUT_G[yb4|0], &quantLUT_G[yb4|1], &quantLUT_G[yb4|2], &quantLUT_G[yb4|3]
+					b0, b1, b2, b3 := &quantLUT_B[yb4|0], &quantLUT_B[yb4|1], &quantLUT_B[yb4|2], &quantLUT_B[yb4|3]
+					pi := rowOffset
+					for x := 0; x < width; x += 4 {
+						ci := int(r0[data[pi]]) | int(g0[data[pi+1]]) | int(b0[data[pi+2]])
 						if st.seen[ci] != st.epoch {
 							st.seen[ci] = st.epoch
 							dirty = append(dirty, ci)
 						}
 						st.buf[ci*width+x] |= bit
+						ci = int(r1[data[pi+4]]) | int(g1[data[pi+5]]) | int(b1[data[pi+6]])
+						if st.seen[ci] != st.epoch {
+							st.seen[ci] = st.epoch
+							dirty = append(dirty, ci)
+						}
+						st.buf[ci*width+x+1] |= bit
+						ci = int(r2[data[pi+8]]) | int(g2[data[pi+9]]) | int(b2[data[pi+10]])
+						if st.seen[ci] != st.epoch {
+							st.seen[ci] = st.epoch
+							dirty = append(dirty, ci)
+						}
+						st.buf[ci*width+x+2] |= bit
+						ci = int(r3[data[pi+12]]) | int(g3[data[pi+13]]) | int(b3[data[pi+14]])
+						if st.seen[ci] != st.epoch {
+							st.seen[ci] = st.epoch
+							dirty = append(dirty, ci)
+						}
+						st.buf[ci*width+x+3] |= bit
+						pi += 16
 					}
 					rowOffset += width * 4
 				}
