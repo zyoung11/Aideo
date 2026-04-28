@@ -568,9 +568,9 @@ func retroLevels(levels int) []uint8 {
 	lv := make([]uint8, levels)
 	switch levels {
 	case 2:
-		lv[0], lv[1] = 25, 235
+		lv[0], lv[1] = 20, 200
 	case 4:
-		lv[0], lv[1], lv[2], lv[3] = 0, 100, 200, 255
+		lv[0], lv[1], lv[2], lv[3] = 0, 105, 210, 255
 	default:
 		for i := 0; i < levels; i++ {
 			lv[i] = uint8(i * 255 / (levels - 1))
@@ -583,7 +583,7 @@ func retroBlueLevels(levels int) []uint8 {
 	lv := make([]uint8, levels)
 	switch levels {
 	case 2:
-		lv[0], lv[1] = 15, 170
+		lv[0], lv[1] = 10, 150
 	default:
 		for i := 0; i < levels; i++ {
 			lv[i] = uint8(i * 255 / (levels - 1))
