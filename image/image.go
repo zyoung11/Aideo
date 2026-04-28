@@ -519,6 +519,26 @@ func EncodeSixelFrame(w io.Writer, img image.Image, colors int, dither bool) err
 var uniform256Palette []color.Color
 var uniform256Once sync.Once
 
+var uniform64Palette []color.Color
+var uniform64Once sync.Once
+
+func initUniform64() {
+	uniform64Palette = make([]color.Color, 64)
+	for ri := 0; ri < 4; ri++ {
+		for gi := 0; gi < 4; gi++ {
+			for bi := 0; bi < 4; bi++ {
+				idx := ri<<4 | gi<<2 | bi
+				uniform64Palette[idx] = color.RGBA{
+					uint8(ri * 255 / 3),
+					uint8(gi * 255 / 3),
+					uint8(bi * 255 / 3),
+					255,
+				}
+			}
+		}
+	}
+}
+
 func initUniform256() {
 	uniform256Palette = make([]color.Color, 256)
 	for ri := 0; ri < 8; ri++ {
@@ -548,6 +568,13 @@ var ditherB = [16]int8{
 	18, -14, 26, -6,
 	-18, 14, -26, 6,
 	30, -2, 22, -10,
+}
+
+var dither64 = [16]int8{
+	-32, 2, -24, 10,
+	20, -16, 28, -4,
+	-20, 16, -28, 4,
+	32, -2, 24, -10,
 }
 
 // EncodeSixelFrameRaw 直接从 raw RGBA 字节编码 Sixel
@@ -962,7 +989,7 @@ type stripResult struct {
 }
 
 func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *SixelFrameCache) error {
-	nc := 256
+	nc := 64
 	totalSixelRows := (height + 5) / 6
 	workers := runtime.NumCPU()
 	if workers > totalSixelRows {
@@ -978,9 +1005,9 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 	}
 	outBuf := bytes.NewBuffer(make([]byte, 0, estSize))
 	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22, 0x31, 0x3b, 0x31})
-	uniform256Once.Do(initUniform256)
+	uniform64Once.Do(initUniform64)
 	for i := 0; i < nc; i++ {
-		r, g, b, _ := uniform256Palette[i].RGBA()
+		r, g, b, _ := uniform64Palette[i].RGBA()
 		outBuf.WriteByte('#')
 		writeSixelNum(outBuf, i+1)
 		outBuf.WriteString(";2;")
@@ -1043,29 +1070,29 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, cache *Six
 					for x := 0; x < width; x++ {
 						bayerIdx := yb4 | (x & 3)
 						pi := rowOffset + x*4
-						r := int(data[pi]) + int(ditherRG[bayerIdx])
-						g := int(data[pi+1]) + int(ditherRG[bayerIdx])
-						b := int(data[pi+2]) + int(ditherB[bayerIdx])
+						r := int(data[pi]) + int(dither64[bayerIdx])
+						g := int(data[pi+1]) + int(dither64[bayerIdx])
+						b := int(data[pi+2]) + int(dither64[bayerIdx])
 
-						ri := r >> 5
-						gi := g >> 5
+						ri := r >> 6
+						gi := g >> 6
 						bi := b >> 6
 						if ri < 0 {
 							ri = 0
-						} else if ri > 7 {
-							ri = 7
+						} else if ri > 3 {
+							ri = 3
 						}
 						if gi < 0 {
 							gi = 0
-						} else if gi > 7 {
-							gi = 7
+						} else if gi > 3 {
+							gi = 3
 						}
 						if bi < 0 {
 							bi = 0
 						} else if bi > 3 {
 							bi = 3
 						}
-						ci := ri<<5 | gi<<2 | bi
+						ci := ri<<4 | gi<<2 | bi
 
 						if st.seen[ci] != st.epoch {
 							st.seen[ci] = st.epoch
