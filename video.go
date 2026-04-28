@@ -390,9 +390,10 @@ func capOutputSize(w, h, maxPx int) (int, int) {
 // ==================== 视频解码器（双缓冲） ====================
 
 type videoDecoder struct {
-	reader  io.ReadCloser
-	closeCh chan struct{}
-	doneCh  chan struct{}
+	reader    io.ReadCloser
+	closeCh   chan struct{}
+	doneCh    chan struct{}
+	closeOnce sync.Once
 }
 
 // spawnVideoDecoder 启动一个 ffmpeg 视频解码进程
@@ -455,7 +456,9 @@ func (vp *VideoPlayer) spawnVideoDecoder(seekSecs float64) *videoDecoder {
 }
 
 func (d *videoDecoder) close() {
-	close(d.closeCh)
+	d.closeOnce.Do(func() {
+		close(d.closeCh)
+	})
 	<-d.doneCh
 }
 
@@ -805,7 +808,6 @@ func (vp *VideoPlayer) startLoop() {
 	var outputBuf strings.Builder
 	outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
-	// 检测视频是否有音频流
 	hasAudio := hasAudioStream(vp.filename)
 
 	// 根据是否有音频选择合适的音频流
@@ -831,11 +833,55 @@ func (vp *VideoPlayer) startLoop() {
 
 	// 帧计数和当前播放时间（用于 resize seek）
 	var frameCount int64
+	var renderFrame []byte
 
 	// 启动第一个视频解码器
 	currentDec := vp.spawnVideoDecoder(0)
 	// 预启动第二个视频解码器（双缓冲）
 	nextDec := vp.spawnVideoDecoder(0)
+
+	// 帧读取 goroutine
+	frameCh := make(chan []byte, 2)
+	stopCh := make(chan struct{})
+	decSwitchCh := make(chan struct {
+		current *videoDecoder
+		next    *videoDecoder
+	}, 1)
+	go func() {
+		cd := currentDec
+		nd := nextDec
+		for {
+			select {
+			case sw := <-decSwitchCh:
+				cd.close()
+				if nd != sw.current && nd != sw.next {
+					nd.close()
+				}
+				cd = sw.current
+				nd = sw.next
+				continue
+			default:
+			}
+			fs := frameSize
+			if cap(vp.frameBuf) < fs {
+				vp.frameBuf = make([]byte, fs)
+			}
+			n, err := io.ReadFull(cd.reader, vp.frameBuf[:fs])
+			if err != nil || n != fs {
+				cd.close()
+				cd = nd
+				nd = vp.spawnVideoDecoder(0)
+				continue
+			}
+			fc := make([]byte, fs)
+			copy(fc, vp.frameBuf[:fs])
+			select {
+			case frameCh <- fc:
+			case <-stopCh:
+				return
+			}
+		}
+	}()
 
 	// 清屏一次（只在最开始时）
 	fmt.Print(CLEAR_SCREEN + CURSOR_HOME)
@@ -858,6 +904,7 @@ func (vp *VideoPlayer) startLoop() {
 			if speakerInitialized {
 				speaker.Close()
 			}
+			close(stopCh)
 			currentDec.close()
 			nextDec.close()
 			vp.cleanupFrame()
@@ -873,8 +920,6 @@ func (vp *VideoPlayer) startLoop() {
 			}
 			resizePending = false
 
-			// 记录当前播放时间
-			targetFrame := frameCount
 			currentTime := float64(frameCount) / vp.fps
 
 			// 精确 seek 到当前时间往前 0.15 秒（output 端 -ss 会解码到目标位置输出）
@@ -894,38 +939,27 @@ func (vp *VideoPlayer) startLoop() {
 			outputBuf.Grow(vp.charW*vp.charH*30 + vp.charH)
 
 			// 从 seekTime 处启动新的解码器
-			currentDec = vp.spawnVideoDecoder(seekTime)
-			nextDec = vp.spawnVideoDecoder(seekTime)
+			newCurrent := vp.spawnVideoDecoder(seekTime)
+			newNext := vp.spawnVideoDecoder(seekTime)
+			decSwitchCh <- struct {
+				current *videoDecoder
+				next    *videoDecoder
+			}{newCurrent, newNext}
 
-			// 不重建音频流，保持连续播放
-
-			// 追帧：快速解码并丢弃帧，直到追上目标帧号
-			// seekTime 到 currentTime 之间的帧都要丢掉
 			seekFrame := int64(seekTime * vp.fps)
 			if seekFrame < 0 {
 				seekFrame = 0
 			}
-			framesToCatch := int(targetFrame - seekFrame)
-			if framesToCatch < 0 {
-				framesToCatch = 0
-			}
+			frameCount = int64(time.Since(playbackStart).Seconds() * vp.fps)
+			renderFrame = nil
 
-			if cap(vp.frameBuf) < frameSize {
-				vp.frameBuf = make([]byte, frameSize)
-			}
-			catchUpBuf := vp.frameBuf[:frameSize]
-			for i := 0; i < framesToCatch; i++ {
-				n, err := io.ReadFull(currentDec.reader, catchUpBuf)
-				if err != nil || n != frameSize {
-					// 当前解码器异常，切换到 nextDec
-					currentDec.close()
-					currentDec = nextDec
-					nextDec = vp.spawnVideoDecoder(seekTime)
-					// 从新解码器继续追
-					i--
-					continue
+			drainLoop:
+			for {
+				select {
+				case <-frameCh:
+				default:
+					break drainLoop
 				}
-				frameCount++
 			}
 
 			// 清屏 + 定位光标到左上角 (1,1)
@@ -974,61 +1008,53 @@ func (vp *VideoPlayer) startLoop() {
 				}
 				continue
 			}
-		default:
+		case renderFrame = <-frameCh:
+			if renderFrame == nil {
+				closer()
+				if speakerInitialized {
+					speaker.Close()
+				}
+				vp.cleanupFrame()
+				return
+			}
 		}
 
-		// 读取一帧（复用缓冲区，避免每帧大块分配）
-		if cap(vp.frameBuf) < frameSize {
-			vp.frameBuf = make([]byte, frameSize)
-		}
-		buf := vp.frameBuf[:frameSize]
-		n, err := io.ReadFull(currentDec.reader, buf)
-		if err != nil || n != frameSize {
-			// 当前视频结束 → 无缝切换到下一个 decoder
-			currentDec.close()
-
-			// 交换：nextDec 变成 currentDec
-			currentDec = nextDec
-			// 启动新的 nextDec
-			nextDec = vp.spawnVideoDecoder(0)
-
-			// 继续读（不执行任何清屏操作）
-			continue
-		}
-
-		// 帧计数（用于 resize seek）
 		frameCount++
 
-		// A/V 同步：如果落后音频超过 1 帧，跳过解码帧追到当前音频位置
+		vp.updateFPS()
+
+		// A/V 同步：落后音频则跳帧（不渲染）
+		syncLoop:
 		for {
 			expectedTime := playbackStart.Add(time.Duration(float64(frameCount)) * vp.frameTime)
-			if behind := time.Since(expectedTime); behind <= vp.frameTime {
+			if time.Since(expectedTime) <= vp.frameTime {
 				break
 			}
-			frameCount++
-			n, err = io.ReadFull(currentDec.reader, buf)
-			if err != nil || n != frameSize {
-				currentDec.close()
-				currentDec = nextDec
-				nextDec = vp.spawnVideoDecoder(0)
-				n, err = io.ReadFull(currentDec.reader, buf)
-				if err != nil || n != frameSize {
-					break
+			select {
+			case renderFrame = <-frameCh:
+				if renderFrame == nil {
+					closer()
+					if speakerInitialized {
+						speaker.Close()
+					}
+					vp.cleanupFrame()
+					return
 				}
+			default:
+				break syncLoop
 			}
+			frameCount++
 		}
-
-		vp.updateFPS()
 
 		outputBuf.Reset()
 
 		switch vp.proto {
 		case timage.ProtocolSixel:
-			vp.renderSixelFrame(buf)
+			vp.renderSixelFrame(renderFrame)
 		case timage.ProtocolKitty:
-			vp.renderKittyFrame(buf)
+			vp.renderKittyFrame(renderFrame)
 		default:
-			vp.renderAsciiFrame(buf, &outputBuf)
+			vp.renderAsciiFrame(renderFrame, &outputBuf)
 		}
 
 		if vp.proto == timage.ProtocolAuto {
