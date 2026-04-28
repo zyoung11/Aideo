@@ -665,8 +665,9 @@ func (vp *VideoPlayer) renderAsciiFrame(raw []byte, outputBuf *strings.Builder) 
 func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 	vp.sixelBuf.Reset()
 	fmt.Fprintf(&vp.sixelBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
-	// 直接编码 raw RGBA 字节，跳过 image.RGBA 创建和拷贝
+	encStart := time.Now()
 	timage.EncodeSixelFrameRaw(&vp.sixelBuf, raw, vp.outWidth, vp.outHeight, 255, false, vp.sixelCache)
+	encDur := time.Since(encStart)
 
 	// 清除图像右侧的残留区域
 	if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
@@ -681,7 +682,7 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 		fmt.Fprintf(&vp.sixelBuf, "\033[%d;1H\033[J", vp.startRow+vp.charH+1)
 	}
 
-	fmt.Fprintf(&vp.sixelBuf, "%s", vp.statusLine())
+	fmt.Fprintf(&vp.sixelBuf, "%s", vp.statusLine(encDur))
 	os.Stdout.Write(vp.sixelBuf.Bytes())
 }
 
@@ -712,7 +713,7 @@ func (vp *VideoPlayer) renderKittyFrame(raw []byte) {
 		timage.DeleteKittyFrame(&vp.kittyBuf, vp.prevKittyID)
 	}
 	vp.prevKittyID = newID
-	fmt.Fprintf(&vp.kittyBuf, "%s", vp.statusLine())
+	fmt.Fprintf(&vp.kittyBuf, "%s", vp.statusLine(0))
 	os.Stdout.Write(vp.kittyBuf.Bytes())
 }
 
@@ -745,8 +746,8 @@ func (vp *VideoPlayer) updateFPS() {
 }
 
 // statusLine 返回底部状态栏，显示分辨率与实时帧率（居中）
-func (vp *VideoPlayer) statusLine() string {
-	text := fmt.Sprintf("[ q退出 | %dx%d | %.1ffps ]", vp.outWidth, vp.outHeight, vp.displayFPS)
+func (vp *VideoPlayer) statusLine(encDur time.Duration) string {
+	text := fmt.Sprintf("[ q退出 | %dx%d | %.1ffps | enc:%.1fms ]", vp.outWidth, vp.outHeight, vp.displayFPS, float64(encDur.Microseconds())/1000)
 	visW := displayWidth(text)
 	col := (vp.termWidth - visW) / 2
 	if col < 1 {
@@ -1027,7 +1028,7 @@ func (vp *VideoPlayer) startLoop() {
 		}
 
 		if vp.proto == timage.ProtocolAuto {
-			outputBuf.WriteString(vp.statusLine())
+			outputBuf.WriteString(vp.statusLine(0))
 
 			fmt.Print(outputBuf.String())
 		}
