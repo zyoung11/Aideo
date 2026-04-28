@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"os/signal"
 	"runtime"
 	"strings"
@@ -34,6 +35,37 @@ type VideoInfo struct {
 }
 
 // ==================== FFmpeg 路径检测 ====================
+
+var cachedFFmpegPath string
+var cachedHWAccel string
+var hwAccelOnce sync.Once
+
+func detectFFmpegAndHWAccel() (ffmpegPath string, hwAccel string) {
+	hwAccelOnce.Do(func() {
+		cachedFFmpegPath = getFFmpegPath()
+		for _, path := range []string{"/usr/sbin/ffmpeg", "/usr/bin/ffmpeg", "ffmpeg"} {
+			cmd := exec.Command(path, "-hwaccels")
+			output, err := cmd.Output()
+			if err != nil {
+				continue
+			}
+			outStr := string(output)
+			for _, accel := range []string{"vulkan", "vaapi", "cuda"} {
+				if strings.Contains(outStr, accel) {
+					cachedFFmpegPath = path
+					cachedHWAccel = accel
+					return
+				}
+			}
+			if strings.Contains(outStr, "vdpau") {
+				cachedFFmpegPath = path
+				cachedHWAccel = "vdpau"
+				return
+			}
+		}
+	})
+	return cachedFFmpegPath, cachedHWAccel
+}
 
 func getFFmpegPath() string {
 	if runtime.GOOS == "windows" {
@@ -195,10 +227,12 @@ type VideoPlayer struct {
 	prevKittyID uint32
 	cellW       int
 	cellH       int
+	hwAccel     string
 
 	kittyBuf   bytes.Buffer // 复用 Kitty 渲染缓冲区
 	sixelBuf   bytes.Buffer // 复用 Sixel 渲染缓冲区
 	frameBuf   []byte        // 复用帧读取缓冲区
+	sixelCache *timage.SixelFrameCache
 
 	// kitty 性能优化
 	kittyFrameCount    int32       // kitty 帧计数器
@@ -292,6 +326,12 @@ func (vp *VideoPlayer) initProto() {
 		vp.startRow = 0
 	}
 
+	// 预分配 Sixel 帧缓存（跳过重编码未变化的 strip）
+	if vp.proto == timage.ProtocolSixel {
+		totalStrips := (vp.outHeight + 5) / 6
+		vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
+	}
+
 	// 预分配 Kitty 渲染缓冲区
 	if vp.proto == timage.ProtocolKitty {
 		rawFrameSize := vp.outWidth * vp.outHeight * 3 // RGB 3 字节
@@ -326,6 +366,11 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	}
 	vp.outWidth = newOutW
 	vp.outHeight = newOutH
+
+	if vp.proto == timage.ProtocolSixel {
+		totalStrips := (vp.outHeight + 5) / 6
+		vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
+	}
 
 	newStartCol := (newWidth - vp.charW) / 2
 	newStartRow := (newHeight - vp.charH) / 2
@@ -372,7 +417,6 @@ type videoDecoder struct {
 // seekSecs 为 0 表示从头开始，>0 表示从该秒附近开始解码
 // 使用 output 端 -ss 实现精确 seek（fasteek），可确保输出的第一帧就是目标时间附近的帧
 func (vp *VideoPlayer) spawnVideoDecoder(seekSecs float64) *videoDecoder {
-	ffmpegPath := getFFmpegPath()
 	pr, pw := io.Pipe()
 
 	outputArgs := ffmpeg.KwArgs{
@@ -383,11 +427,17 @@ func (vp *VideoPlayer) spawnVideoDecoder(seekSecs float64) *videoDecoder {
 		"sn":      "",
 	}
 	if seekSecs > 0 {
-		// output 端 -ss = 精确 seek，ffmpeg 会解码但丢弃前面的帧，直接输出目标位置的帧
 		outputArgs["ss"] = fmt.Sprintf("%.3f", seekSecs)
 	}
 
-	stream := ffmpeg.Input(vp.filename).
+	ffmpegPath, hwAccel := detectFFmpegAndHWAccel()
+
+	var inputKwargs ffmpeg.KwArgs
+	if hwAccel != "" {
+		inputKwargs = ffmpeg.KwArgs{"hwaccel": hwAccel}
+	}
+
+	stream := ffmpeg.Input(vp.filename, inputKwargs).
 		Output("pipe:", outputArgs).
 		Silent(true).
 		SetFfmpegPath(ffmpegPath).
@@ -455,9 +505,10 @@ type audioStreamer struct {
 }
 
 func newAudioStreamer(filename string) *audioStreamer {
+	ffmpegPath, _ := detectFFmpegAndHWAccel()
 	return &audioStreamer{
 		filename:   filename,
-		ffmpegPath: getFFmpegPath(),
+		ffmpegPath: ffmpegPath,
 		closeCh:    make(chan struct{}),
 	}
 }
@@ -615,7 +666,7 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 	vp.sixelBuf.Reset()
 	fmt.Fprintf(&vp.sixelBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
 	// 直接编码 raw RGBA 字节，跳过 image.RGBA 创建和拷贝
-	timage.EncodeSixelFrameRaw(&vp.sixelBuf, raw, vp.outWidth, vp.outHeight, 255, false)
+	timage.EncodeSixelFrameRaw(&vp.sixelBuf, raw, vp.outWidth, vp.outHeight, 255, false, vp.sixelCache)
 
 	// 清除图像右侧的残留区域
 	if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {

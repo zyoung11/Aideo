@@ -613,12 +613,13 @@ func quantizeUniform(data []byte, width, height int) *image.Paletted {
 
 // EncodeSixelFrameRaw 直接从 raw RGBA 字节编码 Sixel
 // 使用均匀量化（O(n)，纯位运算）+ 并行 strip 编码
-func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int, dither bool) error {
+// cache 为帧间缓存，传 nil 表示不使用缓存
+func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int, dither bool, cache *SixelFrameCache) error {
 	if width == 0 || height == 0 {
 		return nil
 	}
 	paletted := quantizeUniform(data, width, height)
-	return encodePaletted(w, paletted, width, height, 256)
+	return encodePaletted(w, paletted, width, height, 256, cache)
 }
 
 func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
@@ -948,9 +949,44 @@ var sixelStripStatePool = sync.Pool{
 }
 
 type sixelStripState struct {
-	buf   []byte  // flat [colors * width]byte  bitmap
-	epoch []uint8 // [colors]uint8 每个颜色的 epoch 标记
-	dirty []int   // 当前 strip 中被写过的颜色索引
+	buf       []byte   // flat [colors * width]byte bitmap
+	seen      []uint16 // [colors]uint16 每个颜色的 epoch 标记
+	epoch     uint16   // 当前 strip 的 epoch 序号（自增）
+	dirty     []int    // 当前 strip 中被写过的颜色索引
+	pixelHash uint64   // 本 strip 的像素哈希（用于帧缓存）
+}
+
+type SixelFrameCache struct {
+	strips []sixelCachedStrip
+	mu     sync.Mutex
+}
+
+type sixelCachedStrip struct {
+	rleData   []byte
+	pixelHash uint64
+}
+
+func NewSixelFrameCache(totalStrips int) *SixelFrameCache {
+	return &SixelFrameCache{
+		strips: make([]sixelCachedStrip, totalStrips),
+	}
+}
+
+func stripPixelHash(pix []uint8, stride int, yStart, yEnd, width int) uint64 {
+	h := uint64(14695981039346656037)
+	for y := yStart; y < yEnd; y++ {
+		row := pix[y*stride : y*stride+width]
+		for _, p := range row {
+			h ^= uint64(p)
+			h *= 1099511628211
+		}
+	}
+	return h
+}
+
+type pendingItem struct {
+	state   *sixelStripState
+	rleData []byte
 }
 
 // stripJob 表示一个待处理的 Sixel 行
@@ -964,7 +1000,8 @@ type stripJob struct {
 // stripResult 是 Worker 处理完一个 strip 后的结果
 type stripResult struct {
 	sixelRow int
-	state    *sixelStripState // 包含 buf 和 dirty 列表，编码后归还到池
+	state    *sixelStripState
+	rleData  []byte // 缓存命中时直接携带 RLE 数据，state 为 nil
 }
 
 func encodeSixel(w io.Writer, img image.Image, colors int, dither bool) error {
@@ -987,11 +1024,12 @@ func encodeSixel(w io.Writer, img image.Image, colors int, dither bool) error {
 			draw.FloydSteinberg.Draw(paletted, img.Bounds(), img, image.Point{})
 		}
 	}
-	return encodePaletted(w, paletted, width, height, nc)
+	return encodePaletted(w, paletted, width, height, nc, nil)
 }
 
 // encodePaletted 编码已量化的 Paletted 图像为 Sixel（并行 strip 处理 + 流式 RLE）
-func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int) error {
+// cache 为帧间缓存，传 nil 表示不使用缓存
+func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int, cache *SixelFrameCache) error {
 	pix := paletted.Pix
 	stride := paletted.Stride
 
@@ -1040,18 +1078,39 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 		go func() {
 			defer wg.Done()
 			for job := range jobCh {
+				pHash := stripPixelHash(pix, stride, job.yStart, job.yEnd, width)
+
+				if cache != nil {
+					cache.mu.Lock()
+					c := &cache.strips[job.sixelRow]
+					if c.pixelHash == pHash && len(c.rleData) > 0 {
+						rleCopy := make([]byte, len(c.rleData))
+						copy(rleCopy, c.rleData)
+						cache.mu.Unlock()
+						resultCh <- stripResult{sixelRow: job.sixelRow, rleData: rleCopy}
+						continue
+					}
+					cache.mu.Unlock()
+				}
+
 				st := sixelStripStatePool.Get().(*sixelStripState)
+				st.pixelHash = pHash
 				stripCap := nc * width
 				if cap(st.buf) < stripCap {
 					st.buf = make([]byte, stripCap)
 				}
 				st.buf = st.buf[:stripCap]
-				if cap(st.epoch) < nc {
-					st.epoch = make([]uint8, nc)
+				if cap(st.seen) < nc {
+					st.seen = make([]uint16, nc)
 				} else {
-					st.epoch = st.epoch[:nc]
+					st.seen = st.seen[:nc]
 				}
-				clear(st.epoch)
+				st.epoch++
+				if st.epoch == 0 {
+					clear(st.seen)
+					st.epoch = 1
+				}
+				clear(st.buf[:stripCap])
 				dirty := st.dirty[:0]
 
 				rowOffset := job.yStart * stride
@@ -1063,10 +1122,9 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 						if idx >= nc {
 							continue
 						}
-						if st.epoch[idx] != 1 {
-							st.epoch[idx] = 1
+						if st.seen[idx] != st.epoch {
+							st.seen[idx] = st.epoch
 							dirty = append(dirty, idx)
-							clear(st.buf[idx*width : (idx+1)*width])
 						}
 						st.buf[idx*width+x] |= bit
 					}
@@ -1101,24 +1159,22 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 	}
 
 	nextRow := 0
-	pending := make(map[int]*sixelStripState)
+	pending := make(map[int]pendingItem)
 	recvCount := 0
 
 	for recvCount < totalSixelRows {
 		if jobsSent < totalSixelRows {
-			// 还有任务待发：select 确保不会同时阻塞在 jobCh 和 resultCh
 			select {
 			case jobCh <- makeJob(jobsSent):
 				jobsSent++
 			case res := <-resultCh:
 				recvCount++
-				processStripResult(outBuf, res, &nextRow, pending, width)
+				processStripResult(outBuf, res, &nextRow, pending, width, cache)
 			}
 		} else {
-			// 所有任务已发完，只收结果
 			res := <-resultCh
 			recvCount++
-			processStripResult(outBuf, res, &nextRow, pending, width)
+			processStripResult(outBuf, res, &nextRow, pending, width, cache)
 		}
 	}
 
@@ -1132,22 +1188,37 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 	return err
 }
 
-// processStripResult 保序处理一个 strip 结果：如果顺序正确立即编码，否则暂存
-func processStripResult(outBuf *bytes.Buffer, res stripResult, nextRow *int, pending map[int]*sixelStripState, width int) {
+func processStripResult(outBuf *bytes.Buffer, res stripResult, nextRow *int, pending map[int]pendingItem, width int, cache *SixelFrameCache) {
+	writeOne := func(row int, item pendingItem) {
+		if item.rleData != nil {
+			outBuf.Write(item.rleData)
+			return
+		}
+		st := item.state
+		start := outBuf.Len()
+		encodeStrip(outBuf, st, row, width)
+		if cache != nil && st != nil {
+			end := outBuf.Len()
+			c := &cache.strips[row]
+			c.rleData = append(c.rleData[:0], outBuf.Bytes()[start:end]...)
+			c.pixelHash = st.pixelHash
+		}
+	}
+
 	if res.sixelRow == *nextRow {
-		encodeStrip(outBuf, res.state, res.sixelRow, width)
+		writeOne(res.sixelRow, pendingItem{state: res.state, rleData: res.rleData})
 		*nextRow++
 		for {
-			if st, ok := pending[*nextRow]; ok {
-				encodeStrip(outBuf, st, *nextRow, width)
-				delete(pending, *nextRow)
-				*nextRow++
-			} else {
+			item, ok := pending[*nextRow]
+			if !ok {
 				break
 			}
+			writeOne(*nextRow, item)
+			delete(pending, *nextRow)
+			*nextRow++
 		}
 	} else {
-		pending[res.sixelRow] = res.state
+		pending[res.sixelRow] = pendingItem{state: res.state, rleData: res.rleData}
 	}
 }
 
