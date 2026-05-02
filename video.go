@@ -18,6 +18,7 @@ import (
 	timage "Aideo/image"
 
 	"github.com/gopxl/beep/v2"
+	"github.com/gopxl/beep/v2/effects"
 	"github.com/gopxl/beep/v2/speaker"
 	ffmpeg "github.com/u2takey/ffmpeg-go"
 	"golang.org/x/term"
@@ -58,7 +59,7 @@ func getFFmpegPath() string {
 func probeVideo(filename string) (*VideoInfo, error) {
 	probeData, err := ffmpeg.Probe(filename)
 	if err != nil {
-		return nil, fmt.Errorf("无法探测视频信息: %v", err)
+		return nil, fmt.Errorf("cannot probe video: %v", err)
 	}
 
 	type ProbeStream struct {
@@ -216,17 +217,30 @@ type VideoPlayer struct {
 
 	// 自适应颜色
 	colorCount int
+
+	// 播放控制
+	paused              bool
+	totalFrames         int
+	currentFrame        int64
+	currentVolume       float64
+	volumeDisplayTimer  int
+	colorDisplayTimer   int
+	seekSeconds         int
+	lastFrame           []byte
+	volumeStreamer      *effects.Volume
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
 	return &VideoPlayer{
-		filename:   filename,
-		srcWidth:   srcWidth,
-		srcHeight:  srcHeight,
-		termWidth:  termWidth,
-		termHeight: termHeight,
-		quit:       make(chan struct{}),
-		done:       make(chan struct{}),
+		filename:      filename,
+		srcWidth:      srcWidth,
+		srcHeight:     srcHeight,
+		termWidth:     termWidth,
+		termHeight:    termHeight,
+		quit:          make(chan struct{}),
+		done:          make(chan struct{}),
+		currentVolume: 1.0,
+		seekSeconds:   DefaultSeekSeconds,
 	}
 }
 
@@ -365,7 +379,7 @@ func (vp *VideoPlayer) spawnVideoDecoder(seekSecs float64) *videoDecoder {
 			<-errCh
 		case err := <-errCh:
 			if err != nil {
-				pw.CloseWithError(fmt.Errorf("ffmpeg 错误: %v", err))
+				pw.CloseWithError(fmt.Errorf("ffmpeg error: %v", err))
 			} else {
 				pw.Close()
 			}
@@ -438,7 +452,7 @@ func (as *audioStreamer) spawnAudioDecoder() io.ReadCloser {
 	go func() {
 		err := stream.Run()
 		if err != nil {
-			pw.CloseWithError(fmt.Errorf("音频解码错误: %v", err))
+			pw.CloseWithError(fmt.Errorf("audio decode error: %v", err))
 		} else {
 			pw.Close()
 		}
@@ -566,7 +580,7 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 		fmt.Fprintf(&vp.sixelBuf, "\033[%d;1H\033[J", vp.startRow+vp.charH+1)
 	}
 
-	fmt.Fprintf(&vp.sixelBuf, "%s", vp.statusLine(encDur))
+	vp.renderControlBar(&vp.sixelBuf, encDur)
 	os.Stdout.Write(vp.sixelBuf.Bytes())
 }
 
@@ -592,16 +606,71 @@ func (vp *VideoPlayer) updateFPS() {
 	}
 }
 
-// statusLine 返回底部状态栏，显示分辨率与实时帧率（居中）
-func (vp *VideoPlayer) statusLine(encDur time.Duration) string {
-	text := fmt.Sprintf("[ q退出 | k+ j- | %dx%d | %dc | %.1ffps | enc:%.1fms ]", vp.outWidth, vp.outHeight, vp.colorCount, vp.displayFPS, float64(encDur.Microseconds())/1000)
-	visW := displayWidth(text)
-	col := (vp.termWidth - visW) / 2
-	if col < 1 {
-		col = 1
+func (vp *VideoPlayer) renderControlBar(buf *bytes.Buffer, encDur time.Duration) {
+	w := vp.termWidth
+	h := vp.termHeight
+
+	infoRow := h - 2
+	barRow := h - 1
+
+	buf.WriteString(fmt.Sprintf("\033[%d;1H\033[K", infoRow))
+
+	if vp.volumeDisplayTimer > 0 {
+		volPct := int(vp.currentVolume * 100)
+		volStr := fmt.Sprintf("%d%%", volPct)
+		buf.WriteString(fmt.Sprintf("\033[%d;%dH\033[0m%s", infoRow, 1, volStr))
 	}
-	return fmt.Sprintf("\033[%d;%dH\033[90m%s\033[K%s",
-		vp.termHeight, col, text, RESET_COLORS)
+
+	if vp.colorDisplayTimer > 0 {
+		colorStr := fmt.Sprintf("%dc", vp.colorCount)
+		colorW := displayWidth(colorStr)
+		buf.WriteString(fmt.Sprintf("\033[%d;%dH\033[0m%s", infoRow, w-colorW, colorStr))
+	}
+
+	infoCenter := fmt.Sprintf("[ %dx%d | %.1ffps | %dc ]", vp.outWidth, vp.outHeight, vp.displayFPS, vp.colorCount)
+	infoW := displayWidth(infoCenter)
+	infoX := (w - infoW) / 2
+	if infoX < 1 {
+		infoX = 1
+	}
+	buf.WriteString(fmt.Sprintf("\033[%d;%dH\033[90m%s\033[0m", infoRow, infoX, infoCenter))
+
+	buf.WriteString(fmt.Sprintf("\033[%d;1H\033[K", barRow))
+
+	icon := "⏸"
+	if vp.paused {
+		icon = "▶"
+	}
+	buf.WriteString(fmt.Sprintf("\033[0m%s ", icon))
+
+	modeIcon := "⟳"
+	modeW := displayWidth(modeIcon)
+	barWidth := w - 5 - modeW
+	if barWidth < 4 {
+		barWidth = 4
+	}
+
+	progress := 0.0
+	if vp.totalFrames > 0 {
+		progress = float64(vp.currentFrame) / float64(vp.totalFrames)
+	}
+	if progress > 1.0 {
+		progress = 1.0
+	}
+	playedChars := int(float64(barWidth) * progress)
+
+	buf.WriteString("\033[2m")
+	for i := 0; i < playedChars; i++ {
+		buf.WriteString("━")
+	}
+	buf.WriteString("\033[0m\033[0m")
+	for i := playedChars; i < barWidth; i++ {
+		buf.WriteString("━")
+	}
+
+	buf.WriteString(fmt.Sprintf("\033[0m \033[90m%s\033[0m", modeIcon))
+
+	_ = encDur
 }
 
 func displayWidth(s string) int {
@@ -630,7 +699,7 @@ func (vp *VideoPlayer) startLoop() {
 	go func() {
 		defer func() { recover() }()
 
-		buf := make([]byte, 3)
+		buf := make([]byte, 256)
 		for {
 			n, err := os.Stdin.Read(buf)
 			if err != nil || n == 0 {
@@ -641,7 +710,22 @@ func (vp *VideoPlayer) startLoop() {
 			for i := 0; i < n; i++ {
 				b := buf[i]
 
-				// ESC 或转义序列处理
+				if b == 27 && i+2 < n && buf[i+1] == '[' {
+					term := buf[i+2]
+					switch term {
+					case 'A':
+						select { case keyCh <- 0x80: default: }
+					case 'B':
+						select { case keyCh <- 0x81: default: }
+					case 'C':
+						select { case keyCh <- 0x82: default: }
+					case 'D':
+						select { case keyCh <- 0x83: default: }
+					}
+					i += 2
+					continue
+				}
+
 				if b == 27 && i+1 < n {
 					next := buf[i+1]
 					if next == '[' || next == 'O' || next == 'M' {
@@ -653,11 +737,11 @@ func (vp *VideoPlayer) startLoop() {
 								break
 							}
 						}
+						i--
 						continue
 					}
 				}
 
-				// 普通按键直接发送
 				select {
 				case keyCh <- b:
 				default:
@@ -669,25 +753,25 @@ func (vp *VideoPlayer) startLoop() {
 	frameSize := vp.outWidth * vp.outHeight * 4
 	hasAudio := hasAudioStream(vp.filename)
 
-	// 根据是否有音频选择合适的音频流
-	var audioStream beep.Streamer
+	var rawStream beep.Streamer
 	var closer func()
 	if hasAudio {
 		s := newAudioStreamer(vp.filename)
-		audioStream = s
+		rawStream = s
 		closer = func() { s.Close() }
 	} else {
 		s := &noopAudioStreamer{}
-		audioStream = s
+		rawStream = s
 		closer = func() { s.Close() }
 	}
 
-	// 初始化 speaker 并播放音频
+	vp.volumeStreamer = &effects.Volume{Streamer: rawStream, Base: 2, Volume: 0}
+
 	speakerInitialized := false
 	err := speaker.Init(beep.SampleRate(audioSampleRate), audioSampleRate/10)
 	if err == nil {
 		speakerInitialized = true
-		speaker.Play(beep.Seq(audioStream, beep.Callback(func() {})))
+		speaker.Play(beep.Seq(vp.volumeStreamer, beep.Callback(func() {})))
 	}
 
 	// 帧计数和当前播放时间（用于 resize seek）
@@ -847,7 +931,12 @@ func (vp *VideoPlayer) startLoop() {
 				vp.cleanupFrame()
 				return
 			}
-			if key == 'k' && vp.proto == timage.ProtocolSixel {
+			if key == ' ' {
+				vp.paused = !vp.paused
+				continue
+			}
+			if key == 'w' || key == 'k' {
+				vp.colorDisplayTimer = 10
 				levels := []int{2, 8, 16, 32, 64, 128, 256}
 				for _, lvl := range levels {
 					if lvl > vp.colorCount {
@@ -858,7 +947,8 @@ func (vp *VideoPlayer) startLoop() {
 				}
 				continue
 			}
-			if key == 'j' && vp.proto == timage.ProtocolSixel {
+			if key == 's' || key == 'j' {
+				vp.colorDisplayTimer = 10
 				levels := []int{2, 8, 16, 32, 64, 128, 256}
 				for i := len(levels) - 1; i >= 0; i-- {
 					if levels[i] < vp.colorCount {
@@ -866,6 +956,32 @@ func (vp *VideoPlayer) startLoop() {
 						vp.sixelCache = nil
 						break
 					}
+				}
+				continue
+			}
+			if key == 0x80 {
+				vp.volumeDisplayTimer = 10
+				vp.currentVolume = min(vp.currentVolume+0.05, 1.0)
+				if vp.volumeStreamer != nil {
+					speaker.Lock()
+					vp.volumeStreamer.Volume = math.Log2(vp.currentVolume)
+					if vp.currentVolume == 0 {
+						vp.volumeStreamer.Volume = -10
+					}
+					speaker.Unlock()
+				}
+				continue
+			}
+			if key == 0x81 {
+				vp.volumeDisplayTimer = 10
+				vp.currentVolume = max(vp.currentVolume-0.05, 0.0)
+				if vp.volumeStreamer != nil {
+					speaker.Lock()
+					vp.volumeStreamer.Volume = math.Log2(vp.currentVolume)
+					if vp.currentVolume == 0 {
+						vp.volumeStreamer.Volume = -10
+					}
+					speaker.Unlock()
 				}
 				continue
 			}
@@ -880,11 +996,35 @@ func (vp *VideoPlayer) startLoop() {
 			}
 		}
 
+		if vp.paused {
+			vp.lastFrame = renderFrame
+			pauseStart := time.Now()
+			if speakerInitialized {
+				speaker.Lock()
+			}
+			vp.pausedLoop(frameCh, keyCh, sigCh, resizeTimer, closer, speakerInitialized, currentDec, nextDec)
+			if speakerInitialized {
+				speaker.Unlock()
+			}
+			playbackStart = playbackStart.Add(time.Since(pauseStart))
+			continue
+		}
+
+		vp.lastFrame = renderFrame
 		frameCount++
+
+		if vp.volumeDisplayTimer > 0 {
+			vp.volumeDisplayTimer--
+		}
+		if vp.colorDisplayTimer > 0 {
+			vp.colorDisplayTimer--
+		}
 
 		vp.updateFPS()
 
-		// A/V 同步：落后音频则跳帧（不渲染）
+		vp.currentFrame = frameCount
+
+		// A/V sync: drop frames if behind audio
 		syncLoop:
 		for {
 			expectedTime := playbackStart.Add(time.Duration(float64(frameCount)) * vp.frameTime)
@@ -909,7 +1049,6 @@ func (vp *VideoPlayer) startLoop() {
 
 		vp.renderSixelFrame(renderFrame)
 
-		// 如果超前于音频，等待到正确的展示时间再渲染
 		expectedTime := playbackStart.Add(time.Duration(float64(frameCount)) * vp.frameTime)
 		if remaining := time.Until(expectedTime); remaining > 0 {
 			time.Sleep(remaining)
@@ -918,6 +1057,99 @@ func (vp *VideoPlayer) startLoop() {
 }
 
 // updateTerminalSizeFromSigwinch 从系统获取当前终端尺寸并更新
+func (vp *VideoPlayer) pausedLoop(frameCh chan []byte, keyCh chan byte, sigCh chan os.Signal, resizeTimer *time.Timer, closer func(), speakerInitialized bool, currentDec, nextDec *videoDecoder) {
+
+drainLoop:
+	for {
+		select {
+		case f := <-frameCh:
+			vp.lastFrame = f
+		default:
+			break drainLoop
+		}
+	}
+
+	for {
+		vp.renderSixelFrame(vp.lastFrame)
+
+		select {
+		case <-vp.quit:
+			return
+		case <-sigCh:
+			continue
+		case <-resizeTimer.C:
+			vp.updateTerminalSizeFromSigwinch()
+			fmt.Print(CLEAR_SCREEN + "\x1b[1;1H")
+			continue
+		case key, ok := <-keyCh:
+			if !ok {
+				close(vp.quit)
+				return
+			}
+			if key == 'q' || key == 'Q' || key == 27 {
+				vp.paused = false
+				close(vp.quit)
+				return
+			}
+			if key == ' ' {
+				vp.paused = false
+				return
+			}
+			if key == 'w' || key == 'k' {
+				vp.colorDisplayTimer = 10
+				levels := []int{2, 8, 16, 32, 64, 128, 256}
+				for _, lvl := range levels {
+					if lvl > vp.colorCount {
+						vp.colorCount = lvl
+						vp.sixelCache = nil
+						break
+					}
+				}
+				continue
+			}
+			if key == 's' || key == 'j' {
+				vp.colorDisplayTimer = 10
+				levels := []int{2, 8, 16, 32, 64, 128, 256}
+				for i := len(levels) - 1; i >= 0; i-- {
+					if levels[i] < vp.colorCount {
+						vp.colorCount = levels[i]
+						vp.sixelCache = nil
+						break
+					}
+				}
+				continue
+			}
+			if key == 0x80 {
+				vp.volumeDisplayTimer = 10
+				vp.currentVolume = min(vp.currentVolume+0.05, 1.0)
+				if vp.volumeStreamer != nil {
+					speaker.Lock()
+					vp.volumeStreamer.Volume = math.Log2(vp.currentVolume)
+					if vp.currentVolume == 0 {
+						vp.volumeStreamer.Volume = -10
+					}
+					speaker.Unlock()
+				}
+				continue
+			}
+			if key == 0x81 {
+				vp.volumeDisplayTimer = 10
+				vp.currentVolume = max(vp.currentVolume-0.05, 0.0)
+				if vp.volumeStreamer != nil {
+					speaker.Lock()
+					vp.volumeStreamer.Volume = math.Log2(vp.currentVolume)
+					if vp.currentVolume == 0 {
+						vp.volumeStreamer.Volume = -10
+					}
+					speaker.Unlock()
+				}
+				continue
+			}
+		case <-time.After(33 * time.Millisecond):
+		}
+	}
+}
+
 func (vp *VideoPlayer) updateTerminalSizeFromSigwinch() {
 	newSize, err := getTerminalSize()
 	if err != nil {
@@ -931,7 +1163,7 @@ func (vp *VideoPlayer) updateTerminalSizeFromSigwinch() {
 func hasAudioStream(filename string) bool {
 	probeData, err := ffmpeg.Probe(filename)
 	if err != nil {
-		// 无法探测，默认有音频（安全处理）
+		// cannot probe, assume has audio (safe default)
 		return true
 	}
 
@@ -989,13 +1221,14 @@ func playVideo(filename string, proto timage.Protocol) error {
 	player := NewVideoPlayer(filename, info.Width, info.Height, termSize.Width, termSize.Height)
 	player.fps = info.FPS
 	player.frameTime = time.Duration(float64(time.Second) / info.FPS)
+	player.totalFrames = info.TotalFrames
 	player.proto = proto
 	player.colorCount = 64
 	player.initProto()
 
 	oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
 	if err != nil {
-		return fmt.Errorf("无法设置 raw 模式: %v", err)
+		return fmt.Errorf("cannot set raw mode: %v", err)
 	}
 	defer term.Restore(int(os.Stdin.Fd()), oldState)
 
@@ -1031,7 +1264,7 @@ func initVideoPlayback(filename string, proto timage.Protocol) {
 		fmt.Print(ENABLE_MOUSE)
 		fmt.Print(SHOW_CURSOR)
 		fmt.Print(LEAVE_ALTERNATE)
-		fmt.Fprintf(os.Stderr, "错误: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }

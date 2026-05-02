@@ -42,6 +42,10 @@ const (
 	CLEAR_SCROLLBACK = "\033[3J"
 	DISABLE_MOUSE    = "\033[?1000l\033[?1002l\033[?1003l"
 	ENABLE_MOUSE     = "\033[?1000h\033[?1002h\033[?1003h"
+
+	DefaultSeekSeconds     = 5
+	DefaultImageAutoSwitch = 2
+	DefaultVideoColors     = 64
 )
 
 func clearScreen()                 { fmt.Print(CLEAR_SCREEN + CURSOR_HOME) }
@@ -73,7 +77,7 @@ type ColorData struct {
 func loadImage(filename string) (*ColorData, error) {
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, fmt.Errorf("无法打开文件: %v", err)
+		return nil, fmt.Errorf("cannot open file: %v", err)
 	}
 	defer file.Close()
 
