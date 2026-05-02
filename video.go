@@ -222,6 +222,7 @@ type VideoPlayer struct {
 	paused              bool
 	totalFrames         int
 	currentFrame        int64
+	resumeSeekSecs      float64
 	currentVolume       float64
 	volumeDisplayTimer  int
 	colorDisplayTimer   int
@@ -750,7 +751,6 @@ func (vp *VideoPlayer) startLoop() {
 		}
 	}()
 
-	frameSize := vp.outWidth * vp.outHeight * 4
 	hasAudio := hasAudioStream(vp.filename)
 
 	var rawStream beep.Streamer
@@ -805,7 +805,7 @@ func (vp *VideoPlayer) startLoop() {
 				continue
 			default:
 			}
-			fs := frameSize
+			fs := vp.outWidth * vp.outHeight * 4
 			if cap(vp.frameBuf) < fs {
 				vp.frameBuf = make([]byte, fs)
 			}
@@ -813,7 +813,7 @@ func (vp *VideoPlayer) startLoop() {
 			if err != nil || n != fs {
 				cd.close()
 				cd = nd
-				nd = vp.spawnVideoDecoder(0)
+				nd = vp.spawnVideoDecoder(vp.resumeSeekSecs)
 				continue
 			}
 			fc := make([]byte, fs)
@@ -878,7 +878,6 @@ func (vp *VideoPlayer) startLoop() {
 			// 更新终端尺寸
 			vp.updateTerminalSizeFromSigwinch()
 			// 重新计算 frameSize
-			frameSize = vp.outWidth * vp.outHeight * 4
 
 			// 从 seekTime 处启动新的解码器
 			newCurrent := vp.spawnVideoDecoder(seekTime)
@@ -994,6 +993,10 @@ func (vp *VideoPlayer) startLoop() {
 				vp.cleanupFrame()
 				return
 			}
+			expectedSize := vp.outWidth * vp.outHeight * 4
+			if len(renderFrame) != expectedSize {
+				continue
+			}
 		}
 
 		if vp.paused {
@@ -1002,7 +1005,7 @@ func (vp *VideoPlayer) startLoop() {
 			if speakerInitialized {
 				speaker.Lock()
 			}
-			vp.pausedLoop(frameCh, keyCh, sigCh, resizeTimer, closer, speakerInitialized, currentDec, nextDec)
+			vp.pausedLoop(frameCh, keyCh, sigCh, resizeTimer, closer, speakerInitialized, currentDec, nextDec, decSwitchCh)
 			if speakerInitialized {
 				speaker.Unlock()
 			}
@@ -1023,6 +1026,7 @@ func (vp *VideoPlayer) startLoop() {
 		vp.updateFPS()
 
 		vp.currentFrame = frameCount
+		vp.resumeSeekSecs = float64(frameCount) / vp.fps
 
 		// A/V sync: drop frames if behind audio
 		syncLoop:
@@ -1041,6 +1045,9 @@ func (vp *VideoPlayer) startLoop() {
 					vp.cleanupFrame()
 					return
 				}
+				if len(renderFrame) != vp.outWidth*vp.outHeight*4 {
+					continue
+				}
 			default:
 				break syncLoop
 			}
@@ -1057,7 +1064,10 @@ func (vp *VideoPlayer) startLoop() {
 }
 
 // updateTerminalSizeFromSigwinch 从系统获取当前终端尺寸并更新
-func (vp *VideoPlayer) pausedLoop(frameCh chan []byte, keyCh chan byte, sigCh chan os.Signal, resizeTimer *time.Timer, closer func(), speakerInitialized bool, currentDec, nextDec *videoDecoder) {
+func (vp *VideoPlayer) pausedLoop(frameCh chan []byte, keyCh chan byte, sigCh chan os.Signal, resizeTimer *time.Timer, closer func(), speakerInitialized bool, currentDec, nextDec *videoDecoder, decSwitchCh chan struct {
+		current *videoDecoder
+		next    *videoDecoder
+	}) {
 
 drainLoop:
 	for {
@@ -1075,11 +1085,13 @@ drainLoop:
 		select {
 		case <-vp.quit:
 			return
-		case <-sigCh:
+		case sig := <-sigCh:
+			if sig == syscall.SIGWINCH {
+				vp.pausedResize(frameCh, currentDec, nextDec, decSwitchCh)
+			}
 			continue
 		case <-resizeTimer.C:
-			vp.updateTerminalSizeFromSigwinch()
-			fmt.Print(CLEAR_SCREEN + "\x1b[1;1H")
+			vp.pausedResize(frameCh, currentDec, nextDec, decSwitchCh)
 			continue
 		case key, ok := <-keyCh:
 			if !ok {
@@ -1150,12 +1162,77 @@ drainLoop:
 	}
 }
 
+func (vp *VideoPlayer) pausedResize(frameCh chan []byte, currentDec, nextDec *videoDecoder, decSwitchCh chan struct {
+		current *videoDecoder
+		next    *videoDecoder
+	}) {
+	oldW, oldH := vp.outWidth, vp.outHeight
+	vp.updateTerminalSizeFromSigwinch()
+
+	vp.lastFrame = rescaleRGBA(vp.lastFrame, oldW, oldH, vp.outWidth, vp.outHeight)
+	totalStrips := (vp.outHeight + 5) / 6
+	vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
+
+	newDec := vp.spawnVideoDecoder(vp.resumeSeekSecs)
+	decSwitchCh <- struct {
+		current *videoDecoder
+		next    *videoDecoder
+	}{newDec, vp.spawnVideoDecoder(vp.resumeSeekSecs)}
+
+	time.Sleep(50 * time.Millisecond)
+
+	for {
+		select {
+		case <-frameCh:
+		default:
+			goto drainDone
+		}
+	}
+drainDone:
+
+	fmt.Print(CLEAR_SCREEN + "\x1b[1;1H")
+}
+
 func (vp *VideoPlayer) updateTerminalSizeFromSigwinch() {
 	newSize, err := getTerminalSize()
 	if err != nil {
 		return
 	}
 	vp.updateTerminalSize(newSize.Width, newSize.Height)
+}
+
+func (vp *VideoPlayer) updateTerminalSizeLight() {
+	newSize, err := getTerminalSize()
+	if err != nil {
+		return
+	}
+	vp.termWidth = newSize.Width
+	vp.termHeight = newSize.Height
+	vp.startCol = (vp.termWidth - vp.charW) / 2
+	if vp.startCol < 0 {
+		vp.startCol = 0
+	}
+	vp.startRow = (vp.termHeight - vp.charH) / 2
+	if vp.startRow < 0 {
+		vp.startRow = 0
+	}
+}
+
+func rescaleRGBA(data []byte, oldW, oldH, newW, newH int) []byte {
+	if oldW == newW && oldH == newH {
+		return data
+	}
+	out := make([]byte, newW*newH*4)
+	for y := 0; y < newH; y++ {
+		srcY := y * oldH / newH
+		for x := 0; x < newW; x++ {
+			srcX := x * oldW / newW
+			srcOff := (srcY*oldW + srcX) * 4
+			dstOff := (y*newW + x) * 4
+			copy(out[dstOff:dstOff+4], data[srcOff:srcOff+4])
+		}
+	}
+	return out
 }
 
 // ==================== 音频流检测 ====================
