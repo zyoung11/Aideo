@@ -8,7 +8,7 @@ import (
 	_ "image/png"
 	"os"
 
-	timage "Aideo/image"
+	timage "aideo/image"
 )
 
 // ==================== 主函数 ====================

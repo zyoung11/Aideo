@@ -8,7 +8,7 @@ import (
 	"strings"
 	"syscall"
 
-	timage "Aideo/image"
+	timage "aideo/image"
 
 	"github.com/nfnt/resize"
 	"golang.org/x/term"

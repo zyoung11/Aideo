@@ -15,7 +15,7 @@ import (
 	"syscall"
 	"time"
 
-	timage "Aideo/image"
+	timage "aideo/image"
 
 	"github.com/gopxl/beep/v2"
 	"github.com/gopxl/beep/v2/effects"
@@ -36,9 +36,11 @@ type VideoInfo struct {
 
 // ==================== FFmpeg 路径检测 ====================
 
-var cachedFFmpegPath string
-var cachedHWAccel string
-var hwAccelOnce sync.Once
+var (
+	cachedFFmpegPath string
+	cachedHWAccel    string
+	hwAccelOnce      sync.Once
+)
 
 func detectFFmpegAndHWAccel() (ffmpegPath string, hwAccel string) {
 	hwAccelOnce.Do(func() {
@@ -202,33 +204,33 @@ type VideoPlayer struct {
 	startRow   int
 	startCol   int
 
-	proto       timage.Protocol
-	cellW       int
-	cellH       int
+	proto timage.Protocol
+	cellW int
+	cellH int
 
 	sixelBuf   bytes.Buffer
 	frameBuf   []byte
 	sixelCache *timage.SixelFrameCache
 
 	// 实时帧率统计
-	fpsAccum           int64
-	fpsAccumStart      time.Time
-	displayFPS         float64
+	fpsAccum      int64
+	fpsAccumStart time.Time
+	displayFPS    float64
 
 	// 自适应颜色
 	colorCount int
 
 	// 播放控制
-	paused              bool
-	totalFrames         int
-	currentFrame        int64
-	resumeSeekSecs      float64
-	currentVolume       float64
-	volumeDisplayTimer  int
-	colorDisplayTimer   int
-	seekSeconds         int
-	lastFrame           []byte
-	volumeStreamer      *effects.Volume
+	paused             bool
+	totalFrames        int
+	currentFrame       int64
+	resumeSeekSecs     float64
+	currentVolume      float64
+	volumeDisplayTimer int
+	colorDisplayTimer  int
+	seekSeconds        int
+	lastFrame          []byte
+	volumeStreamer     *effects.Volume
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -257,17 +259,25 @@ func maxVideoDim(termChars, cellPx int) int {
 
 func (vp *VideoPlayer) initProto() {
 	vp.cellW, vp.cellH = timage.CellPixels()
-	if vp.cellW < 1 { vp.cellW = 8 }
-	if vp.cellH < 1 { vp.cellH = 16 }
+	if vp.cellW < 1 {
+		vp.cellW = 8
+	}
+	if vp.cellH < 1 {
+		vp.cellH = 16
+	}
 	vp.outWidth, vp.outHeight = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, vp.termWidth, vp.termHeight, vp.cellW, vp.cellH)
 	maxPx := maxVideoDim(vp.termWidth, vp.cellW)
 	vp.outWidth, vp.outHeight = capOutputSize(vp.outWidth, vp.outHeight, maxPx)
 	vp.charW = (vp.outWidth + vp.cellW - 1) / vp.cellW
 	vp.charH = (vp.outHeight + vp.cellH - 1) / vp.cellH
 	vp.startCol = (vp.termWidth - vp.charW) / 2
-	if vp.startCol < 0 { vp.startCol = 0 }
+	if vp.startCol < 0 {
+		vp.startCol = 0
+	}
 	vp.startRow = (vp.termHeight - vp.charH) / 2
-	if vp.startRow < 0 { vp.startRow = 0 }
+	if vp.startRow < 0 {
+		vp.startRow = 0
+	}
 	totalStrips := (vp.outHeight + 5) / 6
 	vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
 }
@@ -559,8 +569,6 @@ func (n *noopAudioStreamer) Close()     {}
 
 // ==================== 播放循环 ====================
 
-
-
 func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 	vp.sixelBuf.Reset()
 	fmt.Fprintf(&vp.sixelBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
@@ -584,8 +592,6 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 	vp.renderControlBar(&vp.sixelBuf, encDur)
 	os.Stdout.Write(vp.sixelBuf.Bytes())
 }
-
-
 
 func (vp *VideoPlayer) cleanupFrame() {
 	fmt.Print("\033[2J\033[3J\033[H")
@@ -715,13 +721,25 @@ func (vp *VideoPlayer) startLoop() {
 					term := buf[i+2]
 					switch term {
 					case 'A':
-						select { case keyCh <- 0x80: default: }
+						select {
+						case keyCh <- 0x80:
+						default:
+						}
 					case 'B':
-						select { case keyCh <- 0x81: default: }
+						select {
+						case keyCh <- 0x81:
+						default:
+						}
 					case 'C':
-						select { case keyCh <- 0x82: default: }
+						select {
+						case keyCh <- 0x82:
+						default:
+						}
 					case 'D':
-						select { case keyCh <- 0x83: default: }
+						select {
+						case keyCh <- 0x83:
+						default:
+						}
 					}
 					i += 2
 					continue
@@ -897,7 +915,7 @@ func (vp *VideoPlayer) startLoop() {
 			}
 			renderFrame = nil
 
-			drainLoop:
+		drainLoop:
 			for {
 				select {
 				case <-frameCh:
@@ -1029,7 +1047,7 @@ func (vp *VideoPlayer) startLoop() {
 		vp.resumeSeekSecs = float64(frameCount) / vp.fps
 
 		// A/V sync: drop frames if behind audio
-		syncLoop:
+	syncLoop:
 		for {
 			expectedTime := playbackStart.Add(time.Duration(float64(frameCount)) * vp.frameTime)
 			if time.Since(expectedTime) <= vp.frameTime/2 {
@@ -1065,10 +1083,10 @@ func (vp *VideoPlayer) startLoop() {
 
 // updateTerminalSizeFromSigwinch 从系统获取当前终端尺寸并更新
 func (vp *VideoPlayer) pausedLoop(frameCh chan []byte, keyCh chan byte, sigCh chan os.Signal, resizeTimer *time.Timer, closer func(), speakerInitialized bool, currentDec, nextDec *videoDecoder, decSwitchCh chan struct {
-		current *videoDecoder
-		next    *videoDecoder
-	}) {
-
+	current *videoDecoder
+	next    *videoDecoder
+},
+) {
 drainLoop:
 	for {
 		select {
@@ -1163,9 +1181,10 @@ drainLoop:
 }
 
 func (vp *VideoPlayer) pausedResize(frameCh chan []byte, currentDec, nextDec *videoDecoder, decSwitchCh chan struct {
-		current *videoDecoder
-		next    *videoDecoder
-	}) {
+	current *videoDecoder
+	next    *videoDecoder
+},
+) {
 	oldW, oldH := vp.outWidth, vp.outHeight
 	vp.updateTerminalSizeFromSigwinch()
 
