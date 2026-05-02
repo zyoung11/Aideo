@@ -657,9 +657,14 @@ func (vp *VideoPlayer) renderControlBar(buf *bytes.Buffer, encDur time.Duration)
 		barWidth = 4
 	}
 
+	// 使用帧计数模总帧数，支持循环后进度条重新开始
+	displayFrame := vp.currentFrame
+	if vp.totalFrames > 0 {
+		displayFrame = vp.currentFrame % int64(vp.totalFrames)
+	}
 	progress := 0.0
 	if vp.totalFrames > 0 {
-		progress = float64(vp.currentFrame) / float64(vp.totalFrames)
+		progress = float64(displayFrame) / float64(vp.totalFrames)
 	}
 	if progress > 1.0 {
 		progress = 1.0
@@ -831,7 +836,15 @@ func (vp *VideoPlayer) startLoop() {
 			if err != nil || n != fs {
 				cd.close()
 				cd = nd
-				nd = vp.spawnVideoDecoder(vp.resumeSeekSecs)
+				// 循环播放：seek 时间取模视频时长，确保进度条归零后解码器从头开始
+				seekTime := vp.resumeSeekSecs
+				if vp.totalFrames > 0 && vp.fps > 0 {
+					duration := float64(vp.totalFrames) / vp.fps
+					if duration > 0 {
+						seekTime = math.Mod(seekTime, duration)
+					}
+				}
+				nd = vp.spawnVideoDecoder(seekTime)
 				continue
 			}
 			fc := make([]byte, fs)
