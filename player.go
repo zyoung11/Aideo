@@ -155,8 +155,8 @@ func renderImageProtocol(filePath string, protocol timage.Protocol) {
 		timage.EncodeKittyFrame(os.Stdout, scaled, imageCols, imageRows)
 	default:
 		scaledRGBA := image.NewRGBA(scaled.Bounds())
-		for y := 0; y < finalH; y++ {
-			for x := 0; x < finalW; x++ {
+		for y := range finalH {
+			for x := range finalW {
 				scaledRGBA.Set(x, y, scaled.At(x, y))
 			}
 		}

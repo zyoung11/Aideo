@@ -107,8 +107,8 @@ func loadImage(filename string) (*ColorData, error) {
 
 	nrgbaModel := color.NRGBAModel
 
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
+	for y := range height {
+		for x := range width {
 			c := nrgbaModel.Convert(img.At(x, y)).(color.NRGBA)
 			idx := y*width + x
 
@@ -142,8 +142,8 @@ func resizeImageBilinear(src *ColorData, newWidth, newHeight int) *ColorData {
 	scaleX := float64(src.Width-1) / float64(newWidth-1)
 	scaleY := float64(src.Height-1) / float64(newHeight-1)
 
-	for y := 0; y < newHeight; y++ {
-		for x := 0; x < newWidth; x++ {
+	for y := range newHeight {
+		for x := range newWidth {
 			srcX := float64(x) * scaleX
 			srcY := float64(y) * scaleY
 
@@ -213,8 +213,8 @@ var brailleDotMasks = [4][2]uint8{
 
 func getBrailleChar(dots [4][2]bool) rune {
 	var mask uint8
-	for r := 0; r < 4; r++ {
-		for c := 0; c < 2; c++ {
+	for r := range 4 {
+		for c := range 2 {
 			if dots[r][c] {
 				mask |= brailleDotMasks[r][c]
 			}
@@ -246,7 +246,7 @@ func NewBrailleRenderer(charWidth, charHeight int) *BrailleRenderer {
 
 // sortFloat8 对 8 个 float64 做原地排序（冒泡，避免 import sort）
 func sortFloat8(a *[8]float64) {
-	for i := 0; i < 7; i++ {
+	for i := range 7 {
 		for j := i + 1; j < 8; j++ {
 			if a[j] < a[i] {
 				a[i], a[j] = a[j], a[i]
@@ -265,8 +265,8 @@ func (r *BrailleRenderer) Render(imgData *ColorData, exposure, attenuation float
 			var bs [8]uint8
 
 			// 收集 2×4 像素块
-			for dy := 0; dy < 4; dy++ {
-				for dx := 0; dx < 2; dx++ {
+			for dy := range 4 {
+				for dx := range 2 {
 					px := cx*2 + dx
 					py := cy*4 + dy
 
@@ -297,8 +297,8 @@ func (r *BrailleRenderer) Render(imgData *ColorData, exposure, attenuation float
 			var fgR, fgG, fgB, bgR, bgG, bgB float64
 			var fgN, bgN int
 
-			for dy := 0; dy < 4; dy++ {
-				for dx := 0; dx < 2; dx++ {
+			for dy := range 4 {
+				for dx := range 2 {
 					li := dy*2 + dx
 					if lums[li] > median {
 						dots[dy][dx] = true

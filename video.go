@@ -161,8 +161,8 @@ func rawRGBAToColorData(raw []byte, width, height int) *ColorData {
 	g := make([]uint8, total)
 	b := make([]uint8, total)
 
-	for y := 0; y < height; y++ {
-		for x := 0; x < width; x++ {
+	for y := range height {
+		for x := range width {
 			idx := y*width + x
 			offset := idx * 4
 			pr := raw[offset]
@@ -250,10 +250,7 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 // maxVideoDim 根据终端字符尺寸和单元格像素计算视频输出分辨率上限
 // 目标：填满整个终端，不做分辨率压缩
 func maxVideoDim(termChars, cellPx int) int {
-	maxPx := (termChars - 2) * cellPx
-	if maxPx < 320 {
-		maxPx = 320
-	}
+	maxPx := max((termChars-2)*cellPx, 320)
 	return maxPx
 }
 
@@ -270,14 +267,8 @@ func (vp *VideoPlayer) initProto() {
 	vp.outWidth, vp.outHeight = capOutputSize(vp.outWidth, vp.outHeight, maxPx)
 	vp.charW = (vp.outWidth + vp.cellW - 1) / vp.cellW
 	vp.charH = (vp.outHeight + vp.cellH - 1) / vp.cellH
-	vp.startCol = (vp.termWidth - vp.charW) / 2
-	if vp.startCol < 0 {
-		vp.startCol = 0
-	}
-	vp.startRow = (vp.termHeight - vp.charH) / 2
-	if vp.startRow < 0 {
-		vp.startRow = 0
-	}
+	vp.startCol = max((vp.termWidth-vp.charW)/2, 0)
+	vp.startRow = max((vp.termHeight-vp.charH)/2, 0)
 	totalStrips := (vp.outHeight + 5) / 6
 	vp.sixelCache = timage.NewSixelFrameCache(totalStrips)
 }
@@ -636,10 +627,7 @@ func (vp *VideoPlayer) renderControlBar(buf *bytes.Buffer, encDur time.Duration)
 
 	infoCenter := fmt.Sprintf("[ %dx%d | %.1ffps | %dc ]", vp.outWidth, vp.outHeight, vp.displayFPS, vp.colorCount)
 	infoW := displayWidth(infoCenter)
-	infoX := (w - infoW) / 2
-	if infoX < 1 {
-		infoX = 1
-	}
+	infoX := max((w-infoW)/2, 1)
 	buf.WriteString(fmt.Sprintf("\033[%d;%dH\033[90m%s\033[0m", infoRow, infoX, infoCenter))
 
 	buf.WriteString(fmt.Sprintf("\033[%d;1H\033[K", barRow))
@@ -652,10 +640,7 @@ func (vp *VideoPlayer) renderControlBar(buf *bytes.Buffer, encDur time.Duration)
 
 	modeIcon := "⟳"
 	modeW := displayWidth(modeIcon)
-	barWidth := w - 5 - modeW
-	if barWidth < 4 {
-		barWidth = 4
-	}
+	barWidth := max(w-5-modeW, 4)
 
 	// 使用帧计数模总帧数，支持循环后进度条重新开始
 	displayFrame := vp.currentFrame
@@ -672,7 +657,7 @@ func (vp *VideoPlayer) renderControlBar(buf *bytes.Buffer, encDur time.Duration)
 	playedChars := int(float64(barWidth) * progress)
 
 	buf.WriteString("\033[2m")
-	for i := 0; i < playedChars; i++ {
+	for range playedChars {
 		buf.WriteString("━")
 	}
 	buf.WriteString("\033[0m\033[0m")
@@ -918,14 +903,8 @@ func (vp *VideoPlayer) startLoop() {
 				next    *videoDecoder
 			}{newCurrent, newNext}
 
-			seekFrame := int64(seekTime * vp.fps)
-			if seekFrame < 0 {
-				seekFrame = 0
-			}
-			frameCount = int64(seekTime * vp.fps)
-			if frameCount < 0 {
-				frameCount = 0
-			}
+			// seekFrame := max(int64(seekTime*vp.fps), 0)
+			frameCount = max(int64(seekTime*vp.fps), 0)
 			renderFrame = nil
 
 		drainLoop:
@@ -1240,14 +1219,8 @@ func (vp *VideoPlayer) updateTerminalSizeLight() {
 	}
 	vp.termWidth = newSize.Width
 	vp.termHeight = newSize.Height
-	vp.startCol = (vp.termWidth - vp.charW) / 2
-	if vp.startCol < 0 {
-		vp.startCol = 0
-	}
-	vp.startRow = (vp.termHeight - vp.charH) / 2
-	if vp.startRow < 0 {
-		vp.startRow = 0
-	}
+	vp.startCol = max((vp.termWidth-vp.charW)/2, 0)
+	vp.startRow = max((vp.termHeight-vp.charH)/2, 0)
 }
 
 func rescaleRGBA(data []byte, oldW, oldH, newW, newH int) []byte {
@@ -1255,9 +1228,9 @@ func rescaleRGBA(data []byte, oldW, oldH, newW, newH int) []byte {
 		return data
 	}
 	out := make([]byte, newW*newH*4)
-	for y := 0; y < newH; y++ {
+	for y := range newH {
 		srcY := y * oldH / newH
-		for x := 0; x < newW; x++ {
+		for x := range newW {
 			srcX := x * oldW / newW
 			srcOff := (srcY*oldW + srcX) * 4
 			dstOff := (y*newW + x) * 4
