@@ -124,14 +124,11 @@ AVCodec        :: struct{}
 AVInputFormat  :: struct{}
 
 foreign import libav {
-	"ffstatic/libavformat.a",
-	"ffstatic/libavcodec.a",
-	"ffstatic/libswscale.a",
-	"ffstatic/libswresample.a",
-	"ffstatic/libavutil.a",
-	"system:z",
-	"system:m",
-	"system:pthread",
+	"system:libavformat.so",
+	"system:libavcodec.so",
+	"system:libavutil.so",
+	"system:libswscale.so",
+	"system:libswresample.so",
 }
 
 foreign libav {
