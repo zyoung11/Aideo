@@ -5,10 +5,12 @@ import "core:fmt"
 import "core:os"
 import "core:time"
 import "core:sync"
+import "core:thread"
 
 COLOR_LEVELS := [7]int{2, 8, 16, 32, 64, 128, 256}
 
 main :: proc() {
+	defer prof_report()
 	if len(os.args) >= 2 && os.args[1] == "citest" { ci_test(); return }
 	if len(os.args) >= 2 && os.args[1] == "cibench" { ci_bench(); return }
 	if len(os.args) < 2 {
@@ -64,7 +66,7 @@ main :: proc() {
 	out := Buffer{}
 	buffer_init(&out, out_w * out_h / 2)
 	pool: StripPool
-	strip_pool_init(&pool, cpu_count())
+	strip_pool_init(&pool, 4)
 	defer strip_pool_stop(&pool)
 	pending: FrameMsg
 	have_pending := false
@@ -72,7 +74,11 @@ main :: proc() {
 	start_row := 1
 
 	quit := false
+	_last_frame_t := time.now()
 	for !quit {
+		_loop_t := time.now()
+		prof_add(PROF_FRAME_GAP, i64(time.since(_last_frame_t)))
+		_last_frame_t = _loop_t
 		for {
 			k, ok := key_pop()
 			if !ok {

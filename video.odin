@@ -2,6 +2,7 @@ package aideo
 
 import "core:c"
 import "core:sync"
+import "core:time"
 import "core:thread"
 
 FrameMsg :: struct {
@@ -156,7 +157,12 @@ video_open :: proc(path: cstring) -> ^VideoStream {
 		avformat_close_input(&fmt_ctx)
 		return nil
 	}
-	av_opt_set(codec_ctx, "threads", "0", 0)
+	codec_name := string(avcodec_get_name(par.codec_id))
+	if codec_name == "libdav1d" || codec_name == "av1" {
+		av_opt_set(codec_ctx, "threads", "0", 0)
+	} else {
+		av_opt_set(codec_ctx, "threads", "2", 0)
+	}
 	if avcodec_open2(codec_ctx, codec, nil) < 0 {
 		avcodec_free_context(&codec_ctx)
 		avformat_close_input(&fmt_ctx)
@@ -220,7 +226,9 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			continue
 		}
 
+		_t0 := time.now()
 		res := av_read_frame(vs.fmt_ctx, vs.pkt)
+		prof_add(PROF_DECODE_READ, i64(time.since(_t0)))
 		if res == AVERROR_EOF {
 			av_seek_frame(vs.fmt_ctx, c.int(vs.stream_idx), 0, AVSEEK_FLAG_BACKWARD)
 			avcodec_flush_buffers(vs.codec_ctx)
@@ -235,6 +243,7 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			av_packet_unref(vs.pkt)
 			continue
 		}
+		_t1 := time.now()
 		if avcodec_send_packet(vs.codec_ctx, vs.pkt) < 0 {
 			av_packet_unref(vs.pkt)
 			continue
@@ -257,9 +266,12 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			out_w, out_h := vp.out_w, vp.out_h
 			dst_data: [1][^]u8
 			dst_data[0] = ([^]u8)(&buf[0])
+			prof_add(PROF_DECODE_RECV, i64(time.since(_t1)))
+			_t2 := time.now()
 			dst_stride: [1]c.int
 			dst_stride[0] = c.int(out_w * 4)
 			sws_scale(vs.sws, &vs.frame.data[0], &vs.frame.linesize[0], 0, vs.frame.height, &dst_data[0], &dst_stride[0])
+			prof_add(PROF_DECODE_SWS, i64(time.since(_t2)))
 
 			pts_ns := sync.atomic_load(&vp.loop_offset)
 			if vs.frame.pts != min(i64) {

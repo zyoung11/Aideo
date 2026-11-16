@@ -160,6 +160,7 @@ foreign libav {
 	av_frame_unref :: proc(frame: ^AVFrame) ---
 
 	av_log_set_level :: proc(level: c.int) ---
+	avcodec_get_name :: proc(id: c.int) -> cstring ---
 	av_opt_set :: proc(obj: rawptr, name: cstring, val: cstring, search_flags: c.int) -> c.int ---
 	avcodec_flush_buffers :: proc(avctx: ^AVCodecContext) ---
 	av_channel_layout_default :: proc(ch_layout: ^AVChannelLayout, nb_channels: c.int) ---

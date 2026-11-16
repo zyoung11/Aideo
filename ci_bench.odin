@@ -1,11 +1,19 @@
 package aideo
 
 import "core:fmt"
+import "core:os"
+import "core:strconv"
 import "core:time"
 
 ci_bench :: proc() {
-	p := get_palette(64)
-	w, h := 1280, 720
+	w, h, colors := 1280, 720, 64
+	if len(os.args) >= 5 {
+		v1, _ := strconv.parse_int(os.args[2])
+		v2, _ := strconv.parse_int(os.args[3])
+		v3, _ := strconv.parse_int(os.args[4])
+		w, h, colors = int(v1), int(v2), int(v3)
+	}
+	p := get_palette(colors)
 	rgba := make([]u8, w * h * 4)
 	for i in 0..<w * h {
 		rgba[i*4+0] = u8(i % 256)

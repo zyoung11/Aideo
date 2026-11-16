@@ -1,6 +1,7 @@
 package aideo
 
 import "core:sync"
+import "core:time"
 import "core:thread"
 import x86 "core:simd/x86"
 
@@ -338,6 +339,8 @@ StripState :: struct {
 	buf:        []u8,
 	seen:       []u16,
 	dirty:      [dynamic]int,
+	min_x:      [256]i32,
+	max_x:      [256]i32,
 	epoch:      u16,
 	pixel_hash: u64,
 }
@@ -356,10 +359,30 @@ strip_state_reset :: proc(st: ^StripState, strip_cap, nc: int) {
 		}
 		st.epoch = 1
 	}
+	for i in 0..<256 {
+		st.min_x[i] = 1 << 30
+		st.max_x[i] = -1
+	}
 	for i in 0..<strip_cap {
 		st.buf[i] = 0
 	}
 	clear(&st.dirty)
+}
+
+emit_run :: proc(out: ^Buffer, ch: u8, count_in: int) {
+	count := count_in
+	for count > 0 {
+		c := count
+		if c > 255 {
+			c = 255
+		}
+		if c > 1 {
+			write_byte(out, 0x21)
+			write_sixel_num(out, c)
+		}
+		write_byte(out, ch + 63)
+		count -= c
+	}
 }
 
 write_sixel_num :: proc(b: ^Buffer, n: int) {
@@ -385,29 +408,50 @@ encode_strip :: proc(out: ^Buffer, st: ^StripState, sixel_row, width: int) {
 	for c in st.dirty {
 		base := c * width
 		row := st.buf[base:base+width]
+		x0 := int(st.min_x[c])
+		x1 := int(st.max_x[c])
+
 		write_byte(out, 0x24)
 		write_byte(out, 0x23)
 		write_sixel_num(out, c + 1)
-		last_ch: u8 = 0
+
+		if x0 > 0 {
+			emit_run(out, 0, x0)
+		}
+
+		last_ch: u8 = row[x0]
 		run_count := 0
-		for x := 0; x <= width; x += 1 {
-			ch: u8 = 0xff
-			if x < width {
-				ch = row[x]
-			}
-			if ch != last_ch || run_count == 255 {
-				if run_count > 0 {
-					if run_count > 1 {
-						write_byte(out, 0x21)
-						write_sixel_num(out, run_count)
-					}
-					write_byte(out, last_ch + 63)
-				}
-				last_ch = ch
-				run_count = 1
-			} else {
+		x := x0
+		spread := u64(last_ch) * 0x0101010101010101
+		for x <= x1 {
+			ch := row[x]
+			if ch == last_ch {
 				run_count += 1
+				x += 1
+				for run_count <= 247 && x + 8 <= x1 + 1 {
+					v := (^u64)(&row[x])^
+					if v != spread {
+						break
+					}
+					run_count += 8
+					x += 8
+				}
+				if run_count > 255 {
+					emit_run(out, last_ch, 255)
+					run_count -= 255
+				}
+				continue
 			}
+			emit_run(out, last_ch, run_count)
+			last_ch = ch
+			spread = u64(last_ch) * 0x0101010101010101
+			run_count = 1
+			x += 1
+		}
+		emit_run(out, last_ch, run_count)
+
+		if x1 < width - 1 {
+			emit_run(out, 0, width - 1 - x1)
 		}
 	}
 	clear(&st.dirty)
@@ -453,7 +497,9 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx) {
 		y_start := srow * 6
 		y_end := min(y_start + 6, ctx.height)
 		n_rows := y_end - y_start
+		_t0 := time.now()
 		p_hash := strip_pixel_hash_rgba(ctx.rgba, width, y_start, y_end)
+		prof_add(PROF_ENCODE_HASH, i64(time.since(_t0)))
 
 		if ctx.cache.hashes[srow] == p_hash && len(ctx.cache.rle[srow]) > 0 {
 			continue
@@ -461,6 +507,7 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx) {
 
 		buffer_reset(&buf)
 		strip_state_reset(&st, nc * width, nc)
+		_t1 := time.now()
 
 		row_offset := y_start * width * 4
 		for dy in 0..<n_rows {
@@ -483,11 +530,20 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx) {
 					append(&st.dirty, ci)
 				}
 				st.buf[ci*width+x] |= bit
+				if i32(x) < st.min_x[ci] {
+					st.min_x[ci] = i32(x)
+				}
+				if i32(x) > st.max_x[ci] {
+					st.max_x[ci] = i32(x)
+				}
 			}
 			row_offset += width * 4
 		}
 
+		prof_add(PROF_ENCODE_SCAT, i64(time.since(_t1)))
+		_t2 := time.now()
 		encode_strip(&buf, &st, srow, width)
+		prof_add(PROF_ENCODE_RLE, i64(time.since(_t2)))
 
 		ctx.cache.hashes[srow] = p_hash
 		clear(&ctx.cache.rle[srow])
@@ -557,6 +613,7 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 		cache = cache,
 		total_strips = total_strips,
 	}
+	_t3 := time.now()
 	sync.atomic_store(&pool.ctx.next_job, 0)
 	sync.sema_post(&pool.start, n_workers)
 	for _ in 0..<n_workers {
@@ -567,4 +624,5 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 		write_bytes(out, cache.rle[srow][:])
 	}
 	write_bytes(out, []u8{0x1b, 0x5c})
+	prof_add(PROF_ENCODE_ASM, i64(time.since(_t3)))
 }
