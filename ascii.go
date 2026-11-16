@@ -426,10 +426,9 @@ func calculateOutputSize(imgWidth, imgHeight, termWidth, termHeight int) (int, i
 	return outWidth, outHeight
 }
 
-func calculateOutputSizeCells(imgWidth, imgHeight, termWidth, termHeight, cellW, cellH int) (int, int) {
-	availCharW := termWidth - 2
-	availCharH := termHeight - 2
-
+// calculateOutputSizeCells scales the image to fit the given available cell
+// area while preserving the aspect ratio, snapping the result to whole cells.
+func calculateOutputSizeCells(imgWidth, imgHeight, availCharW, availCharH, cellW, cellH int) (int, int) {
 	availPixelW := availCharW * cellW
 	availPixelH := availCharH * cellH
 

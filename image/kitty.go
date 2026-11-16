@@ -18,27 +18,27 @@ import (
 var kittyImageID uint32 = uint32(os.Getpid()<<16) + uint32(time.Now().UnixMicro()&0xFFFF)
 
 var kittyZlibPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		w, _ := zlib.NewWriterLevel(nil, zlib.BestSpeed)
 		return w
 	},
 }
 
 var kittyCompressPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
 
 var kittyBase64Pool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, 256*1024)
 		return buf
 	},
 }
 
 var kittyRGBPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make([]byte, 512*1024)
 	},
 }
@@ -93,10 +93,7 @@ func EncodeKittyFrame(w io.Writer, img image.Image, c, r int) uint32 {
 	}
 
 	for i := 0; i < encLen; i += 4096 {
-		end := i + 4096
-		if end > encLen {
-			end = encLen
-		}
+		end := min(i+4096, encLen)
 		chunk := base64Buf[i:end]
 
 		if i == 0 {
@@ -130,7 +127,7 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 
 	blocks := len(data) / 32
 	j := 0
-	for b := 0; b < blocks; b++ {
+	for b := range blocks {
 		s := b * 32
 		rgbBuf[j] = data[s]
 		rgbBuf[j+1] = data[s+1]
@@ -207,10 +204,7 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 	const chunkSize = 524288
 	if ok {
 		for i := 0; i < encLen; i += chunkSize {
-			end := i + chunkSize
-			if end > encLen {
-				end = encLen
-			}
+			end := min(i+chunkSize, encLen)
 			chunk := base64Buf[i:end]
 			if i == 0 {
 				if i+chunkSize < encLen {
@@ -234,10 +228,7 @@ func EncodeKittyFrameRaw(w io.Writer, data []byte, pixelW, pixelH, c, r int) uin
 		}
 	} else {
 		for i := 0; i < encLen; i += chunkSize {
-			end := i + chunkSize
-			if end > encLen {
-				end = encLen
-			}
+			end := min(i+chunkSize, encLen)
 			chunk := base64Buf[i:end]
 			if i == 0 {
 				if i+chunkSize < encLen {

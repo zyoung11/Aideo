@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -231,6 +232,7 @@ type VideoPlayer struct {
 	seekSeconds        int
 	lastFrame          []byte
 	volumeStreamer     *effects.Volume
+	uiHidden           bool
 }
 
 func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHeight int) *VideoPlayer {
@@ -247,10 +249,20 @@ func NewVideoPlayer(filename string, srcWidth, srcHeight int, termWidth, termHei
 	}
 }
 
-// maxVideoDim 根据终端字符尺寸和单元格像素计算视频输出分辨率上限
-// 目标：填满整个终端，不做分辨率压缩
-func maxVideoDim(termChars, cellPx int) int {
-	maxPx := max((termChars-2)*cellPx, 320)
+// availCells returns the terminal cell area left for the video frame. While
+// the UI is visible the bottom two rows go to the control bar and one column
+// of side margin is kept; a hidden UI gives the whole terminal to the video.
+func (vp *VideoPlayer) availCells() (int, int) {
+	if vp.uiHidden {
+		return vp.termWidth, vp.termHeight
+	}
+	return vp.termWidth - 2, vp.termHeight - 2
+}
+
+// maxVideoDim 根据可用字符数和单元格像素计算视频输出分辨率上限
+// 目标：填满可用区域，不做分辨率压缩
+func maxVideoDim(availChars, cellPx int) int {
+	maxPx := max(availChars*cellPx, 320)
 	return maxPx
 }
 
@@ -262,8 +274,9 @@ func (vp *VideoPlayer) initProto() {
 	if vp.cellH < 1 {
 		vp.cellH = 16
 	}
-	vp.outWidth, vp.outHeight = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, vp.termWidth, vp.termHeight, vp.cellW, vp.cellH)
-	maxPx := maxVideoDim(vp.termWidth, vp.cellW)
+	availW, availH := vp.availCells()
+	vp.outWidth, vp.outHeight = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, availW, availH, vp.cellW, vp.cellH)
+	maxPx := maxVideoDim(availW, vp.cellW)
 	vp.outWidth, vp.outHeight = capOutputSize(vp.outWidth, vp.outHeight, maxPx)
 	vp.charW = (vp.outWidth + vp.cellW - 1) / vp.cellW
 	vp.charH = (vp.outHeight + vp.cellH - 1) / vp.cellH
@@ -279,8 +292,9 @@ func (vp *VideoPlayer) updateTerminalSize(newWidth, newHeight int) {
 	vp.termHeight = newHeight
 
 	var newOutW, newOutH int
-	newOutW, newOutH = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, newWidth, newHeight, vp.cellW, vp.cellH)
-	maxPx := maxVideoDim(newWidth, vp.cellW)
+	availW, availH := vp.availCells()
+	newOutW, newOutH = calculateOutputSizeCells(vp.srcWidth, vp.srcHeight, availW, availH, vp.cellW, vp.cellH)
+	maxPx := maxVideoDim(availW, vp.cellW)
 	newOutW, newOutH = capOutputSize(newOutW, newOutH, maxPx)
 	vp.charW = (newOutW + vp.cellW - 1) / vp.cellW
 	vp.charH = (newOutH + vp.cellH - 1) / vp.cellH
@@ -563,9 +577,7 @@ func (n *noopAudioStreamer) Close()     {}
 func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 	vp.sixelBuf.Reset()
 	fmt.Fprintf(&vp.sixelBuf, "\033[%d;%dH", vp.startRow+1, vp.startCol+1)
-	encStart := time.Now()
 	timage.EncodeSixelFrameRaw(&vp.sixelBuf, raw, vp.outWidth, vp.outHeight, vp.colorCount, false, vp.sixelCache)
-	encDur := time.Since(encStart)
 
 	// 清除图像右侧的残留区域
 	if vp.charW > 0 && vp.startCol+vp.charW <= vp.termWidth {
@@ -580,7 +592,7 @@ func (vp *VideoPlayer) renderSixelFrame(raw []byte) {
 		fmt.Fprintf(&vp.sixelBuf, "\033[%d;1H\033[J", vp.startRow+vp.charH+1)
 	}
 
-	vp.renderControlBar(&vp.sixelBuf, encDur)
+	vp.renderControlBar(&vp.sixelBuf)
 	os.Stdout.Write(vp.sixelBuf.Bytes())
 }
 
@@ -604,45 +616,58 @@ func (vp *VideoPlayer) updateFPS() {
 	}
 }
 
-func (vp *VideoPlayer) renderControlBar(buf *bytes.Buffer, encDur time.Duration) {
+// UI icons and colors matching the BM default icon set.
+const (
+	uiIconPlay      = "▶"
+	uiIconPause     = "⏸"
+	uiIconRepeatOne = "🗘"
+	uiBarFilled     = "█"
+	uiBarEmpty      = "░"
+	uiColorCode     = "\x1b[37m"
+)
+
+// renderControlBar draws the info row and the progress bar in the bottom two
+// rows in the BM style. It draws nothing while the UI is hidden.
+func (vp *VideoPlayer) renderControlBar(buf *bytes.Buffer) {
+	if vp.uiHidden {
+		return
+	}
+
 	w := vp.termWidth
 	h := vp.termHeight
 
 	infoRow := h - 2
 	barRow := h - 1
 
-	buf.WriteString(fmt.Sprintf("\033[%d;1H\033[K", infoRow))
+	modeW := displayWidth(uiIconRepeatOne)
+	barStart := 3
+	barWidth := max(w-5-modeW, 4)
+
+	fmt.Fprintf(buf, "\033[%d;1H\033[K", infoRow)
 
 	if vp.volumeDisplayTimer > 0 {
-		volPct := int(vp.currentVolume * 100)
-		volStr := fmt.Sprintf("%d%%", volPct)
-		buf.WriteString(fmt.Sprintf("\033[%d;%dH\033[0m%s", infoRow, 1, volStr))
+		volStr := fmt.Sprintf("%d%%", int(vp.currentVolume*100))
+		fmt.Fprintf(buf, "\033[%d;%dH%s%s\033[0m", infoRow, barStart, uiColorCode, volStr)
 	}
 
 	if vp.colorDisplayTimer > 0 {
 		colorStr := fmt.Sprintf("%dc", vp.colorCount)
 		colorW := displayWidth(colorStr)
-		buf.WriteString(fmt.Sprintf("\033[%d;%dH\033[0m%s", infoRow, w-colorW, colorStr))
+		fmt.Fprintf(buf, "\033[%d;%dH%s%s\033[0m", infoRow, barStart+barWidth-colorW, uiColorCode, colorStr)
 	}
 
 	infoCenter := fmt.Sprintf("[ %dx%d | %.1ffps | %dc ]", vp.outWidth, vp.outHeight, vp.displayFPS, vp.colorCount)
 	infoW := displayWidth(infoCenter)
 	infoX := max((w-infoW)/2, 1)
-	buf.WriteString(fmt.Sprintf("\033[%d;%dH\033[90m%s\033[0m", infoRow, infoX, infoCenter))
+	fmt.Fprintf(buf, "\033[%d;%dH\033[90m%s\033[0m", infoRow, infoX, infoCenter)
 
-	buf.WriteString(fmt.Sprintf("\033[%d;1H\033[K", barRow))
+	fmt.Fprintf(buf, "\033[%d;1H\033[K", barRow)
 
-	icon := "⏸"
+	icon := uiIconPause
 	if vp.paused {
-		icon = "▶"
+		icon = uiIconPlay
 	}
-	buf.WriteString(fmt.Sprintf("\033[0m%s ", icon))
 
-	modeIcon := "⟳"
-	modeW := displayWidth(modeIcon)
-	barWidth := max(w-5-modeW, 4)
-
-	// 使用帧计数模总帧数，支持循环后进度条重新开始
 	displayFrame := vp.currentFrame
 	if vp.totalFrames > 0 {
 		displayFrame = vp.currentFrame % int64(vp.totalFrames)
@@ -656,20 +681,18 @@ func (vp *VideoPlayer) renderControlBar(buf *bytes.Buffer, encDur time.Duration)
 	}
 	playedChars := int(float64(barWidth) * progress)
 
-	buf.WriteString("\033[2m")
+	fmt.Fprintf(buf, "%s%s ", uiColorCode, icon)
 	for range playedChars {
-		buf.WriteString("━")
+		buf.WriteString(uiBarFilled)
 	}
-	buf.WriteString("\033[0m\033[0m")
 	for i := playedChars; i < barWidth; i++ {
-		buf.WriteString("━")
+		buf.WriteString(uiBarEmpty)
 	}
-
-	buf.WriteString(fmt.Sprintf("\033[0m \033[90m%s\033[0m", modeIcon))
-
-	_ = encDur
+	fmt.Fprintf(buf, " %s%s\033[0m", uiColorCode, uiIconRepeatOne)
 }
 
+// displayWidth returns the terminal display width of a string, counting CJK
+// and fullwidth characters as two columns.
 func displayWidth(s string) int {
 	w := 0
 	for _, r := range s {
@@ -944,6 +967,12 @@ func (vp *VideoPlayer) startLoop() {
 				vp.paused = !vp.paused
 				continue
 			}
+			if key == 'f' {
+				vp.uiHidden = !vp.uiHidden
+				resizePending = true
+				resizeTimer.Reset(10 * time.Millisecond)
+				continue
+			}
 			if key == 'w' || key == 'k' {
 				vp.colorDisplayTimer = 10
 				levels := []int{2, 8, 16, 32, 64, 128, 256}
@@ -959,9 +988,9 @@ func (vp *VideoPlayer) startLoop() {
 			if key == 's' || key == 'j' {
 				vp.colorDisplayTimer = 10
 				levels := []int{2, 8, 16, 32, 64, 128, 256}
-				for i := len(levels) - 1; i >= 0; i-- {
-					if levels[i] < vp.colorCount {
-						vp.colorCount = levels[i]
+				for _, level := range slices.Backward(levels) {
+					if level < vp.colorCount {
+						vp.colorCount = level
 						vp.sixelCache = nil
 						break
 					}
@@ -1117,6 +1146,11 @@ drainLoop:
 				vp.paused = false
 				return
 			}
+			if key == 'f' {
+				vp.uiHidden = !vp.uiHidden
+				vp.pausedResize(frameCh, currentDec, nextDec, decSwitchCh)
+				continue
+			}
 			if key == 'w' || key == 'k' {
 				vp.colorDisplayTimer = 10
 				levels := []int{2, 8, 16, 32, 64, 128, 256}
@@ -1132,9 +1166,9 @@ drainLoop:
 			if key == 's' || key == 'j' {
 				vp.colorDisplayTimer = 10
 				levels := []int{2, 8, 16, 32, 64, 128, 256}
-				for i := len(levels) - 1; i >= 0; i-- {
-					if levels[i] < vp.colorCount {
-						vp.colorCount = levels[i]
+				for _, level := range slices.Backward(levels) {
+					if level < vp.colorCount {
+						vp.colorCount = level
 						vp.sixelCache = nil
 						break
 					}

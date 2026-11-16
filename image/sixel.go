@@ -51,9 +51,9 @@ func newSixelPalette(rBits, gBits, bBits int) *sixelPalette {
 	rShift := gBits + bBits
 
 	p := &sixelPalette{nc: nc, colors: make([]color.Color, nc)}
-	for ri := 0; ri < rLevels; ri++ {
-		for gi := 0; gi < gLevels; gi++ {
-			for bi := 0; bi < bLevels; bi++ {
+	for ri := range rLevels {
+		for gi := range gLevels {
+			for bi := range bLevels {
 				p.colors[ri<<rShift|gi<<gShift|bi] = color.RGBA{
 					uint8(ri * 255 / (rLevels - 1)),
 					uint8(gi * 255 / (gLevels - 1)),
@@ -68,8 +68,8 @@ func newSixelPalette(rBits, gBits, bBits int) *sixelPalette {
 	dG := makeDither(gLevels)
 	dB := makeDither(bLevels)
 
-	for b := 0; b < 16; b++ {
-		for v := 0; v < 256; v++ {
+	for b := range 16 {
+		for v := range 256 {
 			s := v + int(dR[b])
 			if s < 0 {
 				s = 0
@@ -106,7 +106,7 @@ func retroLevels(levels int) []uint8 {
 	case 4:
 		lv[0], lv[1], lv[2], lv[3] = 0, 105, 210, 255
 	default:
-		for i := 0; i < levels; i++ {
+		for i := range levels {
 			lv[i] = uint8(i * 255 / (levels - 1))
 		}
 	}
@@ -119,7 +119,7 @@ func retroBlueLevels(levels int) []uint8 {
 	case 2:
 		lv[0], lv[1] = 10, 150
 	default:
-		for i := 0; i < levels; i++ {
+		for i := range levels {
 			lv[i] = uint8(i * 255 / (levels - 1))
 		}
 	}
@@ -138,9 +138,9 @@ func newRetroPalette(rBits, gBits, bBits int) *sixelPalette {
 	rLv := retroLevels(rLevels)
 	gLv := retroLevels(gLevels)
 	bLv := retroBlueLevels(bLevels)
-	for ri := 0; ri < rLevels; ri++ {
-		for gi := 0; gi < gLevels; gi++ {
-			for bi := 0; bi < bLevels; bi++ {
+	for ri := range rLevels {
+		for gi := range gLevels {
+			for bi := range bLevels {
 				p.colors[ri<<rShift|gi<<gShift|bi] = color.RGBA{
 					rLv[ri], gLv[gi], bLv[bi], 255,
 				}
@@ -152,8 +152,8 @@ func newRetroPalette(rBits, gBits, bBits int) *sixelPalette {
 	dG := makeDither(gLevels)
 	dB := makeDither(bLevels)
 
-	for b := 0; b < 16; b++ {
-		for v := 0; v < 256; v++ {
+	for b := range 16 {
+		for v := range 256 {
 			s := v + int(dR[b])
 			if s < 0 {
 				s = 0
@@ -184,12 +184,12 @@ func newRetroPalette(rBits, gBits, bBits int) *sixelPalette {
 
 func newGrayPalette(levels int) *sixelPalette {
 	p := &sixelPalette{nc: levels, isGray: true, colors: make([]color.Color, levels)}
-	for i := 0; i < levels; i++ {
+	for i := range levels {
 		v := uint8(i * 255 / (levels - 1))
 		p.colors[i] = color.RGBA{v, v, v, 255}
 	}
 	step := 256 / levels
-	for b := 0; b < 16; b++ {
+	for b := range 16 {
 		p.dither[b] = int8((int(bayer4x4[b]) - 8) * step / 16)
 	}
 	return p
@@ -255,13 +255,13 @@ func EncodeSixelFrameRaw(w io.Writer, data []byte, width, height int, colors int
 }
 
 var sixelRLEBufPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return bytes.NewBuffer(make([]byte, 0, 4096))
 	},
 }
 
 var sixelStripStatePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &sixelStripState{
 			dirty: make([]int, 0, 64),
 		}
@@ -337,25 +337,16 @@ type stripResult struct {
 func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixelPalette, cache *SixelFrameCache) error {
 	nc := pal.nc
 	totalSixelRows := (height + 5) / 6
-	workers := runtime.NumCPU()
-	if workers > totalSixelRows {
-		workers = totalSixelRows
-	}
-	if workers < 1 {
-		workers = 1
-	}
+	workers := max(min(runtime.NumCPU(), totalSixelRows), 1)
 
-	estSize := width * height / 2
-	if estSize < 65536 {
-		estSize = 65536
-	}
+	estSize := max(width*height/2, 65536)
 	outBuf := bytes.NewBuffer(make([]byte, 0, estSize))
 	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22})
 	writeSixelNum(outBuf, width)
 	outBuf.WriteByte(';')
 	writeSixelNum(outBuf, height)
 	outBuf.Write([]byte{0x3b, 0x31, 0x3b, 0x31})
-	for i := 0; i < nc; i++ {
+	for i := range nc {
 		r, g, b, _ := pal.colors[i].RGBA()
 		outBuf.WriteByte('#')
 		writeSixelNum(outBuf, i+1)
@@ -372,9 +363,7 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixel
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for job := range jobCh {
 				nRows := job.yEnd - job.yStart
 				pHash := stripPixelHashRGBA(data, width, job.yStart, job.yEnd)
@@ -418,11 +407,11 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixel
 					for n := pal.nc >> 1; n > 0; n >>= 1 {
 						shift--
 					}
-					for dy := 0; dy < nRows; dy++ {
+					for dy := range nRows {
 						yb4 := ((job.yStart + dy) & 3) << 2
 						bit := byte(1 << dy)
 						pi := rowOffset
-						for x := 0; x < width; x++ {
+						for x := range width {
 							bayerIdx := yb4 | (x & 3)
 							gray := (6966*int(data[pi]) + 23436*int(data[pi+1]) + 2366*int(data[pi+2])) >> 15
 							gray += int(pal.dither[bayerIdx])
@@ -442,7 +431,7 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixel
 						rowOffset += width * 4
 					}
 				} else {
-					for dy := 0; dy < nRows; dy++ {
+					for dy := range nRows {
 						yb4 := ((job.yStart + dy) & 3) << 2
 						bit := byte(1 << dy)
 						r0, r1, r2, r3 := &pal.lutR[yb4|0], &pal.lutR[yb4|1], &pal.lutR[yb4|2], &pal.lutR[yb4|3]
@@ -510,25 +499,19 @@ func encodeSixelFromRGBA(w io.Writer, data []byte, width, height int, pal *sixel
 
 				resultCh <- stripResult{sixelRow: job.sixelRow, rleData: rleBytes}
 			}
-		}()
+		})
 	}
 
 	jobsSent := 0
 	for ; jobsSent < workers && jobsSent < totalSixelRows; jobsSent++ {
 		yStart := jobsSent * 6
-		yEnd := yStart + 6
-		if yEnd > height {
-			yEnd = height
-		}
+		yEnd := min(yStart+6, height)
 		jobCh <- stripJob{sixelRow: jobsSent, yStart: yStart, yEnd: yEnd}
 	}
 
 	makeJob := func(sixelRow int) stripJob {
 		yStart := sixelRow * 6
-		yEnd := yStart + 6
-		if yEnd > height {
-			yEnd = height
-		}
+		yEnd := min(yStart+6, height)
 		return stripJob{sixelRow: sixelRow, yStart: yStart, yEnd: yEnd}
 	}
 
@@ -605,22 +588,16 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 	pix := paletted.Pix
 	stride := paletted.Stride
 
-	paletteSize := len(paletted.Palette)
-	if paletteSize > nc {
-		paletteSize = nc
-	}
+	paletteSize := min(len(paletted.Palette), nc)
 
-	estSize := width * height / 2
-	if estSize < 65536 {
-		estSize = 65536
-	}
+	estSize := max(width*height/2, 65536)
 	outBuf := bytes.NewBuffer(make([]byte, 0, estSize))
 	outBuf.Write([]byte{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22})
 	writeSixelNum(outBuf, width)
 	outBuf.WriteByte(';')
 	writeSixelNum(outBuf, height)
 	outBuf.Write([]byte{0x3b, 0x31, 0x3b, 0x31})
-	for i := 0; i < paletteSize; i++ {
+	for i := range paletteSize {
 		r, g, b, _ := paletted.Palette[i].RGBA()
 		outBuf.WriteByte('#')
 		writeSixelNum(outBuf, i+1)
@@ -633,22 +610,14 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 	}
 
 	totalSixelRows := (height + 5) / 6
-	workers := runtime.NumCPU()
-	if workers > totalSixelRows {
-		workers = totalSixelRows
-	}
-	if workers < 1 {
-		workers = 1
-	}
+	workers := max(min(runtime.NumCPU(), totalSixelRows), 1)
 
 	jobCh := make(chan stripJob, workers)
 	resultCh := make(chan stripResult, workers)
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for job := range jobCh {
 				pHash := stripPixelHash(pix, stride, job.yStart, job.yEnd, width)
 
@@ -687,9 +656,9 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 
 				rowOffset := job.yStart * stride
 				nRows := job.yEnd - job.yStart
-				for dy := 0; dy < nRows; dy++ {
+				for dy := range nRows {
 					bit := byte(1 << dy)
-					for x := 0; x < width; x++ {
+					for x := range width {
 						idx := int(pix[rowOffset+x])
 						if idx >= nc {
 							continue
@@ -706,25 +675,19 @@ func encodePaletted(w io.Writer, paletted *image.Paletted, width, height, nc int
 				st.dirty = dirty
 				resultCh <- stripResult{sixelRow: job.sixelRow, state: st}
 			}
-		}()
+		})
 	}
 
 	jobsSent := 0
 	for ; jobsSent < workers && jobsSent < totalSixelRows; jobsSent++ {
 		yStart := jobsSent * 6
-		yEnd := yStart + 6
-		if yEnd > height {
-			yEnd = height
-		}
+		yEnd := min(yStart+6, height)
 		jobCh <- stripJob{sixelRow: jobsSent, yStart: yStart, yEnd: yEnd}
 	}
 
 	makeJob := func(sixelRow int) stripJob {
 		yStart := sixelRow * 6
-		yEnd := yStart + 6
-		if yEnd > height {
-			yEnd = height
-		}
+		yEnd := min(yStart+6, height)
 		return stripJob{sixelRow: sixelRow, yStart: yStart, yEnd: yEnd}
 	}
 

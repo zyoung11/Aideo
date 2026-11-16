@@ -123,7 +123,7 @@ go build -ldflags="-s -w" .
 
 图片：按 `q`/`ESC` 退出。终端 resize 自适应。
 
-视频：按 `q`/`ESC` 退出，`k`/`j` 切换色数。终端 resize 时不中断播放。
+视频：按 `q`/`ESC` 退出，`k`/`j` 切换色数，`f` 切换纯视频模式（隐藏全部 TUI 控件）。终端 resize 时不中断播放。
 
 ## Go 依赖
 
