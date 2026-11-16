@@ -363,16 +363,19 @@ strip_state_reset :: proc(st: ^StripState, strip_cap, nc: int) {
 }
 
 write_sixel_num :: proc(b: ^Buffer, n: int) {
-	if n >= 100 {
-		write_byte(b, u8(0x30 + n/100))
-		write_byte(b, u8(0x30 + (n%100)/10))
-		write_byte(b, u8(0x30 + n%10))
-	} else if n >= 10 {
-		write_byte(b, u8(0x30 + n/10))
-		write_byte(b, u8(0x30 + n%10))
-	} else {
-		write_byte(b, u8(0x30 + n))
+	if n >= 10000 {
+		write_byte(b, u8(0x30 + n/10000))
 	}
+	if n >= 1000 {
+		write_byte(b, u8(0x30 + (n/1000)%10))
+	}
+	if n >= 100 {
+		write_byte(b, u8(0x30 + (n/100)%10))
+	}
+	if n >= 10 {
+		write_byte(b, u8(0x30 + (n/10)%10))
+	}
+	write_byte(b, u8(0x30 + n%10))
 }
 
 encode_strip :: proc(out: ^Buffer, st: ^StripState, sixel_row, width: int) {
@@ -527,10 +530,10 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 	total_strips := (height + 5) / 6
 
 	write_bytes(out, []u8{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22})
+	write_bytes(out, []u8{0x31, 0x3b, 0x31, 0x3b})
 	write_sixel_num(out, width)
 	write_byte(out, ';')
 	write_sixel_num(out, height)
-	write_bytes(out, []u8{0x3b, 0x31, 0x3b, 0x31})
 	for i in 0..<nc {
 		c := pal.colors[i]
 		write_byte(out, '#')
