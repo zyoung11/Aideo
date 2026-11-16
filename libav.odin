@@ -158,6 +158,7 @@ foreign libav {
 	av_frame_alloc :: proc() -> ^AVFrame ---
 	av_frame_free :: proc(frame: ^^AVFrame) ---
 	av_frame_unref :: proc(frame: ^AVFrame) ---
+	av_frame_move_ref :: proc(dst: ^AVFrame, src: ^AVFrame) ---
 
 	av_log_set_level :: proc(level: c.int) ---
 	avcodec_get_name :: proc(id: c.int) -> cstring ---

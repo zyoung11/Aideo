@@ -2,3 +2,4 @@ ffstatic/
 Aideo
 ffmpeg
 images/
+*.o
