@@ -1,14 +1,27 @@
 package aideo
 
+import "core:c"
 import "core:sync"
 import "core:time"
 import "core:thread"
 import x86 "core:simd/x86"
 
+foreign import avx2lib { "avx2_quant.o" }
+
+foreign avx2lib {
+	quant_row_avx2 :: proc(dst: [^]u8, rgba: [^]u8, w: c.int, dpos_r: [^]u8, dneg_r: [^]u8, dpos_g: [^]u8, dneg_g: [^]u8, dpos_b: [^]u8, dneg_b: [^]u8, r_shr: c.int, g_shr: c.int, b_shr: c.int, r_shift: c.int, g_shift: c.int) ---
+}
+
 BAYER_4X4 := [16]i8{0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}
 
 PALETTE_LEVELS := [7]int{2, 8, 16, 32, 64, 128, 256}
 PALETTE_BITS  := [7][3]int{{0, 0, 0}, {1, 1, 1}, {2, 1, 1}, {2, 2, 1}, {2, 2, 2}, {3, 2, 2}, {3, 3, 2}}
+
+DitherSet :: struct {
+	dpos_r, dneg_r: [32]u8,
+	dpos_g, dneg_g: [32]u8,
+	dpos_b, dneg_b: [32]u8,
+}
 
 SixelPalette :: struct {
 	nc:      int,
@@ -20,6 +33,8 @@ SixelPalette :: struct {
 	lut_g:   [16][256]u8,
 	lut_b:   [16][256]u8,
 	dither:  [16]i8,
+	dither_cache:  [16]DitherSet,
+	dither_ready:  [16]bool,
 }
 
 StripCache :: struct {
@@ -199,74 +214,46 @@ strip_pixel_hash_rgba :: proc(data: []u8, width, y_start, y_end: int) -> u64 {
 }
 
 @(private)
-@(enable_target_feature="sse2,ssse3") quantize_row_uniform_simd :: proc(dst: []u8, rgba: []u8, w, yb4: int, p: ^SixelPalette) {
-	zero := x86._mm_setzero_si128()
-
-	step_r := 256 / ((1 << u32(p.r_bits)) - 1)
-	step_g := 256 / ((1 << u32(p.g_bits)) - 1)
-	step_b := 256 / ((1 << u32(p.b_bits)) - 1)
-
-	d_r := [4]i8{0, 0, 0, 0}
-	d_g := [4]i8{0, 0, 0, 0}
-	d_b := [4]i8{0, 0, 0, 0}
+quantize_row_uniform_simd :: proc(dst: []u8, rgba: []u8, w, yb4: int, p: ^SixelPalette) {
+	dR := make_dither(1 << u32(p.r_bits))
+	dG := make_dither(1 << u32(p.g_bits))
+	dB := make_dither(1 << u32(p.b_bits))
+	dpos_r: [32]u8
+	dneg_r: [32]u8
+	dpos_g: [32]u8
+	dneg_g: [32]u8
+	dpos_b: [32]u8
+	dneg_b: [32]u8
 	for i in 0..<4 {
-		base := int(BAYER_4X4[yb4|i]) - 8
-		d_r[i] = i8(base * step_r / 16)
-		d_g[i] = i8(base * step_g / 16)
-		d_b[i] = i8(base * step_b / 16)
-	}
-
-	dpos_r := x86._mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		i8(max(int(d_r[3]), 0)), i8(max(int(d_r[2]), 0)), i8(max(int(d_r[1]), 0)), i8(max(int(d_r[0]), 0)))
-	dneg_r := x86._mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		i8(max(-int(d_r[3]), 0)), i8(max(-int(d_r[2]), 0)), i8(max(-int(d_r[1]), 0)), i8(max(-int(d_r[0]), 0)))
-	dpos_g := x86._mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		i8(max(int(d_g[3]), 0)), i8(max(int(d_g[2]), 0)), i8(max(int(d_g[1]), 0)), i8(max(int(d_g[0]), 0)))
-	dneg_g := x86._mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		i8(max(-int(d_g[3]), 0)), i8(max(-int(d_g[2]), 0)), i8(max(-int(d_g[1]), 0)), i8(max(-int(d_g[0]), 0)))
-	dpos_b := x86._mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		i8(max(int(d_b[3]), 0)), i8(max(int(d_b[2]), 0)), i8(max(int(d_b[1]), 0)), i8(max(int(d_b[0]), 0)))
-	dneg_b := x86._mm_set_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-		i8(max(-int(d_b[3]), 0)), i8(max(-int(d_b[2]), 0)), i8(max(-int(d_b[1]), 0)), i8(max(-int(d_b[0]), 0)))
-
-	r_shift := p.r_shift
-	g_shift := p.g_shift
-	r_shr := 8 - p.r_bits
-	g_shr := 8 - p.g_bits
-	b_shr := 8 - p.b_bits
-
-	for x := 0; x < w; x += 4 {
-		if x + 4 > w {
-			break
+		col := yb4 | i
+		dr := int(dR[col])
+		dg := int(dG[col])
+		db := int(dB[col])
+		if dr >= 0 {
+			dpos_r[i] = u8(dr)
+			dpos_r[16 + i] = u8(dr)
+		} else {
+			dneg_r[i] = u8(-dr)
+			dneg_r[16 + i] = u8(-dr)
 		}
-		px := x86._mm_loadu_si128(cast(^x86.__m128i)&rgba[x * 4])
-
-		rb := x86._mm_shuffle_epi8(px, shuf_mask_r())
-		gb := x86._mm_shuffle_epi8(px, shuf_mask_g())
-		bb := x86._mm_shuffle_epi8(px, shuf_mask_b())
-
-		rb = x86._mm_subs_epu8(x86._mm_adds_epu8(rb, dpos_r), dneg_r)
-		gb = x86._mm_subs_epu8(x86._mm_adds_epu8(gb, dpos_g), dneg_g)
-		bb = x86._mm_subs_epu8(x86._mm_adds_epu8(bb, dpos_b), dneg_b)
-
-		r16 := x86._mm_unpacklo_epi8(rb, zero)
-		g16 := x86._mm_unpacklo_epi8(gb, zero)
-		b16 := x86._mm_unpacklo_epi8(bb, zero)
-
-		r16 = x86._mm_sll_epi16(x86._mm_srl_epi16(r16, x86._mm_cvtsi32_si128(i32(r_shr))), x86._mm_cvtsi32_si128(i32(r_shift)))
-		g16 = x86._mm_sll_epi16(x86._mm_srl_epi16(g16, x86._mm_cvtsi32_si128(i32(g_shr))), x86._mm_cvtsi32_si128(i32(g_shift)))
-		b16 = x86._mm_srl_epi16(b16, x86._mm_cvtsi32_si128(i32(b_shr)))
-
-		ci16 := x86._mm_or_si128(x86._mm_or_si128(r16, g16), b16)
-		ci8 := x86._mm_packus_epi16(ci16, zero)
-
-		tmp: [16]u8
-		x86._mm_storeu_si128(cast(^x86.__m128i)&tmp[0], ci8)
-		dst[x] = tmp[0]
-		dst[x+1] = tmp[1]
-		dst[x+2] = tmp[2]
-		dst[x+3] = tmp[3]
+		if dg >= 0 {
+			dpos_g[i] = u8(dg)
+			dpos_g[16 + i] = u8(dg)
+		} else {
+			dneg_g[i] = u8(-dg)
+			dneg_g[16 + i] = u8(-dg)
+		}
+		if db >= 0 {
+			dpos_b[i] = u8(db)
+			dpos_b[16 + i] = u8(db)
+		} else {
+			dneg_b[i] = u8(-db)
+			dneg_b[16 + i] = u8(-db)
+		}
 	}
+	quant_row_avx2(&dst[0], &rgba[0], c.int(w), &dpos_r[0], &dneg_r[0], &dpos_g[0], &dneg_g[0], &dpos_b[0], &dneg_b[0],
+		c.int(8 - p.r_bits), c.int(8 - p.g_bits), c.int(8 - p.b_bits),
+		c.int(p.r_shift), c.int(p.g_shift))
 }
 
 @(private)
