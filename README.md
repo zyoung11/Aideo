@@ -1,21 +1,5 @@
 # Aideo
 
-> 终端视频播放器 — Odin 实现，libav 解码，Sixel 渲染，SIMD 量化
-
-## 项目结构
-
-```
-Aideo/
-├── main.odin        # 入口，主循环，帧调度，按键与 resize
-├── libav.odin       # libavformat/libavcodec/libswscale/libswresample C 绑定
-├── video.odin       # 视频解码线程，帧池，无缝循环，resize 通道
-├── audio.odin       # 音频解码，环形缓冲，miniaudio 输出，平滑时钟
-├── sixel.odin       # Sixel 编码器，SIMD 量化，strip 缓存，常驻 worker 池
-├── terminal.odin    # termios raw 模式，SIGWINCH，按键线程
-├── ci_test.odin     # SIMD 与标量量化一致性回归
-└── ci_bench.odin    # 量化与编码耗时基准
-```
-
 ## 依赖
 
 | 库 | 用途 |
