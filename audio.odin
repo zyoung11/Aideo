@@ -4,7 +4,7 @@ import "core:c"
 import "core:sync"
 import "core:thread"
 import "core:time"
-import ma "vendor:miniaudio"
+import ma "miniaudio"
 
 AUDIO_RATE     :: 44100
 AUDIO_CHANNELS :: 2
