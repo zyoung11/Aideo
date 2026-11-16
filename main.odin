@@ -182,7 +182,16 @@ main :: proc() {
 		write_sixel_num(&out, start_col)
 		write_byte(&out, 'H')
 		sixel_encode(&pool, &out, pending.buf, out_w, out_h, pal, &cache)
-		os.write(os.stdout, out.buf[:out.pos])
+		_t4 := time.now()
+		wdata := out.buf[:out.pos]
+		for len(wdata) > 0 {
+			nw, werr := os.write(os.stdout, wdata)
+			if werr != nil || nw <= 0 {
+				break
+			}
+			wdata = wdata[nw:]
+		}
+		prof_add(PROF_WRITE, i64(time.since(_t4)))
 	
 		video_pool_put(vp, pending.buf)
 		have_pending = false

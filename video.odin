@@ -83,6 +83,8 @@ VideoStream :: struct {
 VideoPlayer :: struct {
 	vs:          ^VideoStream,
 	queue:       FrameQueue,
+	yuvq:        YuvQueue,
+	sws_mu:      sync.Mutex,
 	pool:        [3][]u8,
 	pool_mu:     sync.Mutex,
 	out_w:       int,
@@ -201,6 +203,102 @@ video_make_sws :: proc(vs: ^VideoStream, out_w, out_h: int) {
 		c.int(out_w), c.int(out_h), AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nil, nil, nil)
 }
 
+YuvQueue :: struct {
+	slots:  [4]^AVFrame,
+	head:   int,
+	count:  int,
+	mu:     sync.Mutex,
+	used:   sync.Sema,
+	free:   sync.Sema,
+	yfree:  sync.Sema,
+	poolmu: sync.Mutex,
+	pool:   [5]^AVFrame,
+}
+
+yuv_init :: proc(q: ^YuvQueue) {
+	for i in 0..<len(q.pool) {
+		q.pool[i] = av_frame_alloc()
+	}
+	sync.sema_post(&q.free, len(q.slots))
+	sync.sema_post(&q.yfree, len(q.pool))
+}
+
+yuv_get_frame :: proc(q: ^YuvQueue) -> ^AVFrame {
+	sync.sema_wait(&q.yfree)
+	sync.mutex_lock(&q.poolmu)
+	for i in 0..<len(q.pool) {
+		if q.pool[i] != nil {
+			f := q.pool[i]
+			q.pool[i] = nil
+			sync.mutex_unlock(&q.poolmu)
+			return f
+		}
+	}
+	sync.mutex_unlock(&q.poolmu)
+	return nil
+}
+
+yuv_put_frame :: proc(q: ^YuvQueue, f: ^AVFrame) {
+	av_frame_unref(f)
+	sync.mutex_lock(&q.poolmu)
+	for i := len(q.pool) - 1; i >= 0; i -= 1 {
+		if q.pool[i] == nil {
+			q.pool[i] = f
+			sync.mutex_unlock(&q.poolmu)
+			sync.sema_post(&q.yfree)
+			return
+		}
+	}
+	sync.mutex_unlock(&q.poolmu)
+}
+
+yuv_push :: proc(q: ^YuvQueue, f: ^AVFrame) {
+	sync.sema_wait(&q.free)
+	sync.mutex_lock(&q.mu)
+	q.slots[(q.head + q.count) % len(q.slots)] = f
+	q.count += 1
+	sync.mutex_unlock(&q.mu)
+	sync.sema_post(&q.used)
+}
+
+yuv_pop :: proc(q: ^YuvQueue) -> ^AVFrame {
+	sync.sema_wait(&q.used)
+	sync.mutex_lock(&q.mu)
+	f := q.slots[q.head]
+	q.head = (q.head + 1) % len(q.slots)
+	q.count -= 1
+	sync.mutex_unlock(&q.mu)
+	sync.sema_post(&q.free)
+	return f
+}
+
+video_scale_thread :: proc(vp: ^VideoPlayer) {
+	vs := vp.vs
+	for sync.atomic_load(&vp.stop) == 0 {
+		yf := yuv_pop(&vp.yuvq)
+		_t2 := time.now()
+		fs := vp.out_w * vp.out_h * 4
+		buf := video_pool_get(vp, fs)
+		dst_data: [1][^]u8
+		dst_data[0] = ([^]u8)(&buf[0])
+		dst_stride: [1]c.int
+		dst_stride[0] = c.int(vp.out_w * 4)
+		sync.mutex_lock(&vp.sws_mu)
+		if vs.sws != nil {
+			sws_scale(vs.sws, &yf.data[0], &yf.linesize[0], 0, yf.height, &dst_data[0], &dst_stride[0])
+		}
+		sync.mutex_unlock(&vp.sws_mu)
+		prof_add(PROF_DECODE_SWS, i64(time.since(_t2)))
+		pts_ns := sync.atomic_load(&vp.loop_offset)
+		if yf.pts != min(i64) {
+			pts_ns += i64(f64(yf.pts) * vs.time_base * 1000000000.0)
+		}
+		yuv_put_frame(&vp.yuvq, yf)
+		sync.atomic_store(&vp.last_pts, pts_ns)
+		fq_push(&vp.queue, FrameMsg{buf = buf, pts_sec = f64(pts_ns) / 1000000000.0})
+	}
+}
+
 video_decode_thread :: proc(vp: ^VideoPlayer) {
 	vs := vp.vs
 
@@ -286,6 +384,10 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 
 video_start :: proc(vp: ^VideoPlayer) {
 	fq_init(&vp.queue)
+	yuv_init(&vp.yuvq)
+	thread.create_and_start_with_data(vp, proc(data: rawptr) {
+		video_scale_thread((^VideoPlayer)(data))
+	}, nil, thread.Thread_Priority.Normal, true)
 	for i in 0..<len(vp.pool) {
 		vp.pool[i] = make([]u8, vp.out_w * vp.out_h * 4)
 	}
