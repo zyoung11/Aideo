@@ -38,8 +38,16 @@ SixelPalette :: struct {
 }
 
 StripCache :: struct {
-	hashes: []u64,
-	rle:    [][dynamic]u8,
+	hashes:  []u64,
+	rle:     [][dynamic]u8,
+	changed: []u8,
+}
+
+// strip_cache_init allocates per-strip cache storage for total_strips bands.
+strip_cache_init :: proc(cache: ^StripCache, total_strips: int) {
+	cache.hashes = make([]u64, total_strips)
+	cache.rle = make([][dynamic]u8, total_strips)
+	cache.changed = make([]u8, total_strips)
 }
 
 make_dither :: proc(levels: int) -> [16]i8 {
@@ -388,10 +396,7 @@ write_sixel_num :: proc(b: ^Buffer, n: int) {
 	write_byte(b, u8(0x30 + n%10))
 }
 
-encode_strip :: proc(out: ^Buffer, st: ^StripState, sixel_row, width: int) {
-	if sixel_row > 0 {
-		write_byte(out, 0x2d)
-	}
+encode_strip :: proc(out: ^Buffer, st: ^StripState, width: int) {
 	for c in st.dirty {
 		base := c * width
 		row := st.buf[base:base+width]
@@ -529,12 +534,13 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx) {
 
 		prof_add(PROF_ENCODE_SCAT, i64(time.since(_t1)))
 		_t2 := time.now()
-		encode_strip(&buf, &st, srow, width)
+		encode_strip(&buf, &st, width)
 		prof_add(PROF_ENCODE_RLE, i64(time.since(_t2)))
 
 		ctx.cache.hashes[srow] = p_hash
 		clear(&ctx.cache.rle[srow])
 		append(&ctx.cache.rle[srow], ..buf.buf[:buf.pos])
+		ctx.cache.changed[srow] = 1
 	}
 }
 
@@ -572,7 +578,7 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 	nc := pal.nc
 	total_strips := (height + 5) / 6
 
-	write_bytes(out, []u8{0x1b, 0x50, 0x30, 0x3b, 0x30, 0x3b, 0x38, 0x71, 0x22})
+	write_bytes(out, []u8{0x1b, 0x50, 0x30, 0x3b, 0x31, 0x3b, 0x38, 0x71, 0x22})
 	write_bytes(out, []u8{0x31, 0x3b, 0x31, 0x3b})
 	write_sixel_num(out, width)
 	write_byte(out, ';')
@@ -589,6 +595,10 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 		write_sixel_num(out, int((c >> 8 & 0xff) * 100 / 255))
 		write_byte(out, ';')
 		write_sixel_num(out, int((c & 0xff) * 100 / 255))
+	}
+
+	for i in 0..<total_strips {
+		cache.changed[i] = 0
 	}
 
 	n_workers := len(pool.workers)
@@ -608,7 +618,12 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 	}
 
 	for srow in 0..<total_strips {
-		write_bytes(out, cache.rle[srow][:])
+		if srow > 0 {
+			write_byte(out, 0x2d)
+		}
+		if cache.changed[srow] != 0 {
+			write_bytes(out, cache.rle[srow][:])
+		}
 	}
 	write_bytes(out, []u8{0x1b, 0x5c})
 	prof_add(PROF_ENCODE_ASM, i64(time.since(_t3)))

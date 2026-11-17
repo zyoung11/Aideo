@@ -37,8 +37,7 @@ ci_bench :: proc() {
 	t_scalar := time.duration_seconds(time.since(t0))
 
 	cache: StripCache
-	cache.hashes = make([]u64, (h + 5) / 6)
-	cache.rle = make([][dynamic]u8, (h + 5) / 6)
+	strip_cache_init(&cache, (h + 5) / 6)
 	out := Buffer{}
 	buffer_init(&out, w * h)
 	pool: StripPool

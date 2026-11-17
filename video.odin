@@ -195,6 +195,8 @@ video_close :: proc(vs: ^VideoStream) {
 	free(vs)
 }
 
+// video_make_sws rebuilds the pixel scaler for a new output size.
+// Callers must hold vp.sws_mu.
 video_make_sws :: proc(vs: ^VideoStream, out_w, out_h: int) {
 	if vs.sws != nil {
 		sws_freeContext(vs.sws)
@@ -203,6 +205,9 @@ video_make_sws :: proc(vs: ^VideoStream, out_w, out_h: int) {
 		c.int(out_w), c.int(out_h), AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nil, nil, nil)
 }
 
+// YuvQueue carries decoded source frames from the decode thread to the
+// scale thread. frame.pts holds absolute presentation time in nanoseconds,
+// computed by the decode thread at decode time.
 YuvQueue :: struct {
 	slots:  [4]^AVFrame,
 	head:   int,
@@ -277,25 +282,24 @@ video_scale_thread :: proc(vp: ^VideoPlayer) {
 	for sync.atomic_load(&vp.stop) == 0 {
 		yf := yuv_pop(&vp.yuvq)
 		_t2 := time.now()
-		fs := vp.out_w * vp.out_h * 4
-		buf := video_pool_get(vp, fs)
-		dst_data: [1][^]u8
-		dst_data[0] = ([^]u8)(&buf[0])
-		dst_stride: [1]c.int
-		dst_stride[0] = c.int(vp.out_w * 4)
+		buf: []u8
 		sync.mutex_lock(&vp.sws_mu)
 		if vs.sws != nil {
+			fs := vp.out_w * vp.out_h * 4
+			buf = video_pool_get(vp, fs)
+			dst_data: [1][^]u8
+			dst_data[0] = ([^]u8)(&buf[0])
+			dst_stride: [1]c.int
+			dst_stride[0] = c.int(vp.out_w * 4)
 			sws_scale(vs.sws, &yf.data[0], &yf.linesize[0], 0, yf.height, &dst_data[0], &dst_stride[0])
 		}
 		sync.mutex_unlock(&vp.sws_mu)
 		prof_add(PROF_DECODE_SWS, i64(time.since(_t2)))
-		pts_ns := sync.atomic_load(&vp.loop_offset)
-		if yf.pts != min(i64) {
-			pts_ns += i64(f64(yf.pts) * vs.time_base * 1000000000.0)
-		}
+		pts_sec := f64(yf.pts) / 1000000000.0
 		yuv_put_frame(&vp.yuvq, yf)
-		sync.atomic_store(&vp.last_pts, pts_ns)
-		fq_push(&vp.queue, FrameMsg{buf = buf, pts_sec = f64(pts_ns) / 1000000000.0})
+		if len(buf) > 0 {
+			fq_push(&vp.queue, FrameMsg{buf = buf, pts_sec = pts_sec})
+		}
 	}
 }
 
@@ -307,9 +311,11 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			nw := int(sync.atomic_load(&vp.req_w))
 			nh := int(sync.atomic_load(&vp.req_h))
 			sync.atomic_store(&vp.req_resize, 0)
+			sync.mutex_lock(&vp.sws_mu)
 			vp.out_w = nw
 			vp.out_h = nh
 			video_make_sws(vs, nw, nh)
+			sync.mutex_unlock(&vp.sws_mu)
 			cur := f64(sync.atomic_load(&vp.last_pts)) / 1000000000.0
 			seek_target := i64((cur - f64(sync.atomic_load(&vp.loop_offset)) / 1000000000.0) / vs.time_base)
 			av_seek_frame(vs.fmt_ctx, c.int(vs.stream_idx), seek_target, AVSEEK_FLAG_BACKWARD)
@@ -351,33 +357,22 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			if avcodec_receive_frame(vs.codec_ctx, vs.frame) < 0 {
 				break
 			}
+			sync.mutex_lock(&vp.sws_mu)
 			if vs.sws == nil {
 				vs.src_format = int(vs.frame.format)
 				video_make_sws(vs, vp.out_w, vp.out_h)
 			}
-			fs := vp.out_w * vp.out_h * 4
-			buf := video_pool_get(vp, fs)
-			if buf == nil {
-				av_frame_unref(vs.frame)
-				break
-			}
-			out_w, out_h := vp.out_w, vp.out_h
-			dst_data: [1][^]u8
-			dst_data[0] = ([^]u8)(&buf[0])
+			sync.mutex_unlock(&vp.sws_mu)
 			prof_add(PROF_DECODE_RECV, i64(time.since(_t1)))
-			_t2 := time.now()
-			dst_stride: [1]c.int
-			dst_stride[0] = c.int(out_w * 4)
-			sws_scale(vs.sws, &vs.frame.data[0], &vs.frame.linesize[0], 0, vs.frame.height, &dst_data[0], &dst_stride[0])
-			prof_add(PROF_DECODE_SWS, i64(time.since(_t2)))
-
+			yf := yuv_get_frame(&vp.yuvq)
+			av_frame_move_ref(yf, vs.frame)
 			pts_ns := sync.atomic_load(&vp.loop_offset)
-			if vs.frame.pts != min(i64) {
-				pts_ns += i64(f64(vs.frame.pts) * vs.time_base * 1000000000.0)
+			if yf.pts != min(i64) {
+				pts_ns += i64(f64(yf.pts) * vs.time_base * 1000000000.0)
 			}
-			av_frame_unref(vs.frame)
+			yf.pts = pts_ns
 			sync.atomic_store(&vp.last_pts, pts_ns)
-			fq_push(&vp.queue, FrameMsg{buf = buf, pts_sec = f64(pts_ns) / 1000000000.0})
+			yuv_push(&vp.yuvq, yf)
 		}
 	}
 }

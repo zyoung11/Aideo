@@ -61,8 +61,7 @@ main :: proc() {
 	volume := 1.0
 	cache: StripCache
 	total_strips := (out_h + 5) / 6
-	cache.hashes = make([]u64, total_strips)
-	cache.rle = make([][dynamic]u8, total_strips)
+	strip_cache_init(&cache, total_strips)
 	out := Buffer{}
 	buffer_init(&out, out_w * out_h / 2)
 	pool: StripPool
@@ -104,13 +103,11 @@ main :: proc() {
 			case KEY_COLOR_UP:
 				color_idx = min(color_idx + 1, len(COLOR_LEVELS) - 1)
 				pal = get_palette(COLOR_LEVELS[color_idx])
-				cache.hashes = make([]u64, total_strips)
-				cache.rle = make([][dynamic]u8, total_strips)
+				strip_cache_init(&cache, total_strips)
 			case KEY_COLOR_DOWN:
 				color_idx = max(color_idx - 1, 0)
 				pal = get_palette(COLOR_LEVELS[color_idx])
-				cache.hashes = make([]u64, total_strips)
-				cache.rle = make([][dynamic]u8, total_strips)
+				strip_cache_init(&cache, total_strips)
 			}
 		}
 
@@ -125,8 +122,7 @@ main :: proc() {
 				}
 				out_w, out_h = nw, nh
 				total_strips = (out_h + 5) / 6
-				cache.hashes = make([]u64, total_strips)
-				cache.rle = make([][dynamic]u8, total_strips)
+				strip_cache_init(&cache, total_strips)
 				video_request_resize(vp, out_w, out_h)
 				fmt.print("\x1b[2J\x1b[3J\x1b[H")
 			}
