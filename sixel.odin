@@ -10,6 +10,7 @@ foreign import avx2lib { "avx2_quant.o" }
 
 foreign avx2lib {
 	quant_row_avx2 :: proc(dst: [^]u8, rgba: [^]u8, w: c.int, dpos_r: [^]u8, dneg_r: [^]u8, dpos_g: [^]u8, dneg_g: [^]u8, dpos_b: [^]u8, dneg_b: [^]u8, r_shr: c.int, g_shr: c.int, b_shr: c.int, r_shift: c.int, g_shift: c.int) ---
+	hash_strip_avx2 :: proc(rgba: [^]u8, width: c.int, y_start: c.int, y_end: c.int) -> u64 ---
 }
 
 BAYER_4X4 := [16]i8{0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}
@@ -185,28 +186,36 @@ get_palette :: proc(nc: int) -> ^SixelPalette {
 	return nil
 }
 
+// strip_pixel_hash_rgba is the scalar reference for hash_strip_avx2. It
+// hashes the band as one little-endian u32 stream with a Horner style
+// polynomial over eight lanes and two multiplier sets.
 strip_pixel_hash_rgba :: proc(data: []u8, width, y_start, y_end: int) -> u64 {
-	h0: u64 = 14695981039346656037
-	h1: u64 = 14695981039346656037
-	h2: u64 = 14695981039346656037
-	h3: u64 = 14695981039346656037
-	row_len := width * 4
-	for y in y_start..<y_end {
-		base := y * row_len
-		row := data[base:base+row_len]
-		n := len(row)
-		lim := n &~ 3
-		for i := 0; i < lim; i += 4 {
-			h0 = (h0 ~ u64(row[i])) * 1099511628211
-			h1 = (h1 ~ u64(row[i+1])) * 1099511628211
-			h2 = (h2 ~ u64(row[i+2])) * 1099511628211
-			h3 = (h3 ~ u64(row[i+3])) * 1099511628211
-		}
-		for i := lim; i < n; i += 1 {
-			h0 = (h0 ~ u64(row[i])) * 1099511628211
-		}
+	P1 :: u32(0x9E3779B1)
+	P2 :: u32(0x85EBCA77)
+	P3 :: u32(0xC2B2AE3D)
+	P4 :: u32(0x27D4EB2F)
+	a1: [8]u32
+	a2: [8]u32
+	for k in 0..<8 {
+		a1[k] = 0x9E3779B9
+		a2[k] = 0x85EBCA6B
 	}
-	return h0 * 31 + h1 * 7 + h2 * 3 + h3
+	base := y_start * width * 4
+	nwords := (y_end - y_start) * width
+	for i in 0..<nwords {
+		q := base + i * 4
+		v := u32(data[q]) | u32(data[q+1]) << 8 | u32(data[q+2]) << 16 | u32(data[q+3]) << 24
+		k := i % 8
+		a1[k] = a1[k] * P1 + v * P2
+		a2[k] = a2[k] * P3 + v * P4
+	}
+	s1: u32
+	s2: u32
+	for k in 0..<8 {
+		s1 += a1[k] * u32(2 * k + 1)
+		s2 += a2[k] * u32(2 * k + 1)
+	}
+	return u64(s1) << 32 | u64(s2)
 }
 
 @(enable_target_feature="sse2,ssse3") shuf_mask_r :: proc "contextless" () -> x86.__m128i {
@@ -468,13 +477,26 @@ StripPool :: struct {
 	stopped: i32,
 }
 
-strip_pool_run :: proc(ctx: ^StripWorkerCtx) {
-	st: StripState
-	row_ci := make([]u8, ctx.width)
-	defer free(&row_ci[0])
-	buf: Buffer
-	buffer_init(&buf, ctx.width * 64)
-	defer free(&buf.buf[0])
+StripWorkerState :: struct {
+	st:     StripState,
+	row_ci: []u8,
+	buf:    Buffer,
+}
+
+// strip_pool_run encodes every unencoded band of one frame.
+strip_pool_run :: proc(ctx: ^StripWorkerCtx, ws: ^StripWorkerState) {
+	st := &ws.st
+	if len(ws.row_ci) < ctx.width {
+		ws.row_ci = make([]u8, ctx.width)
+	}
+	if len(ws.buf.buf) < ctx.width * 64 {
+		if len(ws.buf.buf) > 0 {
+			free(&ws.buf.buf[0])
+		}
+		buffer_init(&ws.buf, ctx.width * 64)
+	}
+	row_ci := ws.row_ci
+	buf := &ws.buf
 
 	pal := ctx.pal
 	nc := pal.nc
@@ -490,15 +512,15 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx) {
 		y_end := min(y_start + 6, ctx.height)
 		n_rows := y_end - y_start
 		_t0 := time.now()
-		p_hash := strip_pixel_hash_rgba(ctx.rgba, width, y_start, y_end)
+		p_hash := hash_strip_avx2(&ctx.rgba[0], c.int(width), c.int(y_start), c.int(y_end))
 		prof_add(PROF_ENCODE_HASH, i64(time.since(_t0)))
 
 		if ctx.cache.hashes[srow] == p_hash && len(ctx.cache.rle[srow]) > 0 {
 			continue
 		}
 
-		buffer_reset(&buf)
-		strip_state_reset(&st, nc * width, nc)
+		buffer_reset(buf)
+		strip_state_reset(st, nc * width, nc)
 		_t1 := time.now()
 
 		row_offset := y_start * width * 4
@@ -534,7 +556,7 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx) {
 
 		prof_add(PROF_ENCODE_SCAT, i64(time.since(_t1)))
 		_t2 := time.now()
-		encode_strip(&buf, &st, width)
+		encode_strip(buf, st, width)
 		prof_add(PROF_ENCODE_RLE, i64(time.since(_t2)))
 
 		ctx.cache.hashes[srow] = p_hash
@@ -547,12 +569,13 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx) {
 strip_pool_worker :: proc(data: rawptr) {
 	pool := (^StripPool)(data)
 	defer sync.sema_post(&pool.exited)
+	ws: StripWorkerState
 	for {
 		sync.sema_wait(&pool.start)
 		if sync.atomic_load(&pool.stopped) != 0 {
 			return
 		}
-		strip_pool_run(&pool.ctx)
+		strip_pool_run(&pool.ctx, &ws)
 		sync.sema_post(&pool.done)
 	}
 }

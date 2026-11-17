@@ -110,6 +110,7 @@ KEY_VOL_UP :: 2
 KEY_VOL_DOWN :: 3
 KEY_COLOR_UP :: 4
 KEY_COLOR_DOWN :: 5
+KEY_FPS :: 6
 
 key_queue: [32]u8
 key_head: i64
@@ -172,6 +173,8 @@ key_thread :: proc() {
 				key_push(KEY_COLOR_DOWN)
 			case 'k', 'K':
 				key_push(KEY_COLOR_UP)
+			case 9:
+				key_push(KEY_FPS)
 			}
 			i += 1
 		}

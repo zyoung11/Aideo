@@ -75,6 +75,7 @@ VideoStream :: struct {
 	stream_idx: int,
 	time_base:  f64,
 	duration_sec: f64,
+	fps:        f64,
 	src_w:      int,
 	src_h:      int,
 	src_format: int,
@@ -179,6 +180,10 @@ video_open :: proc(path: cstring) -> ^VideoStream {
 	tb := fmt_ctx.streams[idx].time_base
 	vs.time_base = f64(tb.num) / f64(tb.den)
 	vs.duration_sec = f64(fmt_ctx.duration) / 1000000.0
+	gfr := av_guess_frame_rate(fmt_ctx, fmt_ctx.streams[idx], nil)
+	if gfr.num != 0 && gfr.den != 0 {
+		vs.fps = f64(gfr.num) / f64(gfr.den)
+	}
 	vs.src_w = int(par.width)
 	vs.src_h = int(par.height)
 	return vs

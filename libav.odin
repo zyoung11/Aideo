@@ -142,6 +142,7 @@ foreign libav {
 	av_read_frame :: proc(s: ^AVFormatContext, pkt: ^AVPacket) -> c.int ---
 	av_seek_frame :: proc(s: ^AVFormatContext, stream_index: c.int, timestamp: i64, flags: c.int) -> c.int ---
 	av_find_best_stream :: proc(ic: ^AVFormatContext, media_type: c.int, wanted_stream_index: c.int, related_stream: c.int, decoder_ret: rawptr, flags: c.int) -> c.int ---
+	av_guess_frame_rate :: proc(ic: ^AVFormatContext, stream: ^AVStream, frame: ^AVFrame) -> AVRational ---
 
 	avcodec_find_decoder :: proc(id: c.int) -> ^AVCodec ---
 	avcodec_alloc_context3 :: proc(codec: ^AVCodec) -> ^AVCodecContext ---

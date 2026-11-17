@@ -1,5 +1,6 @@
 package aideo
 
+import "core:c"
 import "core:fmt"
 
 ci_test :: proc() {
@@ -23,5 +24,22 @@ ci_test :: proc() {
 			mark = "DIFF"
 		}
 		fmt.printfln("x=%2d rgba=(%3d,%3d,%3d) simd=%3d scalar=%3d %s", x, rgba[x*4], rgba[x*4+1], rgba[x*4+2], simd_out[x], scalar_out[x], mark)
+	}
+	bands := [][2]int{{0, 12}, {0, 1}, {3, 9}, {5, 6}, {11, 12}}
+	widths := []int{1, 7, 8, 16, 37}
+	for w in widths {
+		buf := make([]u8, w * 12 * 4)
+		for i in 0..<len(buf) {
+			buf[i] = u8((i * 37 + i / 7 + 11) % 251)
+		}
+		for band in bands {
+			ref := strip_pixel_hash_rgba(buf, w, band[0], band[1])
+			simd := hash_strip_avx2(&buf[0], c.int(w), c.int(band[0]), c.int(band[1]))
+			mark := "OK"
+			if ref != simd {
+				mark = "DIFF"
+			}
+			fmt.printfln("hash w=%2d y=%2d..%-2d scalar=%016x avx2=%016x %s", w, band[0], band[1], ref, simd, mark)
+		}
 	}
 }

@@ -1,4 +1,51 @@
 #include <immintrin.h>
+#include <stdint.h>
+
+/*
+ * hash_strip_avx2 hashes one sixel band of RGBA pixels with a Horner
+ * style polynomial over eight 32-bit lanes and two multiplier sets.
+ * The result matches the scalar reference in sixel.odin exactly.
+ */
+uint64_t hash_strip_avx2(const unsigned char *rgba, int width, int y_start, int y_end) {
+    const uint32_t P1 = 0x9E3779B1u, P2 = 0x85EBCA77u;
+    const uint32_t P3 = 0xC2B2AE3Du, P4 = 0x27D4EB2Fu;
+    const unsigned char *p = rgba + (size_t)y_start * width * 4;
+    const size_t nwords = (size_t)(y_end - y_start) * width;
+    const size_t nvec = nwords / 8 * 8;
+
+    const __m256i vp1 = _mm256_set1_epi32((int)P1);
+    const __m256i vp2 = _mm256_set1_epi32((int)P2);
+    const __m256i vp3 = _mm256_set1_epi32((int)P3);
+    const __m256i vp4 = _mm256_set1_epi32((int)P4);
+    __m256i acc1 = _mm256_set1_epi32((int)0x9E3779B9u);
+    __m256i acc2 = _mm256_set1_epi32((int)0x85EBCA6Bu);
+
+    for (size_t i = 0; i < nvec; i += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(p + i * 4));
+        acc1 = _mm256_add_epi32(_mm256_mullo_epi32(acc1, vp1), _mm256_mullo_epi32(v, vp2));
+        acc2 = _mm256_add_epi32(_mm256_mullo_epi32(acc2, vp3), _mm256_mullo_epi32(v, vp4));
+    }
+
+    uint32_t a1[8], a2[8];
+    _mm256_storeu_si256((__m256i *)a1, acc1);
+    _mm256_storeu_si256((__m256i *)a2, acc2);
+
+    for (size_t i = nvec; i < nwords; i++) {
+        const unsigned char *q = p + i * 4;
+        uint32_t v = (uint32_t)q[0] | ((uint32_t)q[1] << 8) |
+                     ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+        const size_t k = i % 8;
+        a1[k] = a1[k] * P1 + v * P2;
+        a2[k] = a2[k] * P3 + v * P4;
+    }
+
+    uint32_t s1 = 0, s2 = 0;
+    for (int k = 0; k < 8; k++) {
+        s1 += a1[k] * (uint32_t)(2 * k + 1);
+        s2 += a2[k] * (uint32_t)(2 * k + 1);
+    }
+    return ((uint64_t)s1 << 32) | (uint64_t)s2;
+}
 
 /*
  * quant_row_avx2 quantizes 8 RGBA pixels per iteration using 256-bit

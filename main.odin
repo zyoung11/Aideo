@@ -58,19 +58,29 @@ main :: proc() {
 	playback_start := start_wall
 	pause_start := start_wall
 	paused := false
+	pause_clock := 0.0
 	volume := 1.0
-	cache: StripCache
+	cache := new(StripCache)
 	total_strips := (out_h + 5) / 6
-	strip_cache_init(&cache, total_strips)
-	out := Buffer{}
-	buffer_init(&out, out_w * out_h / 2)
+	strip_cache_init(cache, total_strips)
 	pool: StripPool
 	strip_pool_init(&pool, 4)
 	defer strip_pool_stop(&pool)
+	rc: RenderCtx
+	rc.vp = vp
+	rc.pool = &pool
+	buffer_init(&rc.out, out_w * out_h / 2)
+	thread.create_and_start_with_data(&rc, render_thread, nil, .Normal, true)
 	pending: FrameMsg
 	have_pending := false
 	start_col := 1
 	start_row := 1
+	show_fps := false
+	fps_ui: FpsUI
+	src_fps := vs.fps
+	fps_sample_t := time.now()
+	fps_sample_n := 0
+	fps_ui_t := time.Time{}
 
 	quit := false
 	_last_frame_t := time.now()
@@ -91,6 +101,7 @@ main :: proc() {
 				audio_set_paused(paused)
 				if paused {
 					pause_start = time.now()
+					pause_clock = time.duration_seconds(time.since(playback_start))
 				} else {
 					playback_start = time.time_add(playback_start, time.since(pause_start))
 				}
@@ -103,11 +114,27 @@ main :: proc() {
 			case KEY_COLOR_UP:
 				color_idx = min(color_idx + 1, len(COLOR_LEVELS) - 1)
 				pal = get_palette(COLOR_LEVELS[color_idx])
-				strip_cache_init(&cache, total_strips)
+				cache = new(StripCache)
+				strip_cache_init(cache, total_strips)
+				if paused {
+					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal, cache)
+				}
 			case KEY_COLOR_DOWN:
 				color_idx = max(color_idx - 1, 0)
 				pal = get_palette(COLOR_LEVELS[color_idx])
-				strip_cache_init(&cache, total_strips)
+				cache = new(StripCache)
+				strip_cache_init(cache, total_strips)
+				if paused {
+					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal, cache)
+				}
+			case KEY_FPS:
+				show_fps = !show_fps
+				fps_ui_t = time.Time{}
+				if !show_fps {
+					sync.mutex_lock(&rc.stdout_mu)
+					fps_ui_hide(&fps_ui)
+					sync.mutex_unlock(&rc.stdout_mu)
+				}
 			}
 		}
 
@@ -122,9 +149,35 @@ main :: proc() {
 				}
 				out_w, out_h = nw, nh
 				total_strips = (out_h + 5) / 6
-				strip_cache_init(&cache, total_strips)
+				cache = new(StripCache)
+				strip_cache_init(cache, total_strips)
 				video_request_resize(vp, out_w, out_h)
+				sync.mutex_lock(&rc.stdout_mu)
 				fmt.print("\x1b[2J\x1b[3J\x1b[H")
+				sync.mutex_unlock(&rc.stdout_mu)
+				fps_ui.prev_len = 0
+			}
+		}
+
+		if time.duration_seconds(time.since(fps_ui_t)) >= 0.25 {
+			fps_ui_t = time.now()
+			wn := int(sync.atomic_load(&rc.written))
+			el := time.duration_seconds(time.since(fps_sample_t))
+			inst := 0.0
+			if el > 0 {
+				inst = f64(wn - fps_sample_n) / el
+			}
+			fps_sample_t = time.now()
+			fps_sample_n = wn
+			if show_fps {
+				fps_row := start_row + (out_h + cell_h - 1) / cell_h
+				sync.mutex_lock(&rc.stdout_mu)
+				if fps_row <= rows {
+					fps_ui_show(&fps_ui, fps_row, cols, fmt.tprintf("[ %d | %.3f/%sfps ]", pal.nc, inst, fps_preset(src_fps)))
+				} else {
+					fps_ui_hide(&fps_ui)
+				}
+				sync.mutex_unlock(&rc.stdout_mu)
 			}
 		}
 
@@ -146,15 +199,21 @@ main :: proc() {
 		}
 
 		pts := pending.pts_sec
-		clock := time.duration_seconds(time.since(playback_start))
-		if has_audio {
-			drift := clock - audio_clock_sec()
-			if drift > 0.05 || drift < -0.05 {
-				playback_start = time.time_add(time.now(), time.Duration(-audio_clock_sec() * 1e9))
-				clock = time.duration_seconds(time.since(playback_start))
+		clock := pause_clock
+		if !paused {
+			clock = time.duration_seconds(time.since(playback_start))
+			if has_audio {
+				drift := clock - audio_clock_sec()
+				if drift > 0.05 || drift < -0.05 {
+					playback_start = time.time_add(time.now(), time.Duration(-audio_clock_sec() * 1e9))
+					clock = time.duration_seconds(time.since(playback_start))
+				}
 			}
 		}
-		half := 0.020
+		lag_tol := 0.100
+		if src_fps > 0 {
+			lag_tol = 2.0 / src_fps
+		}
 		if pts > clock + 0.002 {
 			remain := pts - clock - 0.001
 			if remain > 0 {
@@ -162,41 +221,71 @@ main :: proc() {
 			}
 			continue
 		}
-		if pts < clock - half {
-				video_pool_put(vp, pending.buf)
+		if pts < clock - lag_tol {
+			video_pool_put(vp, pending.buf)
 			have_pending = false
 			continue
 		}
 
 		start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 		start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
-		buffer_reset(&out)
-		write_bytes(&out, []u8{0x1b})
-		write_byte(&out, '[')
-		write_sixel_num(&out, start_row)
-		write_byte(&out, ';')
-		write_sixel_num(&out, start_col)
-		write_byte(&out, 'H')
-		sixel_encode(&pool, &out, pending.buf, out_w, out_h, pal, &cache)
-		_t4 := time.now()
-		wdata := out.buf[:out.pos]
-		for len(wdata) > 0 {
-			nw, werr := os.write(os.stdout, wdata)
-			if werr != nil || nw <= 0 {
-				break
-			}
-			wdata = wdata[nw:]
-		}
-		prof_add(PROF_WRITE, i64(time.since(_t4)))
-	
-		video_pool_put(vp, pending.buf)
+		render_submit(&rc, RenderJob{
+			buf = pending.buf,
+			pts_sec = pts,
+			w = out_w,
+			h = out_h,
+			start_col = start_col,
+			start_row = start_row,
+			pal = pal,
+			cache = cache,
+		})
 		have_pending = false
 	}
 
+	render_stop(&rc)
 	video_stop(vp)
 	audio_shutdown()
 	term_leave_raw()
 	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1000h\x1b[?1002h\x1b[?1003h")
+}
+
+// fps_preset formats a frame rate with conventional notation for the
+// common rates and falls back to three decimals for anything else.
+fps_preset :: proc(fps: f64) -> string {
+	values := [8]f64{23.976, 24, 25, 29.97, 30, 50, 59.94, 60}
+	names := [8]string{"23.976", "24", "25", "29.97", "30", "50", "59.94", "60"}
+	for i in 0..<8 {
+		if abs(fps - values[i]) < 0.005 {
+			return names[i]
+		}
+	}
+	return fmt.tprintf("%.3f", fps)
+}
+
+FpsUI :: struct {
+	prev_row: int,
+	prev_col: int,
+	prev_len: int,
+}
+
+// fps_ui_hide erases the label drawn by the previous fps_ui_show call.
+fps_ui_hide :: proc(ui: ^FpsUI) {
+	if ui.prev_len > 0 {
+		spaces := "                                        "
+		n := min(ui.prev_len, len(spaces))
+		fmt.printf("\x1b[%d;%dH%s", ui.prev_row, ui.prev_col, spaces[:n])
+		ui.prev_len = 0
+	}
+}
+
+// fps_ui_show erases the previous label and draws bold text centered on row.
+fps_ui_show :: proc(ui: ^FpsUI, row, cols: int, text: string) {
+	fps_ui_hide(ui)
+	col := max((cols - len(text)) / 2 + 1, 1)
+	fmt.printf("\x1b[%d;%dH\x1b[1m%s\x1b[0m", row, col, text)
+	ui.prev_row = row
+	ui.prev_col = col
+	ui.prev_len = len(text)
 }
 
 fit_aspect :: proc(src_w, src_h, max_w, max_h: int) -> (int, int) {
