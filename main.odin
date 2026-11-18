@@ -19,6 +19,7 @@ main :: proc() {
 	color_cli := 0
 	vol_cli := -1.0
 	start_sec := 0.0
+	full_cli := true
 	file_arg := ""
 	argi := 1
 	for argi < len(os.args) {
@@ -53,6 +54,18 @@ main :: proc() {
 			vol_cli = v
 			if !ok || vol_cli < 0.0 || vol_cli > 100.0 {
 				cli_error("volume must be from 0 to 100")
+				os.exit(1)
+			}
+		} else if a == "-s" || a == "--size" {
+			argi += 1
+			if argi >= len(os.args) {
+				cli_error("missing value for --size")
+				os.exit(1)
+			}
+			if os.args[argi] == "half" {
+				full_cli = false
+			} else if os.args[argi] != "full" {
+				cli_error("size must be full or half")
 				os.exit(1)
 			}
 		} else if a == "-t" || a == "--start" {
@@ -105,7 +118,7 @@ main :: proc() {
 	cell_w, cell_h := term_cell_pixels()
 	out_w := cols * cell_w
 	out_h := rows * cell_h
-	out_w, out_h = fit_aspect(vs.src_w, vs.src_h, out_w, out_h)
+	out_w, out_h = fit_disp(vs.src_w, vs.src_h, cols, rows, cell_w, cell_h, full_cli)
 
 	vp := new(VideoPlayer)
 	vp.vs = vs
@@ -178,6 +191,7 @@ main :: proc() {
 	start_col := 1
 	start_row := 1
 	show_fps := false
+	full_disp := full_cli
 	fps_ui: FpsUI
 	src_fps := vs.fps
 	fps_sample_t := time.now()
@@ -264,6 +278,9 @@ main :: proc() {
 				if paused {
 					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal, cache)
 				}
+			case KEY_SIZE:
+				full_disp = !full_disp
+				sync.atomic_store(&winch_flag, 1)
 			case KEY_FPS:
 				show_fps = !show_fps
 				fps_ui_t = time.Time{}
@@ -278,7 +295,7 @@ main :: proc() {
 		if term_take_winch() {
 			cols, rows = term_size()
 			cell_w, cell_h = term_cell_pixels()
-			nw, nh := fit_aspect(vs.src_w, vs.src_h, cols*cell_w, rows*cell_h)
+			nw, nh := fit_disp(vs.src_w, vs.src_h, cols, rows, cell_w, cell_h, full_disp)
 			if nw != vp.out_w || nh != vp.out_h {
 				if have_pending {
 					video_pool_put(vp, pending.buf)
@@ -308,7 +325,7 @@ main :: proc() {
 			fps_sample_t = time.now()
 			fps_sample_n = wn
 			if show_fps {
-				fps_row := start_row + (out_h + cell_h - 1) / cell_h
+				fps_row := start_row + (out_h + cell_h - 1) / cell_h + 1
 				pos := pause_clock
 				if !paused {
 					pos = time.duration_seconds(time.since(playback_start))
@@ -322,7 +339,11 @@ main :: proc() {
 				if muted {
 					seg = "MUTE"
 				}
-				label := fmt.tprintf("[ %d | %.3f/%sfps | %s | %s ]", pal.nc, inst, fps_preset(src_fps), ptext, seg)
+				size_mark := "\u2922"
+				if !full_disp {
+					size_mark = "\u26F6"
+				}
+				label := fmt.tprintf("[ %d | %.3f/%sfps | %s | %s | %s ]", pal.nc, inst, fps_preset(src_fps), ptext, seg, size_mark)
 				sync.mutex_lock(&rc.stdout_mu)
 				if fps_row <= rows {
 					fps_ui_show(&fps_ui, fps_row, cols, label)
@@ -460,12 +481,35 @@ fps_ui_show_at :: proc(ui: ^FpsUI, row, col: int, text: string) {
 	fmt.printf("\x1b[%d;%dH\x1b[1m%s\x1b[0m", row, col, text)
 	ui.prev_row = row
 	ui.prev_col = col
-	ui.prev_len = len(text)
+	ui.prev_len = text_width(text)
 }
 
 // fps_ui_show erases the previous label and draws bold text centered on row.
 fps_ui_show :: proc(ui: ^FpsUI, row, cols: int, text: string) {
-	fps_ui_show_at(ui, row, max((cols - len(text)) / 2 + 1, 1), text)
+	fps_ui_show_at(ui, row, max((cols - text_width(text)) / 2 + 1, 1), text)
+}
+
+// fit_disp returns the video size fitted to the display area. When full is
+// false the area is halved in both dimensions.
+fit_disp :: proc(src_w, src_h, cols, rows, cell_w, cell_h: int, full: bool) -> (int, int) {
+	w := cols * cell_w
+	h := rows * cell_h
+	if !full {
+		w /= 2
+		h /= 2
+	}
+	return fit_aspect(src_w, src_h, w, h)
+}
+
+// text_width returns the printable width of s counting codepoints.
+text_width :: proc(s: string) -> int {
+	n := 0
+	for i in 0..<len(s) {
+		if s[i] & 0xC0 != 0x80 {
+			n += 1
+		}
+	}
+	return n
 }
 
 fit_aspect :: proc(src_w, src_h, max_w, max_h: int) -> (int, int) {

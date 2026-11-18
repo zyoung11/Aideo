@@ -359,10 +359,6 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			vp.out_h = nh
 			video_make_sws(vs, nw, nh)
 			sync.mutex_unlock(&vp.sws_mu)
-			cur := f64(sync.atomic_load(&vp.last_pts)) / 1000000000.0
-			seek_target := i64((cur - f64(sync.atomic_load(&vp.loop_offset)) / 1000000000.0) / vs.time_base)
-			av_seek_frame(vs.fmt_ctx, c.int(vs.stream_idx), seek_target, AVSEEK_FLAG_BACKWARD)
-			avcodec_flush_buffers(vs.codec_ctx)
 			for {
 				m, ok := fq_try_pop(&vp.queue)
 				if !ok {

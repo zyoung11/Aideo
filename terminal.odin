@@ -147,6 +147,7 @@ KEY_FPS :: 6
 KEY_MUTE :: 8
 KEY_SEEK_FWD :: 9
 KEY_SEEK_BACK :: 10
+KEY_SIZE :: 11
 
 key_queue: [32]u8
 key_head: i64
@@ -217,6 +218,8 @@ key_thread :: proc() {
 				key_push(KEY_FPS)
 			case 'm', 'M':
 				key_push(KEY_MUTE)
+			case 'f', 'F':
+				key_push(KEY_SIZE)
 			}
 			i += 1
 		}

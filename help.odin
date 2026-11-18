@@ -52,6 +52,7 @@ print_help :: proc() {
 	help_line(HELP_YELLOW, "-c, --colors <n>", 22, "color count, one of 2 8 16 32 64 128 256")
 	help_line(HELP_YELLOW, "-v, --volume <n>", 22, "volume percent from 0 to 100")
 	help_line(HELP_YELLOW, "-t, --start <time>", 22, "start position, seconds or mm:ss or hh:mm:ss")
+	help_line(HELP_YELLOW, "-s, --size <mode>", 22, "display size, full or half")
 	help_line(HELP_YELLOW, "-h, --help", 22, "show this help page")
 	help_line(HELP_YELLOW, "    --version", 22, "show the version")
 	fmt.printfln("")
@@ -66,10 +67,11 @@ print_help :: proc() {
 	help_line(HELP_GREEN, "m", 22, "toggle mute")
 	help_line(HELP_GREEN, "Left, Right", 22, "seek 5 seconds backward or forward")
 	help_line(HELP_GREEN, "Tab", 22, "show or hide the status label")
+	help_line(HELP_GREEN, "f", 22, "toggle full or half size picture")
 	fmt.printfln("")
 	fmt.printfln("%sEXAMPLES:%s", section, HELP_RESET)
 	fmt.printfln("  %saideo video.mp4%s", HELP_BLUE, HELP_RESET)
-	fmt.printfln("  %saideo -c 256 -v 80 -t 1:30 concert.mkv%s", HELP_BLUE, HELP_RESET)
+	fmt.printfln("  %saideo -c 256 -v 80 -t 1:30 -s half concert.mkv%s", HELP_BLUE, HELP_RESET)
 	fmt.printfln("")
 }
 

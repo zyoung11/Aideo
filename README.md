@@ -39,6 +39,7 @@ odin build . -o:speed -out:aideo
 | `↑` / `↓` | 音量增 / 减 |
 | `Tab` | 显示 / 隐藏帧率标签 |
 | `m` | 静音 / 取消静音 |
+| `f` | 全屏 / 半屏画面切换 |
 | `←` / `→` | 后退 / 前进 5 秒 |
 
 终端 resize 自适应，不中断播放。
@@ -46,6 +47,8 @@ odin build . -o:speed -out:aideo
 ## 测试
 
 ```bash
-./Aideo citest    # SIMD 与标量量化一致性
-./Aideo cibench   # 量化与编码耗时基准
+./aideo citest    # 量化与哈希的 SIMD 一致性
+./aideo cibench   # 量化与编码耗时基准
+./aideo cisws     # 缩放器逐字节一致性与耗时
+./aideo ciframe   # 单帧像素对照诊断
 ```
