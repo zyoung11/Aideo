@@ -552,7 +552,7 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx, ws: ^StripWorkerState) {
 				quantize_row_gray(row_ci, row, width, yb4, pal)
 			} else if uniform {
 				quantize_row_uniform_simd(row_ci, row, width, yb4, pal)
-				q := width &~ 3
+				q := width &~ 7
 				quantize_row_uniform_scalar(row_ci, row, width, yb4, q, pal)
 			} else {
 				quantize_row_uniform_scalar(row_ci, row, width, yb4, 0, pal)

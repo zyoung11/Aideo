@@ -72,6 +72,8 @@ VideoStream :: struct {
 	codec_ctx:  ^AVCodecContext,
 	sws:        ^SwsContext,
 	retired:    [dynamic]^SwsContext,
+	plan:       ^ScalePlan,
+	plan_old:   [dynamic]^ScalePlan,
 	pkt:        ^AVPacket,
 	frame:      ^AVFrame,
 	stream_idx: int,
@@ -87,6 +89,7 @@ VideoPlayer :: struct {
 	vs:          ^VideoStream,
 	queue:       FrameQueue,
 	yuvq:        YuvQueue,
+	spool:       ScalePool,
 	sws_mu:      sync.Mutex,
 	pool:        [3][]u8,
 	pool_mu:     sync.Mutex,
@@ -194,6 +197,9 @@ video_close :: proc(vs: ^VideoStream) {
 	for ctx in vs.retired {
 		sws_freeContext(ctx)
 	}
+	for p in vs.plan_old {
+		free(p)
+	}
 	av_packet_free(&vs.pkt)
 	av_frame_free(&vs.frame)
 	avcodec_free_context(&vs.codec_ctx)
@@ -210,8 +216,12 @@ video_make_sws :: proc(vs: ^VideoStream, out_w, out_h: int) {
 	if vs.sws != nil {
 		append(&vs.retired, vs.sws)
 	}
+	if vs.plan != nil {
+		append(&vs.plan_old, vs.plan)
+	}
 	vs.sws = sws_getContext(c.int(vs.src_w), c.int(vs.src_h), c.int(vs.src_format),
 		c.int(out_w), c.int(out_h), AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nil, nil, nil)
+	vs.plan = scale_plan(vs.src_w, vs.src_h, out_w, out_h)
 }
 
 // YuvQueue carries decoded source frames from the decode thread to the
@@ -293,6 +303,7 @@ video_scale_thread :: proc(vp: ^VideoPlayer) {
 		_t2 := time.now()
 		sync.mutex_lock(&vp.sws_mu)
 		sws := vs.sws
+		plan := vs.plan
 		ow := vp.out_w
 		oh := vp.out_h
 		sync.mutex_unlock(&vp.sws_mu)
@@ -300,11 +311,16 @@ video_scale_thread :: proc(vp: ^VideoPlayer) {
 		if sws != nil {
 			fs := ow * oh * 4
 			buf = video_pool_get(vp, fs)
-			dst_data: [1][^]u8
-			dst_data[0] = ([^]u8)(&buf[0])
-			dst_stride: [1]c.int
-			dst_stride[0] = c.int(ow * 4)
-			sws_scale(sws, &yf.data[0], &yf.linesize[0], 0, yf.height, &dst_data[0], &dst_stride[0])
+			if int(yf.format) == AV_PIX_FMT_YUV420P && plan != nil {
+				scale_frame(&vp.spool, plan, yf.data[0], yf.data[1], yf.data[2],
+					int(yf.linesize[0]), int(yf.linesize[1]), &buf[0], ow * 4)
+			} else {
+				dst_data: [1][^]u8
+				dst_data[0] = ([^]u8)(&buf[0])
+				dst_stride: [1]c.int
+				dst_stride[0] = c.int(ow * 4)
+				sws_scale(sws, &yf.data[0], &yf.linesize[0], 0, yf.height, &dst_data[0], &dst_stride[0])
+			}
 		}
 		prof_add(PROF_DECODE_SWS, i64(time.since(_t2)))
 		pts_sec := f64(yf.pts) / 1000000000.0
@@ -392,6 +408,7 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 video_start :: proc(vp: ^VideoPlayer) {
 	fq_init(&vp.queue)
 	yuv_init(&vp.yuvq)
+	scale_pool_init(&vp.spool, max(cpu_count() / 2, 2))
 	thread.create_and_start_with_data(vp, proc(data: rawptr) {
 		video_scale_thread((^VideoPlayer)(data))
 	}, nil, thread.Thread_Priority.Normal, true)

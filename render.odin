@@ -6,8 +6,7 @@ import "core:thread"
 import "core:time"
 
 // RenderJob is an immutable snapshot of everything the render thread
-// needs to encode and write one frame. A keep job renders the frozen
-// frame owned by the render context and must not be returned to the pool.
+// needs to encode and write one frame.
 RenderJob :: struct {
 	buf:       []u8,
 	pts_sec:   f64,
@@ -17,7 +16,6 @@ RenderJob :: struct {
 	start_row: int,
 	pal:       ^SixelPalette,
 	cache:     ^StripCache,
-	keep:      bool,
 }
 
 // RenderCtx decouples sixel encoding and terminal writes from the frame
@@ -43,9 +41,7 @@ RenderCtx :: struct {
 render_submit :: proc(rc: ^RenderCtx, job: RenderJob) {
 	sync.mutex_lock(&rc.mu)
 	if rc.has {
-		if !rc.job.keep {
-			video_pool_put(rc.vp, rc.job.buf)
-		}
+		video_pool_put(rc.vp, rc.job.buf)
 	} else {
 		sync.sema_post(&rc.used)
 	}
@@ -55,7 +51,8 @@ render_submit :: proc(rc: ^RenderCtx, job: RenderJob) {
 }
 
 // rerender_freeze re-renders the frozen frame with the current palette so
-// palette changes are visible while playback is paused.
+// palette changes are visible while playback is paused. The frozen frame
+// is copied because the render thread owns the freeze buffer.
 rerender_freeze :: proc(rc: ^RenderCtx, w, h, start_col, start_row: int, pal: ^SixelPalette, cache: ^StripCache) {
 	sync.mutex_lock(&rc.mu)
 	fb := rc.freeze
@@ -64,15 +61,16 @@ rerender_freeze :: proc(rc: ^RenderCtx, w, h, start_col, start_row: int, pal: ^S
 	if fn != w * h * 4 || len(fb) < fn {
 		return
 	}
+	cp := video_pool_get(rc.vp, fn)
+	copy(cp, fb[:fn])
 	render_submit(rc, RenderJob{
-		buf = fb[:fn],
+		buf = cp,
 		w = w,
 		h = h,
 		start_col = start_col,
 		start_row = start_row,
 		pal = pal,
 		cache = cache,
-		keep = true,
 	})
 }
 
@@ -89,7 +87,7 @@ render_thread :: proc(data: rawptr) {
 		stopped := sync.atomic_load(&rc.stopped) != 0
 		sync.mutex_unlock(&rc.mu)
 		if stopped {
-			if len(job.buf) > 0 && !job.keep {
+			if len(job.buf) > 0 {
 				video_pool_put(rc.vp, job.buf)
 			}
 			return
@@ -118,15 +116,13 @@ render_thread :: proc(data: rawptr) {
 		sync.mutex_unlock(&rc.stdout_mu)
 		prof_add(PROF_WRITE, i64(time.since(_t4)))
 		sync.atomic_add(&rc.written, 1)
-		if !job.keep {
-			sync.mutex_lock(&rc.mu)
-			if len(rc.freeze) < len(job.buf) {
-				rc.freeze = make([]u8, len(job.buf))
-			}
-			copy(rc.freeze, job.buf)
-			rc.freeze_n = len(job.buf)
-			sync.mutex_unlock(&rc.mu)
-			video_pool_put(rc.vp, job.buf)
+		sync.mutex_lock(&rc.mu)
+		old := rc.freeze
+		rc.freeze = job.buf
+		rc.freeze_n = len(job.buf)
+		sync.mutex_unlock(&rc.mu)
+		if len(old) > 0 {
+			video_pool_put(rc.vp, old)
 		}
 	}
 }

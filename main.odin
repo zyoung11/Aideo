@@ -10,7 +10,10 @@ import "core:thread"
 COLOR_LEVELS := [7]int{2, 8, 16, 32, 64, 128, 256}
 
 main :: proc() {
+	// defer prof_report()
 	if len(os.args) >= 2 && os.args[1] == "citest" { ci_test(); return }
+	if len(os.args) >= 2 && os.args[1] == "cisws" { ci_sws(); return }
+	if len(os.args) >= 2 && os.args[1] == "ciframe" { ci_frame(); return }
 	if len(os.args) >= 2 && os.args[1] == "cibench" { ci_bench(); return }
 	if len(os.args) < 2 {
 		fmt.printfln("usage: aideo <video file>")
