@@ -45,13 +45,14 @@ ci_bench :: proc() {
 	defer strip_pool_stop(&pool)
 
 	t0 = time.now()
-	sixel_encode(&pool, &out, rgba, w, h, p, &cache)
+	iovs: IoVecList
+	sixel_encode_iov(&pool, &out, rgba, w, h, p, &cache, &iovs)
 	t_first := time.duration_seconds(time.since(t0))
-	first_len := out.pos
+	first_len := iovs_len(&iovs)
 
 	buffer_reset(&out)
 	t0 = time.now()
-	sixel_encode(&pool, &out, rgba, w, h, p, &cache)
+	sixel_encode_iov(&pool, &out, rgba, w, h, p, &cache, &iovs)
 	t_cached := time.duration_seconds(time.since(t0))
 
 	fmt.printfln("quantize row(1280px) x200: simd=%.4fs scalar=%.4fs", t_simd, t_scalar)

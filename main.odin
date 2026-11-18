@@ -75,6 +75,7 @@ main :: proc() {
 	thread.create_and_start_with_data(&rc, render_thread, nil, .Normal, true)
 	pending: FrameMsg
 	have_pending := false
+	force_frame := false
 	start_col := 1
 	start_row := 1
 	show_fps := false
@@ -154,9 +155,8 @@ main :: proc() {
 				cache = new(StripCache)
 				strip_cache_init(cache, total_strips)
 				video_request_resize(vp, out_w, out_h)
-				sync.mutex_lock(&rc.stdout_mu)
-				fmt.print("\x1b[2J\x1b[3J\x1b[H")
-				sync.mutex_unlock(&rc.stdout_mu)
+				render_submit(&rc, RenderJob{clear = true})
+				force_frame = true
 				fps_ui.prev_len = 0
 			}
 		}
@@ -196,6 +196,24 @@ main :: proc() {
 		}
 		if len(pending.buf) != out_w * out_h * 4 {
 			video_pool_put(vp, pending.buf)
+			have_pending = false
+			continue
+		}
+
+		start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
+		start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
+		if force_frame {
+			force_frame = false
+			render_submit(&rc, RenderJob{
+				buf = pending.buf,
+				pts_sec = pending.pts_sec,
+				w = out_w,
+				h = out_h,
+				start_col = start_col,
+				start_row = start_row,
+				pal = pal,
+				cache = cache,
+			})
 			have_pending = false
 			continue
 		}

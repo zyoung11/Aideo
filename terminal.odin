@@ -38,6 +38,38 @@ foreign clib {
 	ioctl :: proc(fd: c.int, req: u64, arg: rawptr) -> c.int ---
 	signal :: proc(sig: c.int, handler: rawptr) -> rawptr ---
 	sysconf :: proc(name: c.int) -> c.long ---
+	writev :: proc(fd: c.int, iov: [^]IoVec, cnt: c.int) -> c.long ---
+}
+
+// IoVec is one scatter gather buffer for writev.
+IoVec :: struct {
+	iov_base: rawptr,
+	iov_len:  u64,
+}
+
+// IoVecList collects scatter gather segments with a fixed capacity.
+IoVecList :: struct {
+	iovs: [4096]IoVec,
+	n:    int,
+}
+
+// iovs_push appends one segment to the list.
+iovs_push :: proc(l: ^IoVecList, data: []u8) {
+	if len(data) == 0 || l.n >= len(l.iovs) {
+		return
+	}
+	l.iovs[l.n].iov_base = &data[0]
+	l.iovs[l.n].iov_len = u64(len(data))
+	l.n += 1
+}
+
+// iovs_len returns the total byte count of all segments.
+iovs_len :: proc(l: ^IoVecList) -> int {
+	t := 0
+	for i in 0..<l.n {
+		t += int(l.iovs[i].iov_len)
+	}
+	return t
 }
 
 // cpu_count returns the number of online CPUs.

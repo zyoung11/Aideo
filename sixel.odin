@@ -15,6 +15,9 @@ foreign avx2lib {
 
 BAYER_4X4 := [16]i8{0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}
 
+DECGNL_BYTES := [1]u8{0x2d}
+SIXEL_ST_BYTES := [2]u8{0x1b, 0x5c}
+
 PALETTE_LEVELS := [7]int{2, 8, 16, 32, 64, 128, 256}
 PALETTE_BITS  := [7][3]int{{0, 0, 0}, {1, 1, 1}, {2, 1, 1}, {2, 2, 1}, {2, 2, 2}, {3, 2, 2}, {3, 3, 2}}
 
@@ -624,7 +627,10 @@ strip_pool_stop :: proc(pool: ^StripPool) {
 	}
 }
 
-sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: int, pal: ^SixelPalette, cache: ^StripCache) {
+// sixel_encode_iov assembles one frame as scatter gather segments. The
+// prefix with header and palette is built in out, band data is referenced
+// straight from the cache so nothing is copied.
+sixel_encode_iov :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: int, pal: ^SixelPalette, cache: ^StripCache, iovs: ^IoVecList) {
 	nc := pal.nc
 	total_strips := (height + 5) / 6
 
@@ -667,14 +673,16 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 		sync.sema_wait(&pool.done)
 	}
 
+	iovs.n = 0
+	iovs_push(iovs, out.buf[:out.pos])
 	for srow in 0..<total_strips {
 		if srow > 0 {
-			write_byte(out, 0x2d)
+			iovs_push(iovs, DECGNL_BYTES[:])
 		}
 		if cache.changed[srow] != 0 {
-			write_bytes(out, cache.rle[srow][:])
+			iovs_push(iovs, cache.rle[srow][:])
 		}
 	}
-	write_bytes(out, []u8{0x1b, 0x5c})
+	iovs_push(iovs, SIXEL_ST_BYTES[:])
 	prof_add(PROF_ENCODE_ASM, i64(time.since(_t3)))
 }

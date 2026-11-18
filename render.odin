@@ -1,12 +1,14 @@
 package aideo
 
-import "core:os"
+import "core:c"
 import "core:sync"
 import "core:thread"
 import "core:time"
 
+CLEAR_BYTES := [11]u8{0x1b, '[', '2', 'J', 0x1b, '[', '3', 'J', 0x1b, '[', 'H'}
+
 // RenderJob is an immutable snapshot of everything the render thread
-// needs to encode and write one frame.
+// needs to encode and write one frame. A clear job only wipes the screen.
 RenderJob :: struct {
 	buf:       []u8,
 	pts_sec:   f64,
@@ -16,6 +18,7 @@ RenderJob :: struct {
 	start_row: int,
 	pal:       ^SixelPalette,
 	cache:     ^StripCache,
+	clear:     bool,
 }
 
 // RenderCtx decouples sixel encoding and terminal writes from the frame
@@ -31,6 +34,7 @@ RenderCtx :: struct {
 	vp:        ^VideoPlayer,
 	pool:      ^StripPool,
 	out:       Buffer,
+	iovs:      IoVecList,
 	stdout_mu: sync.Mutex,
 	written:   i64,
 	freeze:    []u8,
@@ -41,7 +45,9 @@ RenderCtx :: struct {
 render_submit :: proc(rc: ^RenderCtx, job: RenderJob) {
 	sync.mutex_lock(&rc.mu)
 	if rc.has {
-		video_pool_put(rc.vp, rc.job.buf)
+		if len(rc.job.buf) > 0 {
+			video_pool_put(rc.vp, rc.job.buf)
+		}
 	} else {
 		sync.sema_post(&rc.used)
 	}
@@ -92,6 +98,14 @@ render_thread :: proc(data: rawptr) {
 			}
 			return
 		}
+		if job.clear {
+			varr: IoVecList
+			iovs_push(&varr, CLEAR_BYTES[:])
+			sync.mutex_lock(&rc.stdout_mu)
+			writev_all(&varr)
+			sync.mutex_unlock(&rc.stdout_mu)
+			continue
+		}
 		if len(job.buf) == 0 {
 			continue
 		}
@@ -102,17 +116,10 @@ render_thread :: proc(data: rawptr) {
 		write_byte(&rc.out, ';')
 		write_sixel_num(&rc.out, job.start_col)
 		write_byte(&rc.out, 'H')
-		sixel_encode(rc.pool, &rc.out, job.buf, job.w, job.h, job.pal, job.cache)
+		sixel_encode_iov(rc.pool, &rc.out, job.buf, job.w, job.h, job.pal, job.cache, &rc.iovs)
 		_t4 := time.now()
 		sync.mutex_lock(&rc.stdout_mu)
-		wdata := rc.out.buf[:rc.out.pos]
-		for len(wdata) > 0 {
-			nw, werr := os.write(os.stdout, wdata)
-			if werr != nil || nw <= 0 {
-				break
-			}
-			wdata = wdata[nw:]
-		}
+		writev_all(&rc.iovs)
 		sync.mutex_unlock(&rc.stdout_mu)
 		prof_add(PROF_WRITE, i64(time.since(_t4)))
 		sync.atomic_add(&rc.written, 1)
@@ -123,6 +130,31 @@ render_thread :: proc(data: rawptr) {
 		sync.mutex_unlock(&rc.mu)
 		if len(old) > 0 {
 			video_pool_put(rc.vp, old)
+		}
+	}
+}
+
+// writev_all writes the whole iovec list, handling partial writes.
+writev_all :: proc(l: ^IoVecList) {
+	base := 0
+	for base < l.n {
+		cnt := min(l.n - base, 1024)
+		nw := writev(1, &l.iovs[base], c.int(cnt))
+		if nw <= 0 {
+			return
+		}
+		remain := int(nw)
+		for remain > 0 && base < l.n {
+			sz := int(l.iovs[base].iov_len)
+			if sz <= remain {
+				remain -= sz
+				base += 1
+			} else {
+				p := ([^]u8)(l.iovs[base].iov_base)
+				l.iovs[base].iov_base = &p[remain]
+				l.iovs[base].iov_len = u64(sz - remain)
+				remain = 0
+			}
 		}
 	}
 }
