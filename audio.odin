@@ -59,6 +59,7 @@ ring_read :: proc "contextless" (rb: ^RingBuffer, dst: []i16) -> int {
 }
 
 AudioState :: struct {
+	ctx:     ma.context_type,
 	device:  ma.device,
 	ring:    RingBuffer,
 	consumed: i64,
@@ -113,7 +114,13 @@ audio_init :: proc() -> bool {
 	ring_init(&audio_state.ring, AUDIO_RATE * 4)
 	audio_state.scratch = make([]i16, AUDIO_RATE / 10 * AUDIO_CHANNELS)
 	sync.atomic_store(&audio_state.volume, transmute(i64)u64(u32(transmute(u32)f32(1.0))))
-	if ma.device_init(nil, &config, &audio_state.device) != .SUCCESS {
+	config.pulse.pStreamNamePlayback = cstring("Aideo")
+	ctx_config := ma.context_config_init()
+	ctx_config.pulse.pApplicationName = cstring("Aideo")
+	if ma.context_init(nil, 0, &ctx_config, &audio_state.ctx) != .SUCCESS {
+		return false
+	}
+	if ma.device_init(&audio_state.ctx, &config, &audio_state.device) != .SUCCESS {
 		return false
 	}
 	if ma.device_start(&audio_state.device) != .SUCCESS {
@@ -127,6 +134,7 @@ audio_init :: proc() -> bool {
 audio_shutdown :: proc() {
 	if audio_state.dev_ok {
 		ma.device_uninit(&audio_state.device)
+		ma.context_uninit(&audio_state.ctx)
 		audio_state.dev_ok = false
 	}
 }

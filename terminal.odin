@@ -143,6 +143,7 @@ KEY_VOL_DOWN :: 3
 KEY_COLOR_UP :: 4
 KEY_COLOR_DOWN :: 5
 KEY_FPS :: 6
+KEY_MUTE :: 8
 
 key_queue: [32]u8
 key_head: i64
@@ -185,8 +186,8 @@ key_thread :: proc() {
 				for i < n && !((buf[i] >= 'A' && buf[i] <= 'Z') || (buf[i] >= 'a' && buf[i] <= 'z') || buf[i] == '~') {
 					i += 1
 				}
-				if i-1 >= 0 && i-1 < n {
-					switch buf[i-1] {
+				if i < n {
+					switch buf[i] {
 					case 'A':
 						key_push(KEY_VOL_UP)
 					case 'B':
@@ -207,6 +208,8 @@ key_thread :: proc() {
 				key_push(KEY_COLOR_UP)
 			case 9:
 				key_push(KEY_FPS)
+			case 'm', 'M':
+				key_push(KEY_MUTE)
 			}
 			i += 1
 		}

@@ -25,8 +25,8 @@
 ## 构建与运行
 
 ```bash
-odin build . -o:speed
-./Aideo video.mp4
+odin build . -o:speed -out:aideo
+./aideo video.mp4
 ```
 
 ## 按键
@@ -38,6 +38,7 @@ odin build . -o:speed
 | `j` / `k` | 色数降档 / 升档（2/8/16/32/64/128/256） |
 | `↑` / `↓` | 音量增 / 减 |
 | `Tab` | 显示 / 隐藏帧率标签 |
+| `m` | 静音 / 取消静音 |
 
 终端 resize 自适应，不中断播放。
 

@@ -60,6 +60,7 @@ main :: proc() {
 	playback_start := start_wall
 	pause_start := start_wall
 	paused := false
+	muted := false
 	pause_clock := 0.0
 	volume := 1.0
 	cache := new(StripCache)
@@ -81,6 +82,7 @@ main :: proc() {
 	start_col := 1
 	start_row := 1
 	show_fps := false
+	last_vol_t: time.Time
 	fps_ui: FpsUI
 	src_fps := vs.fps
 	fps_sample_t := time.now()
@@ -112,10 +114,25 @@ main :: proc() {
 				}
 			case KEY_VOL_UP:
 				volume = min(volume + 0.05, 1.0)
+				muted = false
 				audio_set_volume(f32(volume))
+				last_vol_t = time.now()
+				fps_ui_t = time.Time{}
 			case KEY_VOL_DOWN:
 				volume = max(volume - 0.05, 0.0)
+				muted = false
 				audio_set_volume(f32(volume))
+				last_vol_t = time.now()
+				fps_ui_t = time.Time{}
+			case KEY_MUTE:
+				muted = !muted
+				if muted {
+					audio_set_volume(0.0)
+				} else {
+					audio_set_volume(f32(volume))
+				}
+				last_vol_t = time.now()
+				fps_ui_t = time.Time{}
 			case KEY_COLOR_UP:
 				color_idx = min(color_idx + 1, len(COLOR_LEVELS) - 1)
 				pal = get_palette(COLOR_LEVELS[color_idx])
@@ -177,9 +194,17 @@ main :: proc() {
 			fps_sample_n = wn
 			if show_fps {
 				fps_row := start_row + (out_h + cell_h - 1) / cell_h
+				label := fmt.tprintf("[ %d | %.3f/%sfps ]", pal.nc, inst, fps_preset(src_fps))
+				if time.duration_seconds(time.since(last_vol_t)) < 5.0 {
+					seg := fmt.tprintf("%d%%", int(volume * 100 + 0.5))
+					if muted {
+						seg = "MUTE"
+					}
+					label = fmt.tprintf("[ %d | %.3f/%sfps | %s ]", pal.nc, inst, fps_preset(src_fps), seg)
+				}
 				sync.mutex_lock(&rc.stdout_mu)
 				if fps_row <= rows {
-					fps_ui_show(&fps_ui, fps_row, cols, fmt.tprintf("[ %d | %.3f/%sfps ]", pal.nc, inst, fps_preset(src_fps)))
+					fps_ui_show(&fps_ui, fps_row, cols, label)
 				} else {
 					fps_ui_hide(&fps_ui)
 				}
@@ -302,14 +327,19 @@ fps_ui_hide :: proc(ui: ^FpsUI) {
 	}
 }
 
-// fps_ui_show erases the previous label and draws bold text centered on row.
-fps_ui_show :: proc(ui: ^FpsUI, row, cols: int, text: string) {
+// fps_ui_show_at erases the previous label and draws bold text at a fixed
+// column.
+fps_ui_show_at :: proc(ui: ^FpsUI, row, col: int, text: string) {
 	fps_ui_hide(ui)
-	col := max((cols - len(text)) / 2 + 1, 1)
 	fmt.printf("\x1b[%d;%dH\x1b[1m%s\x1b[0m", row, col, text)
 	ui.prev_row = row
 	ui.prev_col = col
 	ui.prev_len = len(text)
+}
+
+// fps_ui_show erases the previous label and draws bold text centered on row.
+fps_ui_show :: proc(ui: ^FpsUI, row, cols: int, text: string) {
+	fps_ui_show_at(ui, row, max((cols - len(text)) / 2 + 1, 1), text)
 }
 
 fit_aspect :: proc(src_w, src_h, max_w, max_h: int) -> (int, int) {
