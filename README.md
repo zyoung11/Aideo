@@ -25,6 +25,7 @@
 ## 构建与运行
 
 ```bash
+cc -O3 -mavx2 -c avx2_quant.c -o avx2_quant.o
 odin build . -o:speed -out:aideo
 ./aideo video.mp4
 ```

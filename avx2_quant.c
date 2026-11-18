@@ -24,7 +24,7 @@ int cpu_simd_level(void) {
  * vert_acc_init_avx2 seeds an accumulator row with one weighted source
  * row, replacing the separate zero fill and first accumulate.
  */
-static void vert_acc_init_avx2(uint32_t *acc, const unsigned char *row, uint32_t w, int n) {
+__attribute__((target("avx2"))) static void vert_acc_init_avx2(uint32_t *acc, const unsigned char *row, uint32_t w, int n) {
     const __m256i vw = _mm256_set1_epi32((int)w);
     int i = 0;
     for (; i + 8 <= n; i += 8) {
@@ -41,7 +41,7 @@ static void vert_acc_init_avx2(uint32_t *acc, const unsigned char *row, uint32_t
  * vert_acc_avx2 adds one weighted source row into an accumulator row.
  * The arithmetic is exact 32 bit, matching the scalar reference.
  */
-static void vert_acc_avx2(uint32_t *acc, const unsigned char *row, uint32_t w, int n) {
+__attribute__((target("avx2"))) static void vert_acc_avx2(uint32_t *acc, const unsigned char *row, uint32_t w, int n) {
     const __m256i vw = _mm256_set1_epi32((int)w);
     int i = 0;
     for (; i + 8 <= n; i += 8) {
@@ -59,7 +59,7 @@ static void vert_acc_avx2(uint32_t *acc, const unsigned char *row, uint32_t w, i
  * norm_acc_avx2 normalizes accumulator rows to bytes with the exact
  * rounding of (acc * inv + 2^31) >> 32, computed without table lookups.
  */
-static void norm_acc_avx2(unsigned char *dst, const unsigned int *acc, unsigned int inv, int n) {
+__attribute__((target("avx2"))) static void norm_acc_avx2(unsigned char *dst, const unsigned int *acc, unsigned int inv, int n) {
     const __m256i vinv = _mm256_set1_epi32((int)inv);
     int i = 0;
     for (; i + 8 <= n; i += 8) {
@@ -82,7 +82,7 @@ static void norm_acc_avx2(unsigned char *dst, const unsigned int *acc, unsigned 
  * rgba_matrix_avx2 converts one normalized YUV row to RGBA with the
  * BT.601 limited range matrix, clamped exactly like the scalar code.
  */
-static void rgba_matrix_avx2(unsigned char *dst, const unsigned char *ty,
+__attribute__((target("avx2"))) static void rgba_matrix_avx2(unsigned char *dst, const unsigned char *ty,
                       const unsigned char *tu, const unsigned char *tv, int n) {
     const __m256i vy = _mm256_set1_epi32(16);
     const __m256i vc = _mm256_set1_epi32(128);
@@ -181,7 +181,7 @@ uint64_t hash_strip_avx2(const unsigned char *rgba, int width, int y_start, int 
  * registers. Each channel has its own scaled Bayer dither pair in lane
  * order: bytes 0..3 for pixels 0..3 and bytes 16..19 for pixels 4..7.
  */
-static void quant_row_avx2(unsigned char *dst, const unsigned char *rgba, int w,
+__attribute__((target("avx2"))) static void quant_row_avx2(unsigned char *dst, const unsigned char *rgba, int w,
                     const unsigned char *dpos_r, const unsigned char *dneg_r,
                     const unsigned char *dpos_g, const unsigned char *dneg_g,
                     const unsigned char *dpos_b, const unsigned char *dneg_b,
@@ -236,7 +236,7 @@ static void quant_row_avx2(unsigned char *dst, const unsigned char *rgba, int w,
  * both paths produce byte identical output; the wider vectors simply use
  * fewer instructions for the same work.
  */
-static void vert_acc_init_avx512(uint32_t *acc, const unsigned char *row, uint32_t w, int n) {
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vbmi"))) static void vert_acc_init_avx512(uint32_t *acc, const unsigned char *row, uint32_t w, int n) {
     const __m512i vw = _mm512_set1_epi32((int)w);
     int i = 0;
     for (; i + 16 <= n; i += 16) {
@@ -254,7 +254,7 @@ static void vert_acc_init_avx512(uint32_t *acc, const unsigned char *row, uint32
     }
 }
 
-static void vert_acc_avx512(uint32_t *acc, const unsigned char *row, uint32_t w, int n) {
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vbmi"))) static void vert_acc_avx512(uint32_t *acc, const unsigned char *row, uint32_t w, int n) {
     const __m512i vw = _mm512_set1_epi32((int)w);
     int i = 0;
     for (; i + 16 <= n; i += 16) {
@@ -274,7 +274,7 @@ static void vert_acc_avx512(uint32_t *acc, const unsigned char *row, uint32_t w,
     }
 }
 
-static void norm_acc_avx512(unsigned char *dst, const unsigned int *acc, unsigned int inv, int n) {
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vbmi"))) static void norm_acc_avx512(unsigned char *dst, const unsigned int *acc, unsigned int inv, int n) {
     const __m512i vinv = _mm512_set1_epi32((int)inv);
     int i = 0;
     for (; i + 16 <= n; i += 16) {
@@ -292,7 +292,7 @@ static void norm_acc_avx512(unsigned char *dst, const unsigned int *acc, unsigne
     }
 }
 
-static void rgba_matrix_avx512(unsigned char *dst, const unsigned char *ty,
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vbmi"))) static void rgba_matrix_avx512(unsigned char *dst, const unsigned char *ty,
                                const unsigned char *tu, const unsigned char *tv, int n) {
     const __m512i vy = _mm512_set1_epi32(16);
     const __m512i vc = _mm512_set1_epi32(128);
@@ -340,7 +340,7 @@ static void rgba_matrix_avx512(unsigned char *dst, const unsigned char *ty,
     }
 }
 
-static void quant_row_avx512(unsigned char *dst, const unsigned char *rgba, int w,
+__attribute__((target("avx512f,avx512bw,avx512dq,avx512vl,avx512vbmi"))) static void quant_row_avx512(unsigned char *dst, const unsigned char *rgba, int w,
                              const unsigned char *dpos_r, const unsigned char *dneg_r,
                              const unsigned char *dpos_g, const unsigned char *dneg_g,
                              const unsigned char *dpos_b, const unsigned char *dneg_b,
