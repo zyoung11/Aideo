@@ -92,6 +92,28 @@ scale_plan :: proc(sw, sh, dw, dh: int) -> ^ScalePlan {
 	return p
 }
 
+// scale_plan_free releases one weight table set including the inner
+// slice storage that free(p) alone would leak.
+scale_plan_free :: proc(p: ^ScalePlan) {
+	delete(p.vy_off)
+	delete(p.vy_cnt)
+	delete(p.vy_woff)
+	delete(p.vy_w)
+	delete(p.vcy_off)
+	delete(p.vcy_cnt)
+	delete(p.vcy_woff)
+	delete(p.vcy_w)
+	delete(p.hx_off)
+	delete(p.hx_cnt)
+	delete(p.hx_woff)
+	delete(p.hx_w)
+	delete(p.hcx_off)
+	delete(p.hcx_cnt)
+	delete(p.hcx_woff)
+	delete(p.hcx_w)
+	free(p)
+}
+
 // ScaleJob describes one frame being scaled.
 ScaleJob :: struct {
 	plan:      ^ScalePlan,

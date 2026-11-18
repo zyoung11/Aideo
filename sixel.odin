@@ -25,12 +25,6 @@ SIXEL_ST_BYTES := [2]u8{0x1b, 0x5c}
 PALETTE_LEVELS := [7]int{2, 8, 16, 32, 64, 128, 256}
 PALETTE_BITS  := [7][3]int{{0, 0, 0}, {1, 1, 1}, {2, 1, 1}, {2, 2, 1}, {2, 2, 2}, {3, 2, 2}, {3, 3, 2}}
 
-DitherSet :: struct {
-	dpos_r, dneg_r: [32]u8,
-	dpos_g, dneg_g: [32]u8,
-	dpos_b, dneg_b: [32]u8,
-}
-
 SixelPalette :: struct {
 	nc:      int,
 	is_gray: bool,
@@ -41,8 +35,6 @@ SixelPalette :: struct {
 	lut_g:   [16][256]u8,
 	lut_b:   [16][256]u8,
 	dither:  [16]i8,
-	dither_cache:  [16]DitherSet,
-	dither_ready:  [16]bool,
 }
 
 StripCache :: struct {
@@ -58,6 +50,24 @@ strip_cache_init :: proc(cache: ^StripCache, total_strips: int) {
 	cache.rle = make([][dynamic]u8, total_strips)
 	cache.pix = make([][dynamic]u8, total_strips)
 	cache.changed = make([]u8, total_strips)
+}
+
+// strip_cache_free releases one cache including its per strip storage.
+strip_cache_free :: proc(cache: ^StripCache) {
+	if cache == nil {
+		return
+	}
+	delete(cache.hashes)
+	for i in 0..<len(cache.rle) {
+		delete(cache.rle[i])
+	}
+	delete(cache.rle)
+	for i in 0..<len(cache.pix) {
+		delete(cache.pix[i])
+	}
+	delete(cache.pix)
+	delete(cache.changed)
+	free(cache)
 }
 
 make_dither :: proc(levels: int) -> [16]i8 {
@@ -174,25 +184,36 @@ build_gray_palette :: proc(p: ^SixelPalette, levels: int) {
 	}
 }
 
+palette_cache: [len(PALETTE_LEVELS)]^SixelPalette
+
+// get_palette returns the cached palette for a color count. Palettes are
+// immutable after construction so one instance per color count is shared.
 get_palette :: proc(nc: int) -> ^SixelPalette {
-	if nc == 2 {
-		p := new(SixelPalette)
-		build_gray_palette(p, 2)
-		return p
-	}
+	idx := -1
 	for lvl, i in PALETTE_LEVELS {
 		if lvl == nc {
-			bits := PALETTE_BITS[i]
-			p := new(SixelPalette)
-			if nc == 16 || nc == 32 {
-				build_retro_palette(p, bits[0], bits[1], bits[2])
-			} else {
-				build_uniform_palette(p, bits[0], bits[1], bits[2])
-			}
-			return p
+			idx = i
 		}
 	}
-	return nil
+	if idx < 0 {
+		return nil
+	}
+	if palette_cache[idx] != nil {
+		return palette_cache[idx]
+	}
+	p := new(SixelPalette)
+	if nc == 2 {
+		build_gray_palette(p, 2)
+	} else {
+		bits := PALETTE_BITS[idx]
+		if nc == 16 || nc == 32 {
+			build_retro_palette(p, bits[0], bits[1], bits[2])
+		} else {
+			build_uniform_palette(p, bits[0], bits[1], bits[2])
+		}
+	}
+	palette_cache[idx] = p
+	return p
 }
 
 // strip_pixel_hash_rgba is the scalar reference for hash_strip_avx2. It

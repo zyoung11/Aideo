@@ -30,6 +30,18 @@ odin build . -o:speed -out:aideo
 ./aideo video.mp4
 ```
 
+## 选项
+
+| 选项 | 功能 |
+| --- | --- |
+| `-c, --colors <n>` | 色数，2 8 16 32 64 128 256 |
+| `-v, --volume <n>` | 音量，0 至 100 |
+| `-t, --start <time>` | 起始位置，秒或 mm:ss 或 hh:mm:ss |
+| `-s, --size <mode>` | 画面尺寸，full 或 half |
+| `-p, --profile` | 退出时写性能报告到 `aideo_prof.txt` |
+| `-h, --help` | 帮助页 |
+| `--version` | 版本 |
+
 ## 按键
 
 | 键 | 功能 |

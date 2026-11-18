@@ -8,10 +8,7 @@ import "core:time"
 import "core:sync"
 import "core:thread"
 
-COLOR_LEVELS := [7]int{2, 8, 16, 32, 64, 128, 256}
-
 main :: proc() {
-	// defer prof_report()
 	if len(os.args) >= 2 && os.args[1] == "citest" { ci_test(); return }
 	if len(os.args) >= 2 && os.args[1] == "cisws" { ci_sws(); return }
 	if len(os.args) >= 2 && os.args[1] == "ciframe" { ci_frame(); return }
@@ -20,6 +17,7 @@ main :: proc() {
 	vol_cli := -1.0
 	start_sec := 0.0
 	full_cli := true
+	profile_cli := false
 	file_arg := ""
 	argi := 1
 	for argi < len(os.args) {
@@ -32,7 +30,9 @@ main :: proc() {
 			print_version()
 			return
 		}
-		if a == "-c" || a == "--colors" {
+		if a == "-p" || a == "--profile" {
+			profile_cli = true
+		} else if a == "-c" || a == "--colors" {
 			argi += 1
 			if argi >= len(os.args) {
 				cli_error("missing value for --colors")
@@ -94,7 +94,7 @@ main :: proc() {
 	}
 	if color_cli != 0 {
 		found := false
-		for lv in COLOR_LEVELS {
+		for lv in PALETTE_LEVELS {
 			if lv == color_cli {
 				found = true
 			}
@@ -104,13 +104,13 @@ main :: proc() {
 			os.exit(1)
 		}
 	}
-	path := cstring(strings_clone_to_cstring(file_arg))
+	path := strings_clone_to_cstring(file_arg)
 
 	av_log_set_level(AV_LOG_QUIET)
 
 	vs := video_open(path)
 	if vs == nil {
-		fmt.eprintfln("error: cannot open video: %s", os.args[1])
+		fmt.eprintfln("error: cannot open video: %s", file_arg)
 		os.exit(1)
 	}
 
@@ -127,13 +127,13 @@ main :: proc() {
 
 	color_idx := 4
 	if color_cli != 0 {
-		for lv, li in COLOR_LEVELS {
+		for lv, li in PALETTE_LEVELS {
 			if lv == color_cli {
 				color_idx = li
 			}
 		}
 	}
-	pal := get_palette(COLOR_LEVELS[color_idx])
+	pal := get_palette(PALETTE_LEVELS[color_idx])
 
 	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l")
 	fmt.print("\x1b[2J\x1b[3J\x1b[H")
@@ -204,6 +204,10 @@ main :: proc() {
 		_loop_t := time.now()
 		prof_add(PROF_FRAME_GAP, i64(time.since(_last_frame_t)))
 		_last_frame_t = _loop_t
+		if sync.atomic_load(&vp.stop) != 0 {
+			quit = true
+			continue
+		}
 		for {
 			k, ok := key_pop()
 			if !ok {
@@ -263,8 +267,9 @@ main :: proc() {
 					audio_set_volume(f32(volume))
 				}
 			case KEY_COLOR_UP:
-				color_idx = min(color_idx + 1, len(COLOR_LEVELS) - 1)
-				pal = get_palette(COLOR_LEVELS[color_idx])
+				color_idx = min(color_idx + 1, len(PALETTE_LEVELS) - 1)
+				pal = get_palette(PALETTE_LEVELS[color_idx])
+				strip_cache_free(cache)
 				cache = new(StripCache)
 				strip_cache_init(cache, total_strips)
 				if paused {
@@ -272,7 +277,8 @@ main :: proc() {
 				}
 			case KEY_COLOR_DOWN:
 				color_idx = max(color_idx - 1, 0)
-				pal = get_palette(COLOR_LEVELS[color_idx])
+				pal = get_palette(PALETTE_LEVELS[color_idx])
+				strip_cache_free(cache)
 				cache = new(StripCache)
 				strip_cache_init(cache, total_strips)
 				if paused {
@@ -305,6 +311,7 @@ main :: proc() {
 				total_strips = (out_h + 5) / 6
 				start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 				start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
+				strip_cache_free(cache)
 				cache = new(StripCache)
 				strip_cache_init(cache, total_strips)
 				video_request_resize(vp, out_w, out_h)
@@ -377,7 +384,6 @@ main :: proc() {
 			force_frame = false
 			render_submit(&rc, RenderJob{
 				buf = pending.buf,
-				pts_sec = pending.pts_sec,
 				w = out_w,
 				h = out_h,
 				start_col = start_col,
@@ -427,7 +433,6 @@ main :: proc() {
 		start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
 		render_submit(&rc, RenderJob{
 			buf = pending.buf,
-			pts_sec = pts,
 			w = out_w,
 			h = out_h,
 			start_col = start_col,
@@ -439,10 +444,24 @@ main :: proc() {
 	}
 
 	render_stop(&rc)
+	if len(rc.freeze) > 0 {
+		video_pool_put(vp, rc.freeze)
+		rc.freeze = nil
+	}
 	video_stop(vp)
+	video_close(vp)
 	audio_shutdown()
+	strip_cache_free(cache)
+	for i in 0..<len(rc.bufs) {
+		if len(rc.bufs[i].buf) > 0 {
+			free(&rc.bufs[i].buf[0])
+		}
+	}
 	term_leave_raw()
 	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1000h\x1b[?1002h\x1b[?1003h")
+	if profile_cli {
+		prof_report()
+	}
 }
 
 // fps_preset formats a frame rate with conventional notation for the

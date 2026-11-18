@@ -40,7 +40,17 @@ foreign clib {
 	signal :: proc(sig: c.int, handler: rawptr) -> rawptr ---
 	sysconf :: proc(name: c.int) -> c.long ---
 	writev :: proc(fd: c.int, iov: [^]IoVec, cnt: c.int) -> c.long ---
+	poll :: proc(fds: ^PollFd, nfds: u64, timeout: c.int) -> c.int ---
 }
+
+// PollFd is one file descriptor entry for poll.
+PollFd :: struct {
+	fd:      i32,
+	events:  i16,
+	revents: i16,
+}
+
+POLLIN :: 1
 
 // IoVec is one scatter gather buffer for writev.
 IoVec :: struct {
@@ -62,15 +72,6 @@ iovs_push :: proc(l: ^IoVecList, data: []u8) {
 	l.iovs[l.n].iov_base = &data[0]
 	l.iovs[l.n].iov_len = u64(len(data))
 	l.n += 1
-}
-
-// iovs_len returns the total byte count of all segments.
-iovs_len :: proc(l: ^IoVecList) -> int {
-	t := 0
-	for i in 0..<l.n {
-		t += int(l.iovs[i].iov_len)
-	}
-	return t
 }
 
 // cpu_count returns the number of online CPUs.
@@ -174,24 +175,71 @@ key_pop :: proc() -> (u8, bool) {
 	return k, true
 }
 
+key_start :: proc() {
+	thread.create_and_start(proc() {
+		key_thread()
+	})
+}
+
+// stdin_ready reports whether stdin has data available within timeout_ms.
+stdin_ready :: proc(timeout_ms: int) -> bool {
+	pfd := PollFd{fd = 0, events = POLLIN}
+	return poll(&pfd, 1, c.int(timeout_ms)) > 0
+}
+
+// key_thread reads stdin and translates key bytes into key events. A
+// lone ESC is confirmed by waiting 20 ms for continuation bytes so arrow
+// key sequences split across reads are never mistaken for quit.
 key_thread :: proc() {
-	buf: [64]u8
+	buf: [256]u8
+	n := 0
 	for {
-		n, err := os.read(os.stdin, buf[:])
-		if err != nil || n <= 0 {
+		if n == len(buf) {
+			n = 0
+		}
+		nread, err := os.read(os.stdin, buf[n:])
+		if err != nil || nread <= 0 {
 			key_push(KEY_QUIT)
 			return
 		}
+		n += nread
 		i := 0
 		for i < n {
 			b := buf[i]
-			if b == 27 && i+1 < n && (buf[i+1] == '[' || buf[i+1] == 'O') {
-				i += 2
-				for i < n && !((buf[i] >= 'A' && buf[i] <= 'Z') || (buf[i] >= 'a' && buf[i] <= 'z') || buf[i] == '~') {
-					i += 1
+			if b == 27 {
+				if i + 1 >= n {
+					if !stdin_ready(20) {
+						key_push(KEY_QUIT)
+						i += 1
+						break
+					}
+					k, rerr := os.read(os.stdin, buf[n:])
+					if rerr != nil || k <= 0 {
+						key_push(KEY_QUIT)
+						return
+					}
+					n += k
+					continue
 				}
-				if i < n {
-					switch buf[i] {
+				if buf[i+1] == '[' || buf[i+1] == 'O' {
+					j := i + 2
+					for j < n && !((buf[j] >= 'A' && buf[j] <= 'Z') || (buf[j] >= 'a' && buf[j] <= 'z') || buf[j] == '~') {
+						j += 1
+					}
+					if j >= n {
+						if !stdin_ready(20) {
+							i = n
+							break
+						}
+						k, rerr := os.read(os.stdin, buf[n:])
+						if rerr != nil || k <= 0 {
+							key_push(KEY_QUIT)
+							return
+						}
+						n += k
+						continue
+					}
+					switch buf[j] {
 					case 'A':
 						key_push(KEY_VOL_UP)
 					case 'B':
@@ -201,12 +249,15 @@ key_thread :: proc() {
 					case 'D':
 						key_push(KEY_SEEK_BACK)
 					}
+					i = j + 1
+					continue
 				}
+				key_push(KEY_QUIT)
 				i += 1
 				continue
 			}
 			switch b {
-			case 'q', 'Q', 27:
+			case 'q', 'Q':
 				key_push(KEY_QUIT)
 			case ' ':
 				key_push(KEY_PAUSE)
@@ -223,11 +274,11 @@ key_thread :: proc() {
 			}
 			i += 1
 		}
+		if i < n {
+			copy(buf[:], buf[i:n])
+			n -= i
+		} else {
+			n = 0
+		}
 	}
-}
-
-key_start :: proc() {
-	thread.create_and_start(proc() {
-		key_thread()
-	})
 }

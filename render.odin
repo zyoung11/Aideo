@@ -11,7 +11,6 @@ CLEAR_BYTES := [11]u8{0x1b, '[', '2', 'J', 0x1b, '[', '3', 'J', 0x1b, '[', 'H'}
 // needs to encode and write one frame. A clear job only wipes the screen.
 RenderJob :: struct {
 	buf:       []u8,
-	pts_sec:   f64,
 	w:         int,
 	h:         int,
 	start_col: int,
@@ -78,17 +77,20 @@ render_submit :: proc(rc: ^RenderCtx, job: RenderJob) {
 
 // rerender_freeze re-renders the frozen frame with the current palette so
 // palette changes are visible while playback is paused. The frozen frame
-// is copied because the write thread owns the freeze buffer.
+// is copied under rc.mu so the write thread can never reclaim it mid copy.
 rerender_freeze :: proc(rc: ^RenderCtx, w, h, start_col, start_row: int, pal: ^SixelPalette, cache: ^StripCache) {
+	cp: []u8
 	sync.mutex_lock(&rc.mu)
 	fb := rc.freeze
 	fn := rc.freeze_n
+	if fn == w * h * 4 && len(fb) >= fn {
+		cp = video_pool_get(rc.vp, fn)
+		copy(cp, fb[:fn])
+	}
 	sync.mutex_unlock(&rc.mu)
-	if fn != w * h * 4 || len(fb) < fn {
+	if len(cp) == 0 {
 		return
 	}
-	cp := video_pool_get(rc.vp, fn)
-	copy(cp, fb[:fn])
 	render_submit(rc, RenderJob{
 		buf = cp,
 		w = w,

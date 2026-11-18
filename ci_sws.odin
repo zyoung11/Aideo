@@ -236,6 +236,6 @@ ci_sws :: proc() {
 		fmt.printfln("sws single           : %.2fms", time.duration_seconds(time.since(tt)) * 1000)
 		sws_freeContext(sws_one)
 		scale_pool_stop(&pool)
-		free(plan)
+		scale_plan_free(plan)
 	}
 }

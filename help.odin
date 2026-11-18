@@ -53,6 +53,7 @@ print_help :: proc() {
 	help_line(HELP_YELLOW, "-v, --volume <n>", 22, "volume percent from 0 to 100")
 	help_line(HELP_YELLOW, "-t, --start <time>", 22, "start position, seconds or mm:ss or hh:mm:ss")
 	help_line(HELP_YELLOW, "-s, --size <mode>", 22, "display size, full or half")
+	help_line(HELP_YELLOW, "-p, --profile", 22, "write stage timings to aideo_prof.txt on exit")
 	help_line(HELP_YELLOW, "-h, --help", 22, "show this help page")
 	help_line(HELP_YELLOW, "    --version", 22, "show the version")
 	fmt.printfln("")
