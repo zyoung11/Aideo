@@ -10,7 +10,6 @@ import "core:thread"
 COLOR_LEVELS := [7]int{2, 8, 16, 32, 64, 128, 256}
 
 main :: proc() {
-	defer prof_report()
 	if len(os.args) >= 2 && os.args[1] == "citest" { ci_test(); return }
 	if len(os.args) >= 2 && os.args[1] == "cibench" { ci_bench(); return }
 	if len(os.args) < 2 {
@@ -64,7 +63,7 @@ main :: proc() {
 	total_strips := (out_h + 5) / 6
 	strip_cache_init(cache, total_strips)
 	pool: StripPool
-	strip_pool_init(&pool, 4)
+	strip_pool_init(&pool, max(cpu_count() / 2, 4))
 	defer strip_pool_stop(&pool)
 	rc: RenderCtx
 	rc.vp = vp

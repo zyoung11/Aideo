@@ -1,6 +1,7 @@
 package aideo
 
 import "core:c"
+import "core:fmt"
 import "core:sync"
 import "core:time"
 import "core:thread"
@@ -70,6 +71,7 @@ VideoStream :: struct {
 	fmt_ctx:    ^AVFormatContext,
 	codec_ctx:  ^AVCodecContext,
 	sws:        ^SwsContext,
+	retired:    [dynamic]^SwsContext,
 	pkt:        ^AVPacket,
 	frame:      ^AVFrame,
 	stream_idx: int,
@@ -160,12 +162,8 @@ video_open :: proc(path: cstring) -> ^VideoStream {
 		avformat_close_input(&fmt_ctx)
 		return nil
 	}
-	codec_name := string(avcodec_get_name(par.codec_id))
-	if codec_name == "libdav1d" || codec_name == "av1" {
-		av_opt_set(codec_ctx, "threads", "0", 0)
-	} else {
-		av_opt_set(codec_ctx, "threads", "2", 0)
-	}
+	threads_opt := strings_clone_to_cstring(fmt.tprintf("%d", max(cpu_count() / 2, 2)))
+	av_opt_set(codec_ctx, "threads", threads_opt, 0)
 	if avcodec_open2(codec_ctx, codec, nil) < 0 {
 		avcodec_free_context(&codec_ctx)
 		avformat_close_input(&fmt_ctx)
@@ -193,6 +191,9 @@ video_close :: proc(vs: ^VideoStream) {
 	if vs.sws != nil {
 		sws_freeContext(vs.sws)
 	}
+	for ctx in vs.retired {
+		sws_freeContext(ctx)
+	}
 	av_packet_free(&vs.pkt)
 	av_frame_free(&vs.frame)
 	avcodec_free_context(&vs.codec_ctx)
@@ -202,9 +203,12 @@ video_close :: proc(vs: ^VideoStream) {
 
 // video_make_sws rebuilds the pixel scaler for a new output size.
 // Callers must hold vp.sws_mu.
+// video_make_sws rebuilds the pixel scaler for a new output size. The
+// old scaler is retired instead of freed because the scale thread may
+// still hold it. Callers must hold vp.sws_mu.
 video_make_sws :: proc(vs: ^VideoStream, out_w, out_h: int) {
 	if vs.sws != nil {
-		sws_freeContext(vs.sws)
+		append(&vs.retired, vs.sws)
 	}
 	vs.sws = sws_getContext(c.int(vs.src_w), c.int(vs.src_h), c.int(vs.src_format),
 		c.int(out_w), c.int(out_h), AV_PIX_FMT_RGBA, SWS_FAST_BILINEAR, nil, nil, nil)
@@ -287,18 +291,21 @@ video_scale_thread :: proc(vp: ^VideoPlayer) {
 	for sync.atomic_load(&vp.stop) == 0 {
 		yf := yuv_pop(&vp.yuvq)
 		_t2 := time.now()
-		buf: []u8
 		sync.mutex_lock(&vp.sws_mu)
-		if vs.sws != nil {
-			fs := vp.out_w * vp.out_h * 4
+		sws := vs.sws
+		ow := vp.out_w
+		oh := vp.out_h
+		sync.mutex_unlock(&vp.sws_mu)
+		buf: []u8
+		if sws != nil {
+			fs := ow * oh * 4
 			buf = video_pool_get(vp, fs)
 			dst_data: [1][^]u8
 			dst_data[0] = ([^]u8)(&buf[0])
 			dst_stride: [1]c.int
-			dst_stride[0] = c.int(vp.out_w * 4)
-			sws_scale(vs.sws, &yf.data[0], &yf.linesize[0], 0, yf.height, &dst_data[0], &dst_stride[0])
+			dst_stride[0] = c.int(ow * 4)
+			sws_scale(sws, &yf.data[0], &yf.linesize[0], 0, yf.height, &dst_data[0], &dst_stride[0])
 		}
-		sync.mutex_unlock(&vp.sws_mu)
 		prof_add(PROF_DECODE_SWS, i64(time.since(_t2)))
 		pts_sec := f64(yf.pts) / 1000000000.0
 		yuv_put_frame(&vp.yuvq, yf)

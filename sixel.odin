@@ -41,6 +41,7 @@ SixelPalette :: struct {
 StripCache :: struct {
 	hashes:  []u64,
 	rle:     [][dynamic]u8,
+	pix:     [][dynamic]u8,
 	changed: []u8,
 }
 
@@ -48,6 +49,7 @@ StripCache :: struct {
 strip_cache_init :: proc(cache: ^StripCache, total_strips: int) {
 	cache.hashes = make([]u64, total_strips)
 	cache.rle = make([][dynamic]u8, total_strips)
+	cache.pix = make([][dynamic]u8, total_strips)
 	cache.changed = make([]u8, total_strips)
 }
 
@@ -347,9 +349,12 @@ StripState :: struct {
 	max_x:      [256]i32,
 	epoch:      u16,
 	pixel_hash: u64,
+	prev_width: int,
+	prev_nc:    int,
 }
 
-strip_state_reset :: proc(st: ^StripState, strip_cap, nc: int) {
+strip_state_reset :: proc(st: ^StripState, width, nc: int) {
+	strip_cap := nc * width
 	if len(st.buf) < strip_cap {
 		st.buf = make([]u8, strip_cap)
 	}
@@ -367,9 +372,20 @@ strip_state_reset :: proc(st: ^StripState, strip_cap, nc: int) {
 		st.min_x[i] = 1 << 30
 		st.max_x[i] = -1
 	}
-	for i in 0..<strip_cap {
-		st.buf[i] = 0
+	if st.prev_width == width && st.prev_nc == nc {
+		for c in st.dirty {
+			base := c * width
+			for i in base..<base + width {
+				st.buf[i] = 0
+			}
+		}
+	} else {
+		for i in 0..<strip_cap {
+			st.buf[i] = 0
+		}
 	}
+	st.prev_width = width
+	st.prev_nc = nc
 	clear(&st.dirty)
 }
 
@@ -380,11 +396,15 @@ emit_run :: proc(out: ^Buffer, ch: u8, count_in: int) {
 		if c > 255 {
 			c = 255
 		}
-		if c > 1 {
+		if c >= 4 {
 			write_byte(out, 0x21)
 			write_sixel_num(out, c)
+			write_byte(out, ch + 63)
+		} else {
+			for i in 0..<c {
+				write_byte(out, ch + 63)
+			}
 		}
-		write_byte(out, ch + 63)
 		count -= c
 	}
 }
@@ -450,12 +470,7 @@ encode_strip :: proc(out: ^Buffer, st: ^StripState, width: int) {
 			x += 1
 		}
 		emit_run(out, last_ch, run_count)
-
-		if x1 < width - 1 {
-			emit_run(out, 0, width - 1 - x1)
-		}
 	}
-	clear(&st.dirty)
 }
 
 StripWorkerCtx :: struct {
@@ -480,6 +495,7 @@ StripPool :: struct {
 StripWorkerState :: struct {
 	st:     StripState,
 	row_ci: []u8,
+	cur:    []u8,
 	buf:    Buffer,
 }
 
@@ -520,9 +536,13 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx, ws: ^StripWorkerState) {
 		}
 
 		buffer_reset(buf)
-		strip_state_reset(st, nc * width, nc)
+		strip_state_reset(st, width, nc)
 		_t1 := time.now()
 
+		prev := ctx.cache.pix[srow]
+		if len(ws.cur) < n_rows * width {
+			ws.cur = make([]u8, n_rows * width)
+		}
 		row_offset := y_start * width * 4
 		for dy in 0..<n_rows {
 			yb4 := ((y_start + dy) & 3) << 2
@@ -537,8 +557,13 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx, ws: ^StripWorkerState) {
 			} else {
 				quantize_row_uniform_scalar(row_ci, row, width, yb4, 0, pal)
 			}
+			copy(ws.cur[dy * width:], row_ci[:width])
+			base := dy * width
 			for x in 0..<width {
 				ci := int(row_ci[x])
+				if base + x < len(prev) && prev[base + x] == u8(ci) {
+					continue
+				}
 				if st.seen[ci] != st.epoch {
 					st.seen[ci] = st.epoch
 					append(&st.dirty, ci)
@@ -563,6 +588,8 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx, ws: ^StripWorkerState) {
 		clear(&ctx.cache.rle[srow])
 		append(&ctx.cache.rle[srow], ..buf.buf[:buf.pos])
 		ctx.cache.changed[srow] = 1
+		clear(&ctx.cache.pix[srow])
+		append(&ctx.cache.pix[srow], ..ws.cur[:n_rows * width])
 	}
 }
 
