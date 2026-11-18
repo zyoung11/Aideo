@@ -154,6 +154,8 @@ main :: proc() {
 				}
 				out_w, out_h = nw, nh
 				total_strips = (out_h + 5) / 6
+				start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
+				start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
 				cache = new(StripCache)
 				strip_cache_init(cache, total_strips)
 				video_request_resize(vp, out_w, out_h)

@@ -145,23 +145,23 @@ scale_row :: proc(ws: ^ScaleWorkerState, job: ^ScaleJob, dy: int) {
 	cyn := int(p.vcy_cnt[dy])
 	cyw := int(p.vcy_woff[dy])
 
-	vert_acc_init_avx2(&ws.acc_y[0], ([^]u8)(&job.src_y[y0 * job.stride_y]), u32(p.vy_w[yw]), c.int(p.sw))
+	vert_acc_init_simd(&ws.acc_y[0], ([^]u8)(&job.src_y[y0 * job.stride_y]), u32(p.vy_w[yw]), c.int(p.sw))
 	for k in 1..<yn {
-		vert_acc_avx2(&ws.acc_y[0], ([^]u8)(&job.src_y[(y0 + k) * job.stride_y]), u32(p.vy_w[yw + k]), c.int(p.sw))
+		vert_acc_simd(&ws.acc_y[0], ([^]u8)(&job.src_y[(y0 + k) * job.stride_y]), u32(p.vy_w[yw + k]), c.int(p.sw))
 	}
-	norm_acc_avx2(&ws.tmp_y[0], &ws.acc_y[0], u32(p.inv_sh), c.int(p.sw))
+	norm_acc_simd(&ws.tmp_y[0], &ws.acc_y[0], u32(p.inv_sh), c.int(p.sw))
 
-	vert_acc_init_avx2(&ws.acc_c[0], ([^]u8)(&job.src_u[cy0 * job.stride_c]), u32(p.vcy_w[cyw]), c.int(p.sw2))
+	vert_acc_init_simd(&ws.acc_c[0], ([^]u8)(&job.src_u[cy0 * job.stride_c]), u32(p.vcy_w[cyw]), c.int(p.sw2))
 	for k in 1..<cyn {
-		vert_acc_avx2(&ws.acc_c[0], ([^]u8)(&job.src_u[(cy0 + k) * job.stride_c]), u32(p.vcy_w[cyw + k]), c.int(p.sw2))
+		vert_acc_simd(&ws.acc_c[0], ([^]u8)(&job.src_u[(cy0 + k) * job.stride_c]), u32(p.vcy_w[cyw + k]), c.int(p.sw2))
 	}
-	norm_acc_avx2(&ws.tmp_u[0], &ws.acc_c[0], u32(p.inv_sh2), c.int(p.sw2))
+	norm_acc_simd(&ws.tmp_u[0], &ws.acc_c[0], u32(p.inv_sh2), c.int(p.sw2))
 
-	vert_acc_init_avx2(&ws.acc_c[0], ([^]u8)(&job.src_v[cy0 * job.stride_c]), u32(p.vcy_w[cyw]), c.int(p.sw2))
+	vert_acc_init_simd(&ws.acc_c[0], ([^]u8)(&job.src_v[cy0 * job.stride_c]), u32(p.vcy_w[cyw]), c.int(p.sw2))
 	for k in 1..<cyn {
-		vert_acc_avx2(&ws.acc_c[0], ([^]u8)(&job.src_v[(cy0 + k) * job.stride_c]), u32(p.vcy_w[cyw + k]), c.int(p.sw2))
+		vert_acc_simd(&ws.acc_c[0], ([^]u8)(&job.src_v[(cy0 + k) * job.stride_c]), u32(p.vcy_w[cyw + k]), c.int(p.sw2))
 	}
-	norm_acc_avx2(&ws.tmp_v[0], &ws.acc_c[0], u32(p.inv_sh2), c.int(p.sw2))
+	norm_acc_simd(&ws.tmp_v[0], &ws.acc_c[0], u32(p.inv_sh2), c.int(p.sw2))
 
 	for dx in 0..<p.dw {
 		x0 := int(p.hx_off[dx])
@@ -189,7 +189,7 @@ scale_row :: proc(ws: ^ScaleWorkerState, job: ^ScaleJob, dy: int) {
 	}
 
 	out := ([^]u8)(&job.dst[dy * job.dst_stride])
-	rgba_matrix_avx2(&out[0], &ws.ty[0], &ws.tu[0], &ws.tv[0], c.int(p.dw))
+	rgba_matrix_simd(&out[0], &ws.ty[0], &ws.tu[0], &ws.tv[0], c.int(p.dw))
 }
 
 // scale_row_ref is the scalar reference implementation kept for parity

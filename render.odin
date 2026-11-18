@@ -55,17 +55,23 @@ RenderCtx :: struct {
 	freeze_n:  int,
 }
 
-// render_submit hands a job to the encode thread, replacing any queued job.
+// render_submit hands a job to the encode thread, replacing any queued
+// job. A queued clear request is inherited by its replacement so a screen
+// wipe can never be lost behind a later frame.
 render_submit :: proc(rc: ^RenderCtx, job: RenderJob) {
+	j := job
 	sync.mutex_lock(&rc.mu)
 	if rc.has {
 		if len(rc.job.buf) > 0 {
 			video_pool_put(rc.vp, rc.job.buf)
 		}
+		if rc.job.clear && !j.clear {
+			j.clear = true
+		}
 	} else {
 		sync.sema_post(&rc.used)
 	}
-	rc.job = job
+	rc.job = j
 	rc.has = true
 	sync.mutex_unlock(&rc.mu)
 }
@@ -149,11 +155,10 @@ render_encode_thread :: proc(data: rawptr) {
 			}
 			return
 		}
-		if job.clear {
-			render_handoff(rc, job, nil, -1, true)
-			continue
-		}
 		if len(job.buf) == 0 {
+			if job.clear {
+				render_handoff(rc, job, nil, -1, true)
+			}
 			continue
 		}
 		idx := render_buf_get(rc)
@@ -166,7 +171,7 @@ render_encode_thread :: proc(data: rawptr) {
 		write_sixel_num(buf, job.start_col)
 		write_byte(buf, 'H')
 		sixel_encode(rc.pool, buf, job.buf, job.w, job.h, job.pal, job.cache)
-		render_handoff(rc, job, buf.buf[:buf.pos], idx, false)
+		render_handoff(rc, job, buf.buf[:buf.pos], idx, job.clear)
 	}
 }
 
@@ -193,10 +198,6 @@ render_write_thread :: proc(data: rawptr) {
 			sync.mutex_lock(&rc.stdout_mu)
 			writev_all(&varr)
 			sync.mutex_unlock(&rc.stdout_mu)
-			if stopped {
-				return
-			}
-			continue
 		}
 		if len(wdata) == 0 {
 			if stopped {
