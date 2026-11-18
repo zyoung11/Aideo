@@ -359,11 +359,13 @@ audio_decode_thread :: proc(s: ^AudioStream) {
 				written := ring_write(&audio_state.ring, buf[:produced])
 				sync.mutex_unlock(&audio_state.mu)
 				for written < produced {
+					if sync.atomic_load(&audio_state.stop) != 0 {
+						return
+					}
 					if !sync.sema_wait_with_timeout(&audio_state.space, 10 * time.Millisecond) {
 						continue
 					}
-					if sync.atomic_load(&audio_state.seek_flag) != 0 ||
-						sync.atomic_load(&audio_state.stop) != 0 {
+					if sync.atomic_load(&audio_state.seek_flag) != 0 {
 						break
 					}
 					sync.mutex_lock(&audio_state.mu)

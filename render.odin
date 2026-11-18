@@ -16,7 +16,8 @@ RenderJob :: struct {
 	start_col: int,
 	start_row: int,
 	pal:       ^SixelPalette,
-	cache:     ^StripCache,
+	reset_cache: bool,
+	keep_freeze: bool,
 	clear:     bool,
 }
 
@@ -52,6 +53,12 @@ RenderCtx :: struct {
 	written:   i64,
 	freeze:    []u8,
 	freeze_n:  int,
+	freeze_w:  int,
+	freeze_h:  int,
+
+	cache:     ^StripCache,
+	cache_w:   int,
+	cache_h:   int,
 }
 
 // render_submit hands a job to the encode thread, replacing any queued
@@ -78,7 +85,7 @@ render_submit :: proc(rc: ^RenderCtx, job: RenderJob) {
 // rerender_freeze re-renders the frozen frame with the current palette so
 // palette changes are visible while playback is paused. The frozen frame
 // is copied under rc.mu so the write thread can never reclaim it mid copy.
-rerender_freeze :: proc(rc: ^RenderCtx, w, h, start_col, start_row: int, pal: ^SixelPalette, cache: ^StripCache) {
+rerender_freeze :: proc(rc: ^RenderCtx, w, h, start_col, start_row: int, pal: ^SixelPalette) {
 	cp: []u8
 	sync.mutex_lock(&rc.mu)
 	fb := rc.freeze
@@ -98,7 +105,51 @@ rerender_freeze :: proc(rc: ^RenderCtx, w, h, start_col, start_row: int, pal: ^S
 		start_col = start_col,
 		start_row = start_row,
 		pal = pal,
-		cache = cache,
+		reset_cache = true,
+	})
+}
+
+// rerender_freeze_scaled redraws the frozen frame at a new size with
+// nearest neighbor sampling so a paused picture keeps its content when
+// the display size changes.
+rerender_freeze_scaled :: proc(rc: ^RenderCtx, w, h, start_col, start_row: int, pal: ^SixelPalette) {
+	sw := 0
+	sh := 0
+	cp: []u8
+	sync.mutex_lock(&rc.mu)
+	fn := rc.freeze_n
+	if fn > 0 && len(rc.freeze) >= fn && rc.freeze_w > 0 && rc.freeze_h > 0 {
+		sw = rc.freeze_w
+		sh = rc.freeze_h
+		if sw * sh * 4 == fn {
+			cp = video_pool_get(rc.vp, fn)
+			copy(cp, rc.freeze[:fn])
+		}
+	}
+	sync.mutex_unlock(&rc.mu)
+	if len(cp) == 0 {
+		return
+	}
+	dst := video_pool_get(rc.vp, w * h * 4)
+	for dy in 0..<h {
+		sy := dy * sh / h
+		srow := sy * sw * 4
+		drow := dy * w * 4
+		for dx in 0..<w {
+			sx := dx * sw / w
+			copy(dst[drow + dx * 4:], cp[srow + sx * 4:srow + sx * 4 + 4])
+		}
+	}
+	video_pool_put(rc.vp, cp)
+	render_submit(rc, RenderJob{
+		buf = dst,
+		w = w,
+		h = h,
+		start_col = start_col,
+		start_row = start_row,
+		pal = pal,
+		reset_cache = true,
+		keep_freeze = true,
 	})
 }
 
@@ -139,10 +190,16 @@ render_handoff :: proc(rc: ^RenderCtx, job: RenderJob, data: []u8, buf_idx: int,
 	sync.sema_post(&rc.wused)
 }
 
-// render_encode_thread assembles frames into self contained buffers.
+// render_encode_thread assembles frames into self contained buffers. It
+// owns the strip diff cache: the cache is rebuilt whenever the frame
+// geometry or the palette changes so no other thread ever touches it.
 render_encode_thread :: proc(data: rawptr) {
 	rc := (^RenderCtx)(data)
 	defer sync.sema_post(&rc.exited)
+	defer if rc.cache != nil {
+		strip_cache_free(rc.cache)
+		rc.cache = nil
+	}
 	for {
 		sync.sema_wait(&rc.used)
 		sync.mutex_lock(&rc.mu)
@@ -172,7 +229,16 @@ render_encode_thread :: proc(data: rawptr) {
 		write_byte(buf, ';')
 		write_sixel_num(buf, job.start_col)
 		write_byte(buf, 'H')
-		sixel_encode(rc.pool, buf, job.buf, job.w, job.h, job.pal, job.cache)
+		if rc.cache == nil || rc.cache_w != job.w || rc.cache_h != job.h || job.reset_cache {
+			if rc.cache != nil {
+				strip_cache_free(rc.cache)
+			}
+			rc.cache = new(StripCache)
+			strip_cache_init(rc.cache, (job.h + 5) / 6)
+			rc.cache_w = job.w
+			rc.cache_h = job.h
+		}
+		sixel_encode(rc.pool, buf, job.buf, job.w, job.h, job.pal, rc.cache)
 		render_handoff(rc, job, buf.buf[:buf.pos], idx, job.clear)
 	}
 }
@@ -216,9 +282,16 @@ render_write_thread :: proc(data: rawptr) {
 		prof_add(PROF_WRITE, i64(time.since(_t4)))
 		sync.atomic_add(&rc.written, 1)
 		sync.mutex_lock(&rc.mu)
-		old := rc.freeze
-		rc.freeze = job.buf
-		rc.freeze_n = len(job.buf)
+		old: []u8
+		if job.keep_freeze {
+			old = job.buf
+		} else {
+			old = rc.freeze
+			rc.freeze = job.buf
+			rc.freeze_n = len(job.buf)
+			rc.freeze_w = job.w
+			rc.freeze_h = job.h
+		}
 		sync.mutex_unlock(&rc.mu)
 		if len(old) > 0 {
 			video_pool_put(rc.vp, old)

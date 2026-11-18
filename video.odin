@@ -17,7 +17,6 @@ FrameQueue :: struct {
 	head:     int,
 	count:    int,
 	free_sem: sync.Sema,
-	used_sem: sync.Sema,
 }
 
 fq_init :: proc(q: ^FrameQueue) {
@@ -39,7 +38,6 @@ fq_push :: proc(q: ^FrameQueue, m: FrameMsg, stop: ^i32) -> bool {
 	q.slots[(q.head + q.count) % len(q.slots)] = m
 	q.count += 1
 	sync.mutex_unlock(&q.mu)
-	sync.sema_post(&q.used_sem)
 	return true
 }
 
@@ -284,6 +282,24 @@ yuv_put_frame :: proc(q: ^YuvQueue, f: ^AVFrame) {
 	sync.mutex_unlock(&q.poolmu)
 }
 
+// yuv_drain returns every queued source frame to the pool so stale
+// frames from before a seek or a resize never reach the scaler.
+yuv_drain :: proc(q: ^YuvQueue) {
+	for {
+		sync.mutex_lock(&q.mu)
+		if q.count == 0 {
+			sync.mutex_unlock(&q.mu)
+			return
+		}
+		f := q.slots[q.head]
+		q.head = (q.head + 1) % len(q.slots)
+		q.count -= 1
+		sync.sema_post(&q.free)
+		sync.mutex_unlock(&q.mu)
+		yuv_put_frame(q, f)
+	}
+}
+
 // yuv_push hands one decoded frame to the scale thread. It returns false
 // when stop is set first, leaving ownership with the caller.
 yuv_push :: proc(q: ^YuvQueue, f: ^AVFrame, stop: ^i32) -> bool {
@@ -304,23 +320,28 @@ yuv_push :: proc(q: ^YuvQueue, f: ^AVFrame, stop: ^i32) -> bool {
 }
 
 // yuv_pop takes one decoded frame. It returns nil once stop is set so
-// the scale thread can exit at any wait point.
+// the scale thread can exit at any wait point. A wake up against an empty
+// queue means the signal is stale after a drain and is discarded.
 yuv_pop :: proc(q: ^YuvQueue, stop: ^i32) -> ^AVFrame {
 	for {
 		if sync.atomic_load(stop) != 0 {
 			return nil
 		}
-		if sync.sema_wait_with_timeout(&q.used, 10 * time.Millisecond) {
-			break
+		if !sync.sema_wait_with_timeout(&q.used, 10 * time.Millisecond) {
+			continue
 		}
+		sync.mutex_lock(&q.mu)
+		if q.count == 0 {
+			sync.mutex_unlock(&q.mu)
+			continue
+		}
+		f := q.slots[q.head]
+		q.head = (q.head + 1) % len(q.slots)
+		q.count -= 1
+		sync.mutex_unlock(&q.mu)
+		sync.sema_post(&q.free)
+		return f
 	}
-	sync.mutex_lock(&q.mu)
-	f := q.slots[q.head]
-	q.head = (q.head + 1) % len(q.slots)
-	q.count -= 1
-	sync.mutex_unlock(&q.mu)
-	sync.sema_post(&q.free)
-	return f
 }
 
 video_scale_thread :: proc(vp: ^VideoPlayer) {
@@ -379,6 +400,14 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			}
 			av_seek_frame(vs.fmt_ctx, c.int(vs.stream_idx), seek_target, AVSEEK_FLAG_BACKWARD)
 			avcodec_flush_buffers(vs.codec_ctx)
+			yuv_drain(&vp.yuvq)
+			for {
+				m, ok := fq_try_pop(&vp.queue)
+				if !ok {
+					break
+				}
+				video_pool_put(vp, m.buf)
+			}
 			continue
 		}
 
@@ -391,6 +420,7 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			vp.out_h = nh
 			video_make_sws(vs, nw, nh)
 			sync.mutex_unlock(&vp.sws_mu)
+			yuv_drain(&vp.yuvq)
 			for {
 				m, ok := fq_try_pop(&vp.queue)
 				if !ok {

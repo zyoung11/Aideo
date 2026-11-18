@@ -172,9 +172,6 @@ main :: proc() {
 	if has_audio {
 		audio_set_volume(f32(volume))
 	}
-	cache := new(StripCache)
-	total_strips := (out_h + 5) / 6
-	strip_cache_init(cache, total_strips)
 	pool: StripPool
 	strip_pool_init(&pool, max(cpu_count() / 2, 4))
 	defer strip_pool_stop(&pool)
@@ -224,6 +221,7 @@ main :: proc() {
 					pause_clock = time.duration_seconds(time.since(playback_start))
 				} else {
 					playback_start = time.time_add(playback_start, time.since(pause_start))
+					video_request_seek(vp, i64(pause_clock * 1000000000.0))
 				}
 			case KEY_VOL_UP:
 				volume = min(volume + 0.05, 1.0)
@@ -269,20 +267,14 @@ main :: proc() {
 			case KEY_COLOR_UP:
 				color_idx = min(color_idx + 1, len(PALETTE_LEVELS) - 1)
 				pal = get_palette(PALETTE_LEVELS[color_idx])
-				strip_cache_free(cache)
-				cache = new(StripCache)
-				strip_cache_init(cache, total_strips)
 				if paused {
-					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal, cache)
+					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal)
 				}
 			case KEY_COLOR_DOWN:
 				color_idx = max(color_idx - 1, 0)
 				pal = get_palette(PALETTE_LEVELS[color_idx])
-				strip_cache_free(cache)
-				cache = new(StripCache)
-				strip_cache_init(cache, total_strips)
 				if paused {
-					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal, cache)
+					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal)
 				}
 			case KEY_SIZE:
 				full_disp = !full_disp
@@ -302,21 +294,21 @@ main :: proc() {
 			cols, rows = term_size()
 			cell_w, cell_h = term_cell_pixels()
 			nw, nh := fit_disp(vs.src_w, vs.src_h, cols, rows, cell_w, cell_h, full_disp)
-			if nw != vp.out_w || nh != vp.out_h {
+			if nw != out_w || nh != out_h {
 				if have_pending {
 					video_pool_put(vp, pending.buf)
 					have_pending = false
 				}
 				out_w, out_h = nw, nh
-				total_strips = (out_h + 5) / 6
 				start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 				start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
-				strip_cache_free(cache)
-				cache = new(StripCache)
-				strip_cache_init(cache, total_strips)
 				video_request_resize(vp, out_w, out_h)
 				render_submit(&rc, RenderJob{clear = true})
-				force_frame = true
+				if paused {
+					rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
+				} else {
+					force_frame = true
+				}
 				fps_ui.prev_len = 0
 			}
 		}
@@ -361,6 +353,11 @@ main :: proc() {
 			}
 		}
 
+		if paused && !force_frame {
+			time.sleep(2 * time.Millisecond)
+			continue
+		}
+
 		if !have_pending {
 			m, ok := fq_try_pop(&vp.queue)
 			if ok {
@@ -374,23 +371,6 @@ main :: proc() {
 		}
 		if len(pending.buf) != out_w * out_h * 4 {
 			video_pool_put(vp, pending.buf)
-			have_pending = false
-			continue
-		}
-
-		start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
-		start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
-		if force_frame {
-			force_frame = false
-			render_submit(&rc, RenderJob{
-				buf = pending.buf,
-				w = out_w,
-				h = out_h,
-				start_col = start_col,
-				start_row = start_row,
-				pal = pal,
-				cache = cache,
-			})
 			have_pending = false
 			continue
 		}
@@ -411,12 +391,12 @@ main :: proc() {
 		if src_fps > 0 {
 			lag_tol = 2.0 / src_fps
 		}
-		if pts > clock + 1.0 {
+		if pts > clock + 5.0 {
 			video_pool_put(vp, pending.buf)
 			have_pending = false
 			continue
 		}
-		if pts > clock + 0.002 {
+		if pts > clock + 0.002 && !force_frame {
 			remain := min(pts - clock - 0.001, 0.05)
 			if remain > 0 {
 				time.sleep(time.Duration(remain * 1e9))
@@ -429,6 +409,7 @@ main :: proc() {
 			continue
 		}
 
+		force_frame = false
 		start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 		start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
 		render_submit(&rc, RenderJob{
@@ -438,7 +419,6 @@ main :: proc() {
 			start_col = start_col,
 			start_row = start_row,
 			pal = pal,
-			cache = cache,
 		})
 		have_pending = false
 	}
@@ -451,7 +431,6 @@ main :: proc() {
 	video_stop(vp)
 	video_close(vp)
 	audio_shutdown()
-	strip_cache_free(cache)
 	for i in 0..<len(rc.bufs) {
 		if len(rc.bufs[i].buf) > 0 {
 			free(&rc.bufs[i].buf[0])
