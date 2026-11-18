@@ -3,6 +3,7 @@ package aideo
 import "core:c"
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:time"
 import "core:sync"
 import "core:thread"
@@ -15,11 +16,82 @@ main :: proc() {
 	if len(os.args) >= 2 && os.args[1] == "cisws" { ci_sws(); return }
 	if len(os.args) >= 2 && os.args[1] == "ciframe" { ci_frame(); return }
 	if len(os.args) >= 2 && os.args[1] == "cibench" { ci_bench(); return }
-	if len(os.args) < 2 {
-		fmt.printfln("usage: aideo <video file>")
+	color_cli := 0
+	vol_cli := -1.0
+	start_sec := 0.0
+	file_arg := ""
+	argi := 1
+	for argi < len(os.args) {
+		a := os.args[argi]
+		if a == "-h" || a == "--help" || a == "help" {
+			print_help()
+			return
+		}
+		if a == "--version" || a == "-V" {
+			print_version()
+			return
+		}
+		if a == "-c" || a == "--colors" {
+			argi += 1
+			if argi >= len(os.args) {
+				cli_error("missing value for --colors")
+				os.exit(1)
+			}
+			v, ok := strconv.parse_int(os.args[argi])
+			color_cli = int(v)
+			if !ok {
+				cli_error("invalid color count")
+				os.exit(1)
+			}
+		} else if a == "-v" || a == "--volume" {
+			argi += 1
+			if argi >= len(os.args) {
+				cli_error("missing value for --volume")
+				os.exit(1)
+			}
+			v, ok := strconv.parse_f64(os.args[argi])
+			vol_cli = v
+			if !ok || vol_cli < 0.0 || vol_cli > 100.0 {
+				cli_error("volume must be from 0 to 100")
+				os.exit(1)
+			}
+		} else if a == "-t" || a == "--start" {
+			argi += 1
+			if argi >= len(os.args) {
+				cli_error("missing value for --start")
+				os.exit(1)
+			}
+			v, ok := parse_time(os.args[argi])
+			start_sec = v
+			if !ok {
+				cli_error("start time must be seconds or mm:ss or hh:mm:ss")
+				os.exit(1)
+			}
+		} else if len(a) > 0 && a[0] == '-' {
+			cli_error(fmt.tprintf("unknown option %s", a))
+			os.exit(1)
+		} else {
+			file_arg = a
+		}
+		argi += 1
+	}
+	if file_arg == "" {
+		print_help()
 		os.exit(1)
 	}
-	path := cstring(strings_clone_to_cstring(os.args[1]))
+	if color_cli != 0 {
+		found := false
+		for lv in COLOR_LEVELS {
+			if lv == color_cli {
+				found = true
+			}
+		}
+		if !found {
+			cli_error("color count must be one of 2 8 16 32 64 128 256")
+			os.exit(1)
+		}
+	}
+	path := cstring(strings_clone_to_cstring(file_arg))
 
 	av_log_set_level(AV_LOG_QUIET)
 
@@ -41,6 +113,13 @@ main :: proc() {
 	vp.out_h = out_h
 
 	color_idx := 4
+	if color_cli != 0 {
+		for lv, li in COLOR_LEVELS {
+			if lv == color_cli {
+				color_idx = li
+			}
+		}
+	}
 	pal := get_palette(COLOR_LEVELS[color_idx])
 
 	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l")
@@ -58,11 +137,28 @@ main :: proc() {
 
 	start_wall := time.now()
 	playback_start := start_wall
+	if start_sec > 0.0 {
+		abs_t := start_sec
+		if vs.duration_sec > 0 {
+			abs_t = clamp(start_sec, 0.0, max(vs.duration_sec - 0.5, 0.0))
+		}
+		playback_start = time.time_add(time.now(), time.Duration(-abs_t * 1000000000.0))
+		if has_audio {
+			audio_seek(i64(abs_t * 1000000000.0), i64(abs_t * 1000000000.0))
+		}
+		video_request_seek(vp, i64(abs_t * 1000000000.0))
+	}
 	pause_start := start_wall
 	paused := false
 	muted := false
 	pause_clock := 0.0
 	volume := 1.0
+	if vol_cli >= 0.0 {
+		volume = vol_cli / 100.0
+	}
+	if has_audio {
+		audio_set_volume(f32(volume))
+	}
 	cache := new(StripCache)
 	total_strips := (out_h + 5) / 6
 	strip_cache_init(cache, total_strips)
