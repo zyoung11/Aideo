@@ -82,7 +82,6 @@ main :: proc() {
 	start_col := 1
 	start_row := 1
 	show_fps := false
-	last_vol_t: time.Time
 	fps_ui: FpsUI
 	src_fps := vs.fps
 	fps_sample_t := time.now()
@@ -116,14 +115,10 @@ main :: proc() {
 				volume = min(volume + 0.05, 1.0)
 				muted = false
 				audio_set_volume(f32(volume))
-				last_vol_t = time.now()
-				fps_ui_t = time.Time{}
 			case KEY_VOL_DOWN:
 				volume = max(volume - 0.05, 0.0)
 				muted = false
 				audio_set_volume(f32(volume))
-				last_vol_t = time.now()
-				fps_ui_t = time.Time{}
 			case KEY_SEEK_FWD, KEY_SEEK_BACK:
 				cur := time.duration_seconds(time.since(playback_start))
 				if paused {
@@ -157,8 +152,6 @@ main :: proc() {
 				} else {
 					audio_set_volume(f32(volume))
 				}
-				last_vol_t = time.now()
-				fps_ui_t = time.Time{}
 			case KEY_COLOR_UP:
 				color_idx = min(color_idx + 1, len(COLOR_LEVELS) - 1)
 				pal = get_palette(COLOR_LEVELS[color_idx])
@@ -229,14 +222,11 @@ main :: proc() {
 				ptext := fmt.tprintf("%d:%02d/%d:%02d",
 					int(media_pos) / 60, int(media_pos) %% 60,
 					int(vs.duration_sec) / 60, int(vs.duration_sec) %% 60)
-				label := fmt.tprintf("[ %d | %.3f/%sfps | %s ]", pal.nc, inst, fps_preset(src_fps), ptext)
-				if time.duration_seconds(time.since(last_vol_t)) < 5.0 {
-					seg := fmt.tprintf("%d%%", int(volume * 100 + 0.5))
-					if muted {
-						seg = "MUTE"
-					}
-					label = fmt.tprintf("[ %d | %.3f/%sfps | %s | %s ]", pal.nc, inst, fps_preset(src_fps), ptext, seg)
+				seg := fmt.tprintf("%d%%", int(volume * 100 + 0.5))
+				if muted {
+					seg = "MUTE"
 				}
+				label := fmt.tprintf("[ %d | %.3f/%sfps | %s | %s ]", pal.nc, inst, fps_preset(src_fps), ptext, seg)
 				sync.mutex_lock(&rc.stdout_mu)
 				if fps_row <= rows {
 					fps_ui_show(&fps_ui, fps_row, cols, label)
@@ -360,7 +350,7 @@ FpsUI :: struct {
 // fps_ui_hide erases the label drawn by the previous fps_ui_show call.
 fps_ui_hide :: proc(ui: ^FpsUI) {
 	if ui.prev_len > 0 {
-		spaces := "                                        "
+		spaces := "                                                                                                "
 		n := min(ui.prev_len, len(spaces))
 		fmt.printf("\x1b[%d;%dH%s", ui.prev_row, ui.prev_col, spaces[:n])
 		ui.prev_len = 0
