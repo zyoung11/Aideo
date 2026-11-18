@@ -1,5 +1,6 @@
 package aideo
 
+import "core:c"
 import "core:sync"
 import "core:thread"
 
@@ -109,6 +110,9 @@ ScaleWorkerState :: struct {
 	tmp_y: []u8,
 	tmp_u: []u8,
 	tmp_v: []u8,
+	ty:    []u8,
+	tu:    []u8,
+	tv:    []u8,
 	acc_y: []u32,
 	acc_c: []u32,
 }
@@ -124,10 +128,73 @@ scale_prepare_scratch :: proc(ws: ^ScaleWorkerState, p: ^ScalePlan) {
 		ws.tmp_v = make([]u8, p.sw2)
 		ws.acc_c = make([]u32, p.sw2)
 	}
+	if len(ws.ty) < p.dw {
+		ws.ty = make([]u8, p.dw)
+		ws.tu = make([]u8, p.dw)
+		ws.tv = make([]u8, p.dw)
+	}
 }
 
 // scale_row scales one output row with the BT.601 limited range matrix.
 scale_row :: proc(ws: ^ScaleWorkerState, job: ^ScaleJob, dy: int) {
+	p := job.plan
+	y0 := int(p.vy_off[dy])
+	yn := int(p.vy_cnt[dy])
+	yw := int(p.vy_woff[dy])
+	cy0 := int(p.vcy_off[dy])
+	cyn := int(p.vcy_cnt[dy])
+	cyw := int(p.vcy_woff[dy])
+
+	vert_acc_init_avx2(&ws.acc_y[0], ([^]u8)(&job.src_y[y0 * job.stride_y]), u32(p.vy_w[yw]), c.int(p.sw))
+	for k in 1..<yn {
+		vert_acc_avx2(&ws.acc_y[0], ([^]u8)(&job.src_y[(y0 + k) * job.stride_y]), u32(p.vy_w[yw + k]), c.int(p.sw))
+	}
+	norm_acc_avx2(&ws.tmp_y[0], &ws.acc_y[0], u32(p.inv_sh), c.int(p.sw))
+
+	vert_acc_init_avx2(&ws.acc_c[0], ([^]u8)(&job.src_u[cy0 * job.stride_c]), u32(p.vcy_w[cyw]), c.int(p.sw2))
+	for k in 1..<cyn {
+		vert_acc_avx2(&ws.acc_c[0], ([^]u8)(&job.src_u[(cy0 + k) * job.stride_c]), u32(p.vcy_w[cyw + k]), c.int(p.sw2))
+	}
+	norm_acc_avx2(&ws.tmp_u[0], &ws.acc_c[0], u32(p.inv_sh2), c.int(p.sw2))
+
+	vert_acc_init_avx2(&ws.acc_c[0], ([^]u8)(&job.src_v[cy0 * job.stride_c]), u32(p.vcy_w[cyw]), c.int(p.sw2))
+	for k in 1..<cyn {
+		vert_acc_avx2(&ws.acc_c[0], ([^]u8)(&job.src_v[(cy0 + k) * job.stride_c]), u32(p.vcy_w[cyw + k]), c.int(p.sw2))
+	}
+	norm_acc_avx2(&ws.tmp_v[0], &ws.acc_c[0], u32(p.inv_sh2), c.int(p.sw2))
+
+	for dx in 0..<p.dw {
+		x0 := int(p.hx_off[dx])
+		xn := int(p.hx_cnt[dx])
+		xw := int(p.hx_woff[dx])
+		acc: u32
+		for k in 0..<xn {
+			acc += u32(p.hx_w[xw + k]) * u32(ws.tmp_y[x0 + k])
+		}
+		ws.ty[dx] = u8((u64(acc) * p.inv_sw + (u64(1) << 31)) >> 32)
+
+		cx0 := int(p.hcx_off[dx])
+		cxn := int(p.hcx_cnt[dx])
+		cxw := int(p.hcx_woff[dx])
+		acc = 0
+		for k in 0..<cxn {
+			acc += u32(p.hcx_w[cxw + k]) * u32(ws.tmp_u[cx0 + k])
+		}
+		ws.tu[dx] = u8((u64(acc) * p.inv_sw2 + (u64(1) << 31)) >> 32)
+		acc = 0
+		for k in 0..<cxn {
+			acc += u32(p.hcx_w[cxw + k]) * u32(ws.tmp_v[cx0 + k])
+		}
+		ws.tv[dx] = u8((u64(acc) * p.inv_sw2 + (u64(1) << 31)) >> 32)
+	}
+
+	out := ([^]u8)(&job.dst[dy * job.dst_stride])
+	rgba_matrix_avx2(&out[0], &ws.ty[0], &ws.tu[0], &ws.tv[0], c.int(p.dw))
+}
+
+// scale_row_ref is the scalar reference implementation kept for parity
+// testing. The fast path must stay byte identical to it.
+scale_row_ref :: proc(ws: ^ScaleWorkerState, job: ^ScaleJob, dy: int) {
 	p := job.plan
 	y0 := int(p.vy_off[dy])
 	yn := int(p.vy_cnt[dy])

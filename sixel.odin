@@ -11,6 +11,10 @@ foreign import avx2lib { "avx2_quant.o" }
 foreign avx2lib {
 	quant_row_avx2 :: proc(dst: [^]u8, rgba: [^]u8, w: c.int, dpos_r: [^]u8, dneg_r: [^]u8, dpos_g: [^]u8, dneg_g: [^]u8, dpos_b: [^]u8, dneg_b: [^]u8, r_shr: c.int, g_shr: c.int, b_shr: c.int, r_shift: c.int, g_shift: c.int) ---
 	hash_strip_avx2 :: proc(rgba: [^]u8, width: c.int, y_start: c.int, y_end: c.int) -> u64 ---
+	vert_acc_init_avx2 :: proc(acc: [^]u32, row: [^]u8, w: u32, n: c.int) ---
+	vert_acc_avx2 :: proc(acc: [^]u32, row: [^]u8, w: u32, n: c.int) ---
+	norm_acc_avx2 :: proc(dst: [^]u8, acc: [^]u32, inv: u32, n: c.int) ---
+	rgba_matrix_avx2 :: proc(dst: [^]u8, ty: [^]u8, tu: [^]u8, tv: [^]u8, n: c.int) ---
 }
 
 BAYER_4X4 := [16]i8{0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}

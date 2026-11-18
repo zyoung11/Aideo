@@ -146,6 +146,50 @@ ci_sws :: proc() {
 		clear(&diff_rows)
 	}
 
+	fmt.printfln("--- fast vs scalar reference parity ---")
+	pcases := [2]SwsCase{{2193, 1234, 0, false}, {1097, 617, 0, false}}
+	for tc in pcases {
+		plan := scale_plan(sw, sh, tc.dw, tc.dh)
+		pool: ScalePool
+		scale_pool_init(&pool, 8)
+		got := make([]u8, tc.dw * tc.dh * 4)
+		scale_frame(&pool, plan, &ybuf[0], &ubuf[0], &vbuf[0], sw, sw / 2, &got[0], tc.dw * 4)
+		scale_pool_stop(&pool)
+		ref := make([]u8, tc.dw * tc.dh * 4)
+		ws: ScaleWorkerState
+		scale_prepare_scratch(&ws, plan)
+		job := ScaleJob{
+			plan = plan,
+			src_y = &ybuf[0],
+			src_u = &ubuf[0],
+			src_v = &vbuf[0],
+			stride_y = sw,
+			stride_c = sw / 2,
+			dst = &ref[0],
+			dst_stride = tc.dw * 4,
+		}
+		for dy in 0..<tc.dh {
+			scale_row_ref(&ws, &job, dy)
+		}
+		n_diff := 0
+		maxd := 0
+		shown := 0
+		for i in 0..<len(ref) {
+			if ref[i] != got[i] {
+				n_diff += 1
+				d := abs(int(ref[i]) - int(got[i]))
+				if d > maxd {
+					maxd = d
+				}
+				if shown < 5 {
+					fmt.printfln("  first diffs i=%d ref=%d got=%d", i, ref[i], got[i])
+					shown += 1
+				}
+			}
+		}
+		fmt.printfln("parity %4dx%-4d diffs=%d maxd=%d %s", tc.dw, tc.dh, n_diff, maxd, n_diff == 0 ? "OK" : "DIFF")
+	}
+
 	fmt.printfln("--- custom scaler vs sws ---")
 	cases2 := [2]SwsCase{{2193, 1234, 0, false}, {1097, 617, 0, false}}
 	for tc in cases2 {
