@@ -71,8 +71,10 @@ main :: proc() {
 	rc: RenderCtx
 	rc.vp = vp
 	rc.pool = &pool
-	buffer_init(&rc.out, out_w * out_h / 2)
-	thread.create_and_start_with_data(&rc, render_thread, nil, .Normal, true)
+	for i in 0..<len(rc.bufs) {
+		buffer_init(&rc.bufs[i], out_w * out_h / 2)
+	}
+	render_start(&rc)
 	pending: FrameMsg
 	have_pending := false
 	force_frame := false
