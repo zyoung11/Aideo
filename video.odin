@@ -98,6 +98,8 @@ VideoPlayer :: struct {
 	req_w:       i64,
 	req_h:       i64,
 	req_resize:  i32,
+	req_seek:    i32,
+	req_seek_ns: i64,
 	stop:        i32,
 	loop_offset: i64,
 	last_pts:    i64,
@@ -335,6 +337,19 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 	vs := vp.vs
 
 	for sync.atomic_load(&vp.stop) == 0 {
+		if sync.atomic_load(&vp.req_seek) != 0 {
+			tgt := sync.atomic_load(&vp.req_seek_ns)
+			sync.atomic_store(&vp.req_seek, 0)
+			loff := sync.atomic_load(&vp.loop_offset)
+			seek_target := i64(f64(tgt - loff) / 1e9 / vs.time_base)
+			if seek_target < 0 {
+				seek_target = 0
+			}
+			av_seek_frame(vs.fmt_ctx, c.int(vs.stream_idx), seek_target, AVSEEK_FLAG_BACKWARD)
+			avcodec_flush_buffers(vs.codec_ctx)
+			continue
+		}
+
 		if sync.atomic_load(&vp.req_resize) != 0 {
 			nw := int(sync.atomic_load(&vp.req_w))
 			nh := int(sync.atomic_load(&vp.req_h))
@@ -418,6 +433,13 @@ video_start :: proc(vp: ^VideoPlayer) {
 	thread.create_and_start_with_data(vp, proc(data: rawptr) {
 		video_decode_thread((^VideoPlayer)(data))
 	})
+}
+
+// video_request_seek asks the decode thread to jump to an absolute
+// timeline position in nanoseconds.
+video_request_seek :: proc(vp: ^VideoPlayer, abs_ns: i64) {
+	sync.atomic_store(&vp.req_seek_ns, abs_ns)
+	sync.atomic_store(&vp.req_seek, 1)
 }
 
 video_request_resize :: proc(vp: ^VideoPlayer, w, h: int) {

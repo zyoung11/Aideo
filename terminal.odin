@@ -1,6 +1,7 @@
 package aideo
 
 import "core:c"
+import "core:fmt"
 import "core:os"
 import "core:sync"
 import "core:thread"
@@ -144,6 +145,8 @@ KEY_COLOR_UP :: 4
 KEY_COLOR_DOWN :: 5
 KEY_FPS :: 6
 KEY_MUTE :: 8
+KEY_SEEK_FWD :: 9
+KEY_SEEK_BACK :: 10
 
 key_queue: [32]u8
 key_head: i64
@@ -192,6 +195,10 @@ key_thread :: proc() {
 						key_push(KEY_VOL_UP)
 					case 'B':
 						key_push(KEY_VOL_DOWN)
+					case 'C':
+						key_push(KEY_SEEK_FWD)
+					case 'D':
+						key_push(KEY_SEEK_BACK)
 					}
 				}
 				i += 1

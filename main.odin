@@ -124,6 +124,32 @@ main :: proc() {
 				audio_set_volume(f32(volume))
 				last_vol_t = time.now()
 				fps_ui_t = time.Time{}
+			case KEY_SEEK_FWD, KEY_SEEK_BACK:
+				cur := time.duration_seconds(time.since(playback_start))
+				if paused {
+					cur = pause_clock
+				}
+				target := cur + 5.0
+				if k == KEY_SEEK_BACK {
+					target = cur - 5.0
+				}
+				loff := f64(sync.atomic_load(&vp.loop_offset)) / 1000000000.0
+				media_t := clamp(target - loff, 0.0, max(vs.duration_sec - 0.5, 0.0))
+				abs_t := media_t + loff
+				playback_start = time.time_add(time.now(), time.Duration(-abs_t * 1000000000.0))
+				if paused {
+					pause_clock = abs_t
+					pause_start = time.now()
+				}
+				if has_audio {
+					audio_seek(i64(media_t * 1000000000.0), i64(abs_t * 1000000000.0))
+				}
+				if have_pending {
+					video_pool_put(vp, pending.buf)
+					have_pending = false
+				}
+				video_request_seek(vp, i64(abs_t * 1000000000.0))
+				force_frame = true
 			case KEY_MUTE:
 				muted = !muted
 				if muted {
@@ -194,13 +220,22 @@ main :: proc() {
 			fps_sample_n = wn
 			if show_fps {
 				fps_row := start_row + (out_h + cell_h - 1) / cell_h
-				label := fmt.tprintf("[ %d | %.3f/%sfps ]", pal.nc, inst, fps_preset(src_fps))
+				pos := pause_clock
+				if !paused {
+					pos = time.duration_seconds(time.since(playback_start))
+				}
+				loff := f64(sync.atomic_load(&vp.loop_offset)) / 1000000000.0
+				media_pos := clamp(pos - loff, 0.0, vs.duration_sec)
+				ptext := fmt.tprintf("%d:%02d/%d:%02d",
+					int(media_pos) / 60, int(media_pos) %% 60,
+					int(vs.duration_sec) / 60, int(vs.duration_sec) %% 60)
+				label := fmt.tprintf("[ %d | %.3f/%sfps | %s ]", pal.nc, inst, fps_preset(src_fps), ptext)
 				if time.duration_seconds(time.since(last_vol_t)) < 5.0 {
 					seg := fmt.tprintf("%d%%", int(volume * 100 + 0.5))
 					if muted {
 						seg = "MUTE"
 					}
-					label = fmt.tprintf("[ %d | %.3f/%sfps | %s ]", pal.nc, inst, fps_preset(src_fps), seg)
+					label = fmt.tprintf("[ %d | %.3f/%sfps | %s | %s ]", pal.nc, inst, fps_preset(src_fps), ptext, seg)
 				}
 				sync.mutex_lock(&rc.stdout_mu)
 				if fps_row <= rows {
@@ -263,8 +298,13 @@ main :: proc() {
 		if src_fps > 0 {
 			lag_tol = 2.0 / src_fps
 		}
+		if pts > clock + 1.0 {
+			video_pool_put(vp, pending.buf)
+			have_pending = false
+			continue
+		}
 		if pts > clock + 0.002 {
-			remain := pts - clock - 0.001
+			remain := min(pts - clock - 0.001, 0.05)
 			if remain > 0 {
 				time.sleep(time.Duration(remain * 1e9))
 			}

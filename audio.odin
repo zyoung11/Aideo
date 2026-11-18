@@ -70,6 +70,9 @@ AudioState :: struct {
 	space:   sync.Sema,
 	anchor_consumed: i64,
 	anchor_wall:     time.Time,
+	seek_req:        i64,
+	seek_abs:        i64,
+	seek_flag:       i32,
 }
 
 audio_state: AudioState
@@ -169,6 +172,7 @@ audio_clock_sec :: proc() -> f64 {
 
 AudioStream :: struct {
 	fmt_ctx:    ^AVFormatContext,
+	time_base:  f64,
 	codec_ctx:  ^AVCodecContext,
 	swr:        ^SwrContext,
 	pkt:        ^AVPacket,
@@ -233,6 +237,8 @@ audio_stream_open :: proc(path: cstring) -> ^AudioStream {
 	s.pkt = av_packet_alloc()
 	s.frame = av_frame_alloc()
 	s.stream_idx = int(idx)
+	tb := s.fmt_ctx.streams[s.stream_idx].time_base
+	s.time_base = f64(tb.num) / f64(tb.den)
 	s.samples = make([]i16, AUDIO_RATE * AUDIO_CHANNELS)
 	return s
 }
@@ -246,8 +252,31 @@ audio_stream_close :: proc(s: ^AudioStream) {
 	free(s)
 }
 
+// audio_seek requests a jump to the given media position. abs_ns is the
+// matching absolute timeline position that the video clock follows.
+audio_seek :: proc(media_ns: i64, abs_ns: i64) {
+	sync.atomic_store(&audio_state.seek_req, media_ns)
+	sync.atomic_store(&audio_state.seek_abs, abs_ns)
+	sync.atomic_store(&audio_state.seek_flag, 1)
+	sync.sema_post(&audio_state.space)
+}
+
 audio_decode_thread :: proc(s: ^AudioStream) {
 	for {
+		if sync.atomic_load(&audio_state.seek_flag) != 0 {
+			media_ns := sync.atomic_load(&audio_state.seek_req)
+			abs_ns := sync.atomic_load(&audio_state.seek_abs)
+			sync.atomic_store(&audio_state.seek_flag, 0)
+			ts := i64(f64(media_ns) / 1e9 / s.time_base)
+			av_seek_frame(s.fmt_ctx, c.int(s.stream_idx), ts, AVSEEK_FLAG_BACKWARD)
+			avcodec_flush_buffers(s.codec_ctx)
+			sync.atomic_store(&audio_state.ring.head, sync.atomic_load(&audio_state.ring.tail))
+			cons := i64(f64(abs_ns) / 1e9 * f64(AUDIO_RATE))
+			sync.atomic_store(&audio_state.consumed, cons)
+			sync.atomic_store(&audio_state.anchor_consumed, cons)
+			audio_state.anchor_wall = time.now()
+			continue
+		}
 		res := av_read_frame(s.fmt_ctx, s.pkt)
 		if res == AVERROR_EOF {
 			av_seek_frame(s.fmt_ctx, c.int(s.stream_idx), 0, AVSEEK_FLAG_BACKWARD)
@@ -287,6 +316,9 @@ audio_decode_thread :: proc(s: ^AudioStream) {
 				written := ring_write(&audio_state.ring, buf[:produced])
 				for written < produced {
 					sync.sema_wait(&audio_state.space)
+					if sync.atomic_load(&audio_state.seek_flag) != 0 {
+						break
+					}
 					written += ring_write(&audio_state.ring, buf[written:produced])
 				}
 			}
