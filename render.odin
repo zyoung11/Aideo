@@ -244,6 +244,12 @@ render_encode_thread :: proc(data: rawptr) {
 			rc.cache_h = job.h
 		}
 		sixel_encode(rc.pool, buf, job.buf, job.w, job.h, job.pal, rc.cache)
+		write_bytes(buf, []u8{0x1b})
+		write_byte(buf, '[')
+		write_sixel_num(buf, job.start_row)
+		write_byte(buf, ';')
+		write_sixel_num(buf, job.start_col)
+		write_byte(buf, 'H')
 		render_handoff(rc, job, buf.buf[:buf.pos], idx, job.clear)
 	}
 }

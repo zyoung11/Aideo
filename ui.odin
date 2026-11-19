@@ -48,13 +48,19 @@ fps_ui_show :: proc(ui: ^FpsUI, row, cols: int, text: string) {
 }
 
 // fit_disp returns the video size fitted to the display area. When full is
-// false the area is halved in both dimensions.
+// false the area is halved in both dimensions. The height is capped one
+// row short of the terminal height so a sixel linefeed never reaches the
+// bottom row, which would scroll the screen on foot.
 fit_disp :: proc(src_w, src_h, cols, rows, cell_w, cell_h: int, full: bool) -> (int, int) {
 	w := cols * cell_w
 	h := rows * cell_h
 	if !full {
 		w /= 2
 		h /= 2
+	}
+	if rows > 1 && (h + cell_h - 1) / cell_h >= rows {
+		h = (rows - 1) * cell_h
+		w = cols * cell_w
 	}
 	return fit_aspect(src_w, src_h, w, h)
 }
