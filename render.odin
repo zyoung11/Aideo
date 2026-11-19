@@ -214,6 +214,10 @@ render_encode_thread :: proc(data: rawptr) {
 			}
 			return
 		}
+		if job.clear && rc.cache != nil {
+			strip_cache_free(rc.cache)
+			rc.cache = nil
+		}
 		if len(job.buf) == 0 {
 			if job.clear {
 				render_handoff(rc, job, nil, -1, true)
