@@ -1,4 +1,4 @@
-package aideo
+package main
 
 import "core:fmt"
 

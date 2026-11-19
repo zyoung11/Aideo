@@ -5,3 +5,4 @@ images/
 *.o
 aideo_prof.txt
 aideo
+libaideo.a

@@ -43,9 +43,32 @@
 
 ```bash
 cc -O3 -mavx2 -c avx2_quant.c -o avx2_quant.o
-odin build . -o:speed -out:aideo
+sh build_ffstatic.sh                 # 构建静态 FFmpeg、dav1d、zlib
+odin build cmd/aideo -o:speed -out:aideo
 ./aideo video.mp4
 ```
+
+## libaideo
+
+核心渲染引擎可作为静态库复用。构建：
+
+```bash
+odin build . -build-mode:static -out:libaideo.a
+```
+
+C 接口见 `aideo.h`。任意语言通过标准 C ABI 调用（Go 用 cgo，Rust 用 FFI）。示例：
+
+```c
+#include "aideo.h"
+
+aideo_config cfg = { .fd = 1, .src_w = 1920, .src_h = 1080,
+    .out_w = 640, .out_h = 360, .colors = 256, .origin_row = 1, .origin_col = 1 };
+aideo_engine *e = aideo_open(&cfg);
+aideo_push_yuv(e, y, u, v, stride_y, stride_c);  /* 帧进，终端画面出 */
+aideo_close(e);
+```
+
+链接时需带上 `avx2_quant.o` 与 `ffstatic/`、`miniaudio/` 的静态库，见 `aideo.h` 头注释。
 
 ## 选项
 

@@ -49,6 +49,7 @@ RenderCtx :: struct {
 
 	vp:        ^VideoPlayer,
 	pool:      ^StripPool,
+	fd:        int,
 	stdout_mu: sync.Mutex,
 	written:   i64,
 	freeze:    []u8,
@@ -268,7 +269,7 @@ render_write_thread :: proc(data: rawptr) {
 			varr: IoVecList
 			iovs_push(&varr, CLEAR_BYTES[:])
 			sync.mutex_lock(&rc.stdout_mu)
-			writev_all(&varr)
+			writev_all(rc.fd, &varr)
 			sync.mutex_unlock(&rc.stdout_mu)
 		}
 		if len(wdata) == 0 {
@@ -281,7 +282,7 @@ render_write_thread :: proc(data: rawptr) {
 		varr: IoVecList
 		iovs_push(&varr, wdata)
 		sync.mutex_lock(&rc.stdout_mu)
-		writev_all(&varr)
+		writev_all(rc.fd, &varr)
 		sync.mutex_unlock(&rc.stdout_mu)
 		prof_add(PROF_WRITE, i64(time.since(_t4)))
 		sync.atomic_add(&rc.written, 1)
@@ -307,12 +308,12 @@ render_write_thread :: proc(data: rawptr) {
 	}
 }
 
-// writev_all writes the whole iovec list, handling partial writes.
-writev_all :: proc(l: ^IoVecList) {
+// writev_all writes the whole iovec list to fd, handling partial writes.
+writev_all :: proc(fd: int, l: ^IoVecList) {
 	base := 0
 	for base < l.n {
 		cnt := min(l.n - base, 1024)
-		nw := writev(1, &l.iovs[base], c.int(cnt))
+		nw := writev(c.int(fd), &l.iovs[base], c.int(cnt))
 		if nw <= 0 {
 			return
 		}
@@ -334,6 +335,9 @@ writev_all :: proc(l: ^IoVecList) {
 
 // render_start spawns the encode and write threads.
 render_start :: proc(rc: ^RenderCtx) {
+	if rc.fd == 0 {
+		rc.fd = 1
+	}
 	sync.sema_post(&rc.buf_empty, len(rc.bufs))
 	sync.sema_post(&rc.wempty, 1)
 	thread.create_and_start_with_data(rc, render_encode_thread, nil, .Normal, true)

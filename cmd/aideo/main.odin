@@ -1,6 +1,7 @@
-package aideo
+package main
 
 import "core:c"
+import aideo "../.."
 import "core:fmt"
 import "core:os"
 import "core:strconv"
@@ -9,10 +10,10 @@ import "core:sync"
 import "core:thread"
 
 main :: proc() {
-	if len(os.args) >= 2 && os.args[1] == "citest" { ci_test(); return }
-	if len(os.args) >= 2 && os.args[1] == "cisws" { ci_sws(); return }
-	if len(os.args) >= 2 && os.args[1] == "ciframe" { ci_frame(); return }
-	if len(os.args) >= 2 && os.args[1] == "cibench" { ci_bench(); return }
+	if len(os.args) >= 2 && os.args[1] == "citest" { aideo.ci_test(); return }
+	if len(os.args) >= 2 && os.args[1] == "cisws" { aideo.ci_sws(); return }
+	if len(os.args) >= 2 && os.args[1] == "ciframe" { aideo.ci_frame(); return }
+	if len(os.args) >= 2 && os.args[1] == "cibench" { aideo.ci_bench(); return }
 	color_cli := 0
 	vol_cli := -1.0
 	start_sec := 0.0
@@ -94,7 +95,7 @@ main :: proc() {
 	}
 	if color_cli != 0 {
 		found := false
-		for lv in PALETTE_LEVELS {
+		for lv in aideo.PALETTE_LEVELS {
 			if lv == color_cli {
 				found = true
 			}
@@ -104,48 +105,48 @@ main :: proc() {
 			os.exit(1)
 		}
 	}
-	path := strings_clone_to_cstring(file_arg)
+	path := aideo.strings_clone_to_cstring(file_arg)
 	in_tmux := os.get_env("TMUX", context.allocator) != ""
 
-	av_log_set_level(AV_LOG_QUIET)
+	aideo.av_log_set_level(aideo.AV_LOG_QUIET)
 
-	vs := video_open(path)
+	vs := aideo.video_open(path)
 	if vs == nil {
 		fmt.eprintfln("error: cannot open video: %s", file_arg)
 		os.exit(1)
 	}
-	if is_image_codec_name(vs.codec_name) {
-		if stream_is_animated(vs, file_arg) {
+	if aideo.is_image_codec_name(vs.codec_name) {
+		if aideo.stream_is_animated(vs, file_arg) {
 			vs.loop_forever = true
 		} else {
-			video_close_stream(vs)
-			photo_run(path, file_arg, full_cli)
+			aideo.video_close_stream(vs)
+			aideo.photo_run(path, file_arg, full_cli)
 			return
 		}
-	} else if is_animation_codec_name(vs.codec_name) {
+	} else if aideo.is_animation_codec_name(vs.codec_name) {
 		vs.loop_forever = true
 	}
 
-	cols, rows := term_size()
-	cell_w, cell_h := term_cell_pixels()
+	cols, rows := aideo.term_size()
+	cell_w, cell_h := aideo.term_cell_pixels()
 	out_w := cols * cell_w
 	out_h := rows * cell_h
-	out_w, out_h = fit_disp(vs.src_w, vs.src_h, cols, rows, cell_w, cell_h, full_cli)
+	out_w, out_h = aideo.fit_disp(vs.src_w, vs.src_h, cols, rows, cell_w, cell_h, full_cli)
 
-	vp := new(VideoPlayer)
+	vp := new(aideo.VideoPlayer)
 	vp.vs = vs
 	vp.out_w = out_w
 	vp.out_h = out_h
 
 	color_idx := 4
 	if color_cli != 0 {
-		for lv, li in PALETTE_LEVELS {
+		for lv, li in aideo.PALETTE_LEVELS {
 			if lv == color_cli {
 				color_idx = li
 			}
 		}
 	}
-	pal := get_palette(PALETTE_LEVELS[color_idx])
+	pal := aideo.get_palette(aideo.PALETTE_LEVELS[color_idx])
 
 	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l")
 	if in_tmux {
@@ -153,15 +154,15 @@ main :: proc() {
 	}
 	fmt.print("\x1b[2J\x1b[3J\x1b[H")
 
-	has_audio := audio_init()
+	has_audio := aideo.audio_init()
 	if has_audio {
-		has_audio = audio_start(path)
+		has_audio = aideo.audio_start(path)
 	}
 
-	term_enter_raw()
-	term_watch_winch()
-	key_start()
-	video_start(vp)
+	aideo.term_enter_raw()
+	aideo.term_watch_winch()
+	aideo.key_start()
+	aideo.video_start(vp)
 
 	start_wall := time.now()
 	playback_start := start_wall
@@ -172,9 +173,9 @@ main :: proc() {
 		}
 		playback_start = time.time_add(time.now(), time.Duration(-abs_t * 1000000000.0))
 		if has_audio {
-			audio_seek(i64(abs_t * 1000000000.0), i64(abs_t * 1000000000.0))
+			aideo.audio_seek(i64(abs_t * 1000000000.0), i64(abs_t * 1000000000.0))
 		}
-		video_request_seek(vp, i64(abs_t * 1000000000.0))
+		aideo.video_request_seek(vp, i64(abs_t * 1000000000.0))
 	}
 	pause_start := start_wall
 	paused := false
@@ -185,26 +186,26 @@ main :: proc() {
 		volume = vol_cli / 100.0
 	}
 	if has_audio {
-		audio_set_volume(f32(volume))
+		aideo.audio_set_volume(f32(volume))
 	}
-	pool: StripPool
-	strip_pool_init(&pool, max(cpu_count() / 2, 4))
-	defer strip_pool_stop(&pool)
-	rc: RenderCtx
+	pool: aideo.StripPool
+	aideo.strip_pool_init(&pool, max(aideo.cpu_count() / 2, 4))
+	defer aideo.strip_pool_stop(&pool)
+	rc: aideo.RenderCtx
 	rc.vp = vp
 	rc.pool = &pool
 	for i in 0..<len(rc.bufs) {
-		buffer_init(&rc.bufs[i], out_w * out_h / 2)
+		aideo.buffer_init(&rc.bufs[i], out_w * out_h / 2)
 	}
-	render_start(&rc)
-	pending: FrameMsg
+	aideo.render_start(&rc)
+	pending: aideo.FrameMsg
 	have_pending := false
 	force_frame := false
 	start_col := 1
 	start_row := 1
 	show_fps := false
 	full_disp := full_cli
-	fps_ui: FpsUI
+	fps_ui: aideo.FpsUI
 	full_t := time.now()
 	src_fps := vs.fps
 	fps_sample_t := time.now()
@@ -215,45 +216,45 @@ main :: proc() {
 	_last_frame_t := time.now()
 	for !quit {
 		_loop_t := time.now()
-		prof_add(PROF_FRAME_GAP, i64(time.since(_last_frame_t)))
+		aideo.prof_add(aideo.PROF_FRAME_GAP, i64(time.since(_last_frame_t)))
 		_last_frame_t = _loop_t
 		if sync.atomic_load(&vp.stop) != 0 {
 			quit = true
 			continue
 		}
 		for {
-			k, ok := key_pop()
+			k, ok := aideo.key_pop()
 			if !ok {
 				break
 			}
 			switch k {
-			case KEY_QUIT:
+			case aideo.KEY_QUIT:
 				quit = true
-			case KEY_PAUSE:
+			case aideo.KEY_PAUSE:
 				paused = !paused
-				audio_set_paused(paused)
+				aideo.audio_set_paused(paused)
 				if paused {
 					pause_start = time.now()
 					pause_clock = time.duration_seconds(time.since(playback_start))
 				} else {
 					playback_start = time.time_add(playback_start, time.since(pause_start))
-					video_request_seek(vp, i64(pause_clock * 1000000000.0))
+					aideo.video_request_seek(vp, i64(pause_clock * 1000000000.0))
 				}
-			case KEY_VOL_UP:
+			case aideo.KEY_VOL_UP:
 				volume = min(volume + 0.05, 1.0)
 				muted = false
-				audio_set_volume(f32(volume))
-			case KEY_VOL_DOWN:
+				aideo.audio_set_volume(f32(volume))
+			case aideo.KEY_VOL_DOWN:
 				volume = max(volume - 0.05, 0.0)
 				muted = false
-				audio_set_volume(f32(volume))
-			case KEY_SEEK_FWD, KEY_SEEK_BACK:
+				aideo.audio_set_volume(f32(volume))
+			case aideo.KEY_SEEK_FWD, aideo.KEY_SEEK_BACK:
 				cur := time.duration_seconds(time.since(playback_start))
 				if paused {
 					cur = pause_clock
 				}
 				target := cur + 5.0
-				if k == KEY_SEEK_BACK {
+				if k == aideo.KEY_SEEK_BACK {
 					target = cur - 5.0
 				}
 				loff := f64(sync.atomic_load(&vp.loop_offset)) / 1000000000.0
@@ -265,74 +266,74 @@ main :: proc() {
 					pause_start = time.now()
 				}
 				if has_audio {
-					audio_seek(i64(media_t * 1000000000.0), i64(abs_t * 1000000000.0))
+					aideo.audio_seek(i64(media_t * 1000000000.0), i64(abs_t * 1000000000.0))
 				}
 				if have_pending {
-					video_pool_put(vp, pending.buf)
+					aideo.video_pool_put(vp, pending.buf)
 					have_pending = false
 				}
-				video_request_seek(vp, i64(abs_t * 1000000000.0))
+				aideo.video_request_seek(vp, i64(abs_t * 1000000000.0))
 				force_frame = true
-			case KEY_MUTE:
+			case aideo.KEY_MUTE:
 				muted = !muted
 				if muted {
-					audio_set_volume(0.0)
+					aideo.audio_set_volume(0.0)
 				} else {
-					audio_set_volume(f32(volume))
+					aideo.audio_set_volume(f32(volume))
 				}
-			case KEY_COLOR_UP:
-				color_idx = min(color_idx + 1, len(PALETTE_LEVELS) - 1)
-				pal = get_palette(PALETTE_LEVELS[color_idx])
+			case aideo.KEY_COLOR_UP:
+				color_idx = min(color_idx + 1, len(aideo.PALETTE_LEVELS) - 1)
+				pal = aideo.get_palette(aideo.PALETTE_LEVELS[color_idx])
 				if paused {
-					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal)
+					aideo.rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal)
 				}
-			case KEY_COLOR_DOWN:
+			case aideo.KEY_COLOR_DOWN:
 				color_idx = max(color_idx - 1, 0)
-				pal = get_palette(PALETTE_LEVELS[color_idx])
+				pal = aideo.get_palette(aideo.PALETTE_LEVELS[color_idx])
 				if paused {
-					rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal)
+					aideo.rerender_freeze(&rc, out_w, out_h, start_col, start_row, pal)
 				}
-			case KEY_SIZE:
+			case aideo.KEY_SIZE:
 				full_disp = !full_disp
-				sync.atomic_store(&winch_flag, 1)
-			case KEY_FOCUS_IN:
+				sync.atomic_store(&aideo.winch_flag, 1)
+			case aideo.KEY_FOCUS_IN:
 				if in_tmux {
-					render_submit(&rc, RenderJob{clear = true})
+					aideo.render_submit(&rc, aideo.RenderJob{clear = true})
 					if paused {
-						rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
+						aideo.rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
 					} else {
 						force_frame = true
 					}
 				}
-			case KEY_FPS:
+			case aideo.KEY_FPS:
 				show_fps = !show_fps
 				fps_ui_t = time.Time{}
 				if !show_fps {
 					sync.mutex_lock(&rc.stdout_mu)
-					fps_ui_hide(&fps_ui)
+					aideo.fps_ui_hide(&fps_ui)
 					sync.mutex_unlock(&rc.stdout_mu)
 				}
 			}
 		}
 
-		if term_take_winch() {
-			cols, rows = term_size()
-			cell_w, cell_h = term_cell_pixels()
-			nw, nh := fit_disp(vs.src_w, vs.src_h, cols, rows, cell_w, cell_h, full_disp)
+		if aideo.term_take_winch() {
+			cols, rows = aideo.term_size()
+			cell_w, cell_h = aideo.term_cell_pixels()
+			nw, nh := aideo.fit_disp(vs.src_w, vs.src_h, cols, rows, cell_w, cell_h, full_disp)
 			if have_pending {
-				video_pool_put(vp, pending.buf)
+				aideo.video_pool_put(vp, pending.buf)
 				have_pending = false
 			}
 			if nw != out_w || nh != out_h {
 				out_w, out_h = nw, nh
 				start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 				start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
-				video_request_resize(vp, out_w, out_h)
+				aideo.video_request_resize(vp, out_w, out_h)
 				fps_ui.prev_len = 0
 			}
-			render_submit(&rc, RenderJob{clear = true})
+			aideo.render_submit(&rc, aideo.RenderJob{clear = true})
 			if paused {
-				rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
+				aideo.rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
 			} else {
 				force_frame = true
 			}
@@ -367,12 +368,12 @@ main :: proc() {
 				if !full_disp {
 					size_mark = "\u26F6"
 				}
-				label := fmt.tprintf("[ %d | %.3f/%sfps | %s | %s | %s ]", pal.nc, inst, fps_preset(src_fps), ptext, seg, size_mark)
+				label := fmt.tprintf("[ %d | %.3f/%sfps | %s | %s | %s ]", pal.nc, inst, aideo.fps_preset(src_fps), ptext, seg, size_mark)
 				sync.mutex_lock(&rc.stdout_mu)
 				if fps_row <= rows {
-					fps_ui_show(&fps_ui, fps_row, cols, label)
+					aideo.fps_ui_show(&fps_ui, fps_row, cols, label)
 				} else {
-					fps_ui_hide(&fps_ui)
+					aideo.fps_ui_hide(&fps_ui)
 				}
 				sync.mutex_unlock(&rc.stdout_mu)
 			}
@@ -384,7 +385,7 @@ main :: proc() {
 		}
 
 		if !have_pending {
-			m, ok := fq_try_pop(&vp.queue)
+			m, ok := aideo.fq_try_pop(&vp.queue)
 			if ok {
 				pending = m
 				have_pending = true
@@ -395,7 +396,7 @@ main :: proc() {
 			continue
 		}
 		if len(pending.buf) != out_w * out_h * 4 {
-			video_pool_put(vp, pending.buf)
+			aideo.video_pool_put(vp, pending.buf)
 			have_pending = false
 			continue
 		}
@@ -405,9 +406,9 @@ main :: proc() {
 		if !paused {
 			clock = time.duration_seconds(time.since(playback_start))
 			if has_audio {
-				drift := clock - audio_clock_sec()
+				drift := clock - aideo.audio_clock_sec()
 				if drift > 0.05 || drift < -0.05 {
-					playback_start = time.time_add(time.now(), time.Duration(-audio_clock_sec() * 1e9))
+					playback_start = time.time_add(time.now(), time.Duration(-aideo.audio_clock_sec() * 1e9))
 					clock = time.duration_seconds(time.since(playback_start))
 				}
 			}
@@ -417,7 +418,7 @@ main :: proc() {
 			lag_tol = 2.0 / src_fps
 		}
 		if pts > clock + 5.0 {
-			video_pool_put(vp, pending.buf)
+			aideo.video_pool_put(vp, pending.buf)
 			have_pending = false
 			continue
 		}
@@ -429,7 +430,7 @@ main :: proc() {
 			continue
 		}
 		if pts < clock - lag_tol {
-			video_pool_put(vp, pending.buf)
+			aideo.video_pool_put(vp, pending.buf)
 			have_pending = false
 			continue
 		}
@@ -441,7 +442,7 @@ main :: proc() {
 		if full_now {
 			full_t = time.now()
 		}
-		render_submit(&rc, RenderJob{
+		aideo.render_submit(&rc, aideo.RenderJob{
 			buf = pending.buf,
 			w = out_w,
 			h = out_h,
@@ -453,113 +454,25 @@ main :: proc() {
 		have_pending = false
 	}
 
-	render_stop(&rc)
+	aideo.render_stop(&rc)
 	if len(rc.freeze) > 0 {
-		video_pool_put(vp, rc.freeze)
+		aideo.video_pool_put(vp, rc.freeze)
 		rc.freeze = nil
 	}
-	video_stop(vp)
-	video_close(vp)
-	audio_shutdown()
+	aideo.video_stop(vp)
+	aideo.video_close(vp)
+	aideo.audio_shutdown()
 	for i in 0..<len(rc.bufs) {
 		if len(rc.bufs[i].buf) > 0 {
 			free(&rc.bufs[i].buf[0])
 		}
 	}
-	term_leave_raw()
+	aideo.term_leave_raw()
 	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1000h\x1b[?1002h\x1b[?1003h")
 	if in_tmux {
 		fmt.print("\x1b[?1004l")
 	}
 	if profile_cli {
-		prof_report()
+		aideo.prof_report()
 	}
-}
-
-// fps_preset formats a frame rate with conventional notation for the
-// common rates and falls back to three decimals for anything else.
-fps_preset :: proc(fps: f64) -> string {
-	values := [8]f64{23.976, 24, 25, 29.97, 30, 50, 59.94, 60}
-	names := [8]string{"23.976", "24", "25", "29.97", "30", "50", "59.94", "60"}
-	for i in 0..<8 {
-		if abs(fps - values[i]) < 0.005 {
-			return names[i]
-		}
-	}
-	return fmt.tprintf("%.3f", fps)
-}
-
-FpsUI :: struct {
-	prev_row: int,
-	prev_col: int,
-	prev_len: int,
-}
-
-// fps_ui_hide erases the label drawn by the previous fps_ui_show call.
-fps_ui_hide :: proc(ui: ^FpsUI) {
-	if ui.prev_len > 0 {
-		spaces := "                                                                                                "
-		n := min(ui.prev_len, len(spaces))
-		fmt.printf("\x1b[%d;%dH%s", ui.prev_row, ui.prev_col, spaces[:n])
-		ui.prev_len = 0
-	}
-}
-
-// fps_ui_show_at erases the previous label and draws bold text at a fixed
-// column.
-fps_ui_show_at :: proc(ui: ^FpsUI, row, col: int, text: string) {
-	fps_ui_hide(ui)
-	fmt.printf("\x1b[%d;%dH\x1b[1m%s\x1b[0m", row, col, text)
-	ui.prev_row = row
-	ui.prev_col = col
-	ui.prev_len = text_width(text)
-}
-
-// fps_ui_show erases the previous label and draws bold text centered on row.
-fps_ui_show :: proc(ui: ^FpsUI, row, cols: int, text: string) {
-	fps_ui_show_at(ui, row, max((cols - text_width(text)) / 2 + 1, 1), text)
-}
-
-// fit_disp returns the video size fitted to the display area. When full is
-// false the area is halved in both dimensions.
-fit_disp :: proc(src_w, src_h, cols, rows, cell_w, cell_h: int, full: bool) -> (int, int) {
-	w := cols * cell_w
-	h := rows * cell_h
-	if !full {
-		w /= 2
-		h /= 2
-	}
-	return fit_aspect(src_w, src_h, w, h)
-}
-
-// text_width returns the printable width of s counting codepoints.
-text_width :: proc(s: string) -> int {
-	n := 0
-	for i in 0..<len(s) {
-		if s[i] & 0xC0 != 0x80 {
-			n += 1
-		}
-	}
-	return n
-}
-
-fit_aspect :: proc(src_w, src_h, max_w, max_h: int) -> (int, int) {
-	if src_w <= 0 || src_h <= 0 {
-		return max_w, max_h
-	}
-	w := max_w
-	h := w * src_h / src_w
-	if h > max_h {
-		h = max_h
-		w = h * src_w / src_h
-	}
-	w = max(w, 4)
-	h = max(h, 4)
-	return w, h
-}
-
-strings_clone_to_cstring :: proc(s: string) -> cstring {
-	buf := make([]u8, len(s) + 1)
-	copy(buf, s)
-	return cstring(&buf[0])
 }
