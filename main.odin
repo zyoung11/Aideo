@@ -146,7 +146,7 @@ main :: proc() {
 	}
 	pal := get_palette(PALETTE_LEVELS[color_idx])
 
-	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l")
+	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1004h\x1b[?1000l\x1b[?1002l\x1b[?1003l")
 	fmt.print("\x1b[2J\x1b[3J\x1b[H")
 
 	has_audio := audio_init()
@@ -201,6 +201,7 @@ main :: proc() {
 	show_fps := false
 	full_disp := full_cli
 	fps_ui: FpsUI
+	full_t := time.now()
 	src_fps := vs.fps
 	fps_sample_t := time.now()
 	fps_sample_n := 0
@@ -290,6 +291,13 @@ main :: proc() {
 			case KEY_SIZE:
 				full_disp = !full_disp
 				sync.atomic_store(&winch_flag, 1)
+			case KEY_FOCUS_IN:
+				render_submit(&rc, RenderJob{clear = true})
+				if paused {
+					rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
+				} else {
+					force_frame = true
+				}
 			case KEY_FPS:
 				show_fps = !show_fps
 				fps_ui_t = time.Time{}
@@ -305,22 +313,22 @@ main :: proc() {
 			cols, rows = term_size()
 			cell_w, cell_h = term_cell_pixels()
 			nw, nh := fit_disp(vs.src_w, vs.src_h, cols, rows, cell_w, cell_h, full_disp)
+			if have_pending {
+				video_pool_put(vp, pending.buf)
+				have_pending = false
+			}
 			if nw != out_w || nh != out_h {
-				if have_pending {
-					video_pool_put(vp, pending.buf)
-					have_pending = false
-				}
 				out_w, out_h = nw, nh
 				start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 				start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
 				video_request_resize(vp, out_w, out_h)
-				render_submit(&rc, RenderJob{clear = true})
-				if paused {
-					rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
-				} else {
-					force_frame = true
-				}
 				fps_ui.prev_len = 0
+			}
+			render_submit(&rc, RenderJob{clear = true})
+			if paused {
+				rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
+			} else {
+				force_frame = true
 			}
 		}
 
@@ -423,6 +431,10 @@ main :: proc() {
 		force_frame = false
 		start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 		start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
+		full_now := time.duration_seconds(time.since(full_t)) >= 2.0
+		if full_now {
+			full_t = time.now()
+		}
 		render_submit(&rc, RenderJob{
 			buf = pending.buf,
 			w = out_w,
@@ -430,6 +442,7 @@ main :: proc() {
 			start_col = start_col,
 			start_row = start_row,
 			pal = pal,
+			reset_cache = full_now,
 		})
 		have_pending = false
 	}
@@ -448,7 +461,7 @@ main :: proc() {
 		}
 	}
 	term_leave_raw()
-	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1000h\x1b[?1002h\x1b[?1003h")
+	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1004l\x1b[?1000h\x1b[?1002h\x1b[?1003h")
 	if profile_cli {
 		prof_report()
 	}

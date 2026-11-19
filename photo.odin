@@ -406,7 +406,7 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 		os.exit(1)
 	}
 
-	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l")
+	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1004h\x1b[?1000l\x1b[?1002l\x1b[?1003l")
 	fmt.print("\x1b[2J\x1b[3J\x1b[H")
 
 	term_enter_raw()
@@ -440,6 +440,7 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 	need_render := true
 	show_fps := false
 	label_t := time.Time{}
+	full_t := time.now()
 	fps_ui: FpsUI
 	quit := false
 	for !quit {
@@ -462,6 +463,9 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 				color_idx = max(color_idx - 1, 0)
 				pal = get_palette(PALETTE_LEVELS[color_idx])
 				need_render = true
+			case KEY_FOCUS_IN:
+				render_submit(&rc, RenderJob{clear = true})
+				need_render = true
 			case KEY_FPS:
 				show_fps = !show_fps
 				label_t = time.Time{}
@@ -481,10 +485,10 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 				out_w, out_h = nw, nh
 				start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 				start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
-				render_submit(&rc, RenderJob{clear = true})
-				need_render = true
 				fps_ui.prev_len = 0
 			}
+			render_submit(&rc, RenderJob{clear = true})
+			need_render = true
 		}
 
 		if time.duration_seconds(time.since(label_t)) >= 0.25 {
@@ -505,6 +509,11 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 				}
 				sync.mutex_unlock(&rc.stdout_mu)
 			}
+		}
+
+		if time.duration_seconds(time.since(full_t)) >= 2.0 {
+			full_t = time.now()
+			need_render = true
 		}
 
 		if need_render {
@@ -552,5 +561,5 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 	photo_release(&ph)
 	free(vp)
 	term_leave_raw()
-	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1000h\x1b[?1002h\x1b[?1003h")
+	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1004l\x1b[?1000h\x1b[?1002h\x1b[?1003h")
 }

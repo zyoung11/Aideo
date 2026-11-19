@@ -55,6 +55,16 @@ odin build . -o:speed -out:aideo
 | `-h, --help` | 帮助页 |
 | `--version` | 版本 |
 
+## tmux
+
+tmux 3.4 起支持 sixel，需编译时启用 `--enable-sixel`。焦点重绘依赖焦点事件转发，在 `~/.tmux.conf` 启用：
+
+```
+set -g focus-events on
+```
+
+切换 pane、tab、session 回到播放画面时自动重绘。foot 直接运行无此要求。
+
 ## 按键
 
 | 键 | 功能 |

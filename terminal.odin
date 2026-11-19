@@ -149,6 +149,7 @@ KEY_MUTE :: 8
 KEY_SEEK_FWD :: 9
 KEY_SEEK_BACK :: 10
 KEY_SIZE :: 11
+KEY_FOCUS_IN :: 12
 
 key_queue: [32]u8
 key_head: i64
@@ -248,6 +249,8 @@ key_thread :: proc() {
 						key_push(KEY_SEEK_FWD)
 					case 'D':
 						key_push(KEY_SEEK_BACK)
+					case 'I':
+						key_push(KEY_FOCUS_IN)
 					}
 					i = j + 1
 					continue
