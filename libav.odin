@@ -79,7 +79,7 @@ AVStream :: struct {
 
 AVFormatContext :: struct {
 	av_class:        rawptr,
-	iformat:         rawptr,
+	iformat:         ^AVInputFormat,
 	oformat:         rawptr,
 	priv_data:       rawptr,
 	pb:              rawptr,
@@ -123,7 +123,10 @@ AVCodecContext :: struct{}
 SwsContext     :: struct{}
 SwrContext     :: struct{}
 AVCodec        :: struct{}
-AVInputFormat  :: struct{}
+AVInputFormat :: struct {
+	name:      cstring,
+	long_name: cstring,
+}
 
 foreign import libav {
 	"ffstatic/libavformat.a",
@@ -131,8 +134,8 @@ foreign import libav {
 	"ffstatic/libswscale.a",
 	"ffstatic/libswresample.a",
 	"ffstatic/libavutil.a",
-	"system:dav1d",
-	"system:z",
+	"ffstatic/libdav1d.a",
+	"ffstatic/libz.a",
 	"system:m",
 	"system:pthread",
 }

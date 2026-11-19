@@ -296,6 +296,46 @@ audio_seek :: proc(media_ns: i64, abs_ns: i64) {
 	sync.sema_post(&audio_state.space)
 }
 
+// audio_take_frame converts one decoded frame and feeds the ring,
+// blocking while the ring is full.
+audio_take_frame :: proc(s: ^AudioStream) {
+	nb := int(s.frame.nb_samples)
+	if nb <= 0 {
+		av_frame_unref(s.frame)
+		return
+	}
+	need := nb * AUDIO_CHANNELS
+	if len(s.samples) < need {
+		delete(s.samples)
+		s.samples = make([]i16, need)
+	}
+	buf := s.samples[:need]
+	out_planes: [1][^]u8
+	out_planes[0] = ([^]u8)(&buf[0])
+	in_count := swr_convert(s.swr, &out_planes[0], c.int(nb), &s.frame.extended_data[0], c.int(nb))
+	if in_count > 0 {
+		produced := int(in_count) * AUDIO_CHANNELS
+		sync.mutex_lock(&audio_state.mu)
+		written := ring_write(&audio_state.ring, buf[:produced])
+		sync.mutex_unlock(&audio_state.mu)
+		for written < produced {
+			if sync.atomic_load(&audio_state.stop) != 0 {
+				return
+			}
+			if !sync.sema_wait_with_timeout(&audio_state.space, 10 * time.Millisecond) {
+				continue
+			}
+			if sync.atomic_load(&audio_state.seek_flag) != 0 {
+				break
+			}
+			sync.mutex_lock(&audio_state.mu)
+			written += ring_write(&audio_state.ring, buf[written:produced])
+			sync.mutex_unlock(&audio_state.mu)
+		}
+	}
+	av_frame_unref(s.frame)
+}
+
 audio_decode_thread :: proc(s: ^AudioStream) {
 	defer sync.sema_post(&audio_state.exited)
 	for {
@@ -330,50 +370,22 @@ audio_decode_thread :: proc(s: ^AudioStream) {
 			av_packet_unref(s.pkt)
 			continue
 		}
-		if avcodec_send_packet(s.codec_ctx, s.pkt) < 0 {
-			av_packet_unref(s.pkt)
-			continue
+		for {
+			sres := avcodec_send_packet(s.codec_ctx, s.pkt)
+			if sres != AVERROR_EAGAIN {
+				break
+			}
+			if avcodec_receive_frame(s.codec_ctx, s.frame) < 0 {
+				break
+			}
+			audio_take_frame(s)
 		}
 		av_packet_unref(s.pkt)
 		for {
 			if avcodec_receive_frame(s.codec_ctx, s.frame) < 0 {
 				break
 			}
-			nb := int(s.frame.nb_samples)
-			if nb <= 0 {
-				av_frame_unref(s.frame)
-				continue
-			}
-			need := nb * AUDIO_CHANNELS
-			if len(s.samples) < need {
-				delete(s.samples)
-				s.samples = make([]i16, need)
-			}
-			buf := s.samples[:need]
-			out_planes: [1][^]u8
-			out_planes[0] = ([^]u8)(&buf[0])
-			in_count := swr_convert(s.swr, &out_planes[0], c.int(nb), &s.frame.extended_data[0], c.int(nb))
-			if in_count > 0 {
-				produced := int(in_count) * AUDIO_CHANNELS
-				sync.mutex_lock(&audio_state.mu)
-				written := ring_write(&audio_state.ring, buf[:produced])
-				sync.mutex_unlock(&audio_state.mu)
-				for written < produced {
-					if sync.atomic_load(&audio_state.stop) != 0 {
-						return
-					}
-					if !sync.sema_wait_with_timeout(&audio_state.space, 10 * time.Millisecond) {
-						continue
-					}
-					if sync.atomic_load(&audio_state.seek_flag) != 0 {
-						break
-					}
-					sync.mutex_lock(&audio_state.mu)
-					written += ring_write(&audio_state.ring, buf[written:produced])
-					sync.mutex_unlock(&audio_state.mu)
-				}
-			}
-			av_frame_unref(s.frame)
+			audio_take_frame(s)
 		}
 	}
 }

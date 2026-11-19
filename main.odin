@@ -113,6 +113,17 @@ main :: proc() {
 		fmt.eprintfln("error: cannot open video: %s", file_arg)
 		os.exit(1)
 	}
+	if is_image_codec_name(vs.codec_name) {
+		if stream_is_animated(vs, file_arg) {
+			vs.loop_forever = true
+		} else {
+			video_close_stream(vs)
+			photo_run(path, file_arg, full_cli)
+			return
+		}
+	} else if is_animation_codec_name(vs.codec_name) {
+		vs.loop_forever = true
+	}
 
 	cols, rows := term_size()
 	cell_w, cell_h := term_cell_pixels()

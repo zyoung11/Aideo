@@ -58,6 +58,8 @@ fq_try_pop :: proc(q: ^FrameQueue) -> (FrameMsg, bool) {
 VideoStream :: struct {
 	fmt_ctx:    ^AVFormatContext,
 	codec_ctx:  ^AVCodecContext,
+	codec_name: cstring,
+	path:       cstring,
 	sws:        ^SwsContext,
 	retired:    [dynamic]^SwsContext,
 	plan:       ^ScalePlan,
@@ -71,6 +73,7 @@ VideoStream :: struct {
 	src_w:      int,
 	src_h:      int,
 	src_format: int,
+	loop_forever: bool,
 }
 
 VideoPlayer :: struct {
@@ -161,6 +164,8 @@ video_open :: proc(path: cstring) -> ^VideoStream {
 	vs := new(VideoStream)
 	vs.fmt_ctx = fmt_ctx
 	vs.codec_ctx = codec_ctx
+	vs.codec_name = avcodec_get_name(par.codec_id)
+	vs.path = path
 	vs.pkt = av_packet_alloc()
 	vs.frame = av_frame_alloc()
 	vs.stream_idx = int(idx)
@@ -204,6 +209,50 @@ video_close_stream :: proc(vs: ^VideoStream) {
 	avcodec_free_context(&vs.codec_ctx)
 	avformat_close_input(&vs.fmt_ctx)
 	free(vs)
+}
+
+// video_reopen_stream reopens the container and decoder from the start
+// of the file. Image based demuxers cannot seek, so looping a still
+// animation needs a full reopen instead of av_seek_frame.
+video_reopen_stream :: proc(vs: ^VideoStream) -> bool {
+	avcodec_free_context(&vs.codec_ctx)
+	avformat_close_input(&vs.fmt_ctx)
+	fmt_ctx: ^AVFormatContext
+	if avformat_open_input(&fmt_ctx, vs.path, nil, nil) != 0 {
+		return false
+	}
+	if avformat_find_stream_info(fmt_ctx, nil) < 0 {
+		avformat_close_input(&fmt_ctx)
+		return false
+	}
+	idx := av_find_best_stream(fmt_ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
+	if idx < 0 {
+		avformat_close_input(&fmt_ctx)
+		return false
+	}
+	par := fmt_ctx.streams[idx].codecpar
+	codec := avcodec_find_decoder(par.codec_id)
+	if codec == nil {
+		avformat_close_input(&fmt_ctx)
+		return false
+	}
+	codec_ctx := avcodec_alloc_context3(codec)
+	if avcodec_parameters_to_context(codec_ctx, par) < 0 {
+		avcodec_free_context(&codec_ctx)
+		avformat_close_input(&fmt_ctx)
+		return false
+	}
+	threads_opt := strings_clone_to_cstring(fmt.tprintf("%d", max(cpu_count() / 2, 2)))
+	av_opt_set(codec_ctx, "threads", threads_opt, 0)
+	if avcodec_open2(codec_ctx, codec, nil) < 0 {
+		avcodec_free_context(&codec_ctx)
+		avformat_close_input(&fmt_ctx)
+		return false
+	}
+	vs.fmt_ctx = fmt_ctx
+	vs.codec_ctx = codec_ctx
+	vs.stream_idx = int(idx)
+	return true
 }
 
 // video_make_sws rebuilds the pixel scaler for a new output size. The
@@ -344,6 +393,31 @@ yuv_pop :: proc(q: ^YuvQueue, stop: ^i32) -> ^AVFrame {
 	}
 }
 
+// video_take_frame moves one decoded frame into the scaling queue with
+// its absolute presentation time.
+video_take_frame :: proc(vp: ^VideoPlayer, vs: ^VideoStream) {
+	sync.mutex_lock(&vp.sws_mu)
+	if vs.sws == nil {
+		vs.src_format = int(vs.frame.format)
+		video_make_sws(vs, vp.out_w, vp.out_h)
+	}
+	sync.mutex_unlock(&vp.sws_mu)
+	yf := yuv_get_frame(&vp.yuvq, &vp.stop)
+	if yf == nil {
+		return
+	}
+	av_frame_move_ref(yf, vs.frame)
+	pts_ns := sync.atomic_load(&vp.loop_offset)
+	if yf.pts != min(i64) {
+		pts_ns += i64(f64(yf.pts) * vs.time_base * 1000000000.0)
+	}
+	yf.pts = pts_ns
+	sync.atomic_store(&vp.last_pts, pts_ns)
+	if !yuv_push(&vp.yuvq, yf, &vp.stop) {
+		yuv_put_frame(&vp.yuvq, yf)
+	}
+}
+
 video_scale_thread :: proc(vp: ^VideoPlayer) {
 	defer sync.sema_post(&vp.exited)
 	vs := vp.vs
@@ -435,14 +509,38 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 		res := av_read_frame(vs.fmt_ctx, vs.pkt)
 		prof_add(PROF_DECODE_READ, i64(time.since(_t0)))
 		if res == AVERROR_EOF {
-			if vs.duration_sec <= 0 {
-				sync.atomic_store(&vp.stop, 1)
-				break
+			avcodec_send_packet(vs.codec_ctx, nil)
+			for {
+				if avcodec_receive_frame(vs.codec_ctx, vs.frame) < 0 {
+					break
+				}
+				video_take_frame(vp, vs)
 			}
-			av_seek_frame(vs.fmt_ctx, c.int(vs.stream_idx), 0, AVSEEK_FLAG_BACKWARD)
+			period := i64(vs.duration_sec * 1000000000.0)
+			if period <= 0 {
+				if !vs.loop_forever {
+					sync.atomic_store(&vp.stop, 1)
+					break
+				}
+				last := sync.atomic_load(&vp.last_pts)
+				period = last - sync.atomic_load(&vp.loop_offset)
+				if period <= 0 {
+					period = 1
+				}
+			}
+			if vs.loop_forever {
+				if !video_reopen_stream(vs) {
+					sync.atomic_store(&vp.stop, 1)
+					break
+				}
+			} else if av_seek_frame(vs.fmt_ctx, c.int(vs.stream_idx), 0, AVSEEK_FLAG_BACKWARD) < 0 {
+				if !video_reopen_stream(vs) {
+					sync.atomic_store(&vp.stop, 1)
+					break
+				}
+			}
 			avcodec_flush_buffers(vs.codec_ctx)
-			new_offset := sync.atomic_load(&vp.loop_offset) + i64(vs.duration_sec * 1000000000.0)
-			sync.atomic_store(&vp.loop_offset, new_offset)
+			sync.atomic_store(&vp.loop_offset, sync.atomic_load(&vp.loop_offset) + period)
 			continue
 		}
 		if res < 0 {
@@ -453,37 +551,24 @@ video_decode_thread :: proc(vp: ^VideoPlayer) {
 			continue
 		}
 		_t1 := time.now()
-		if avcodec_send_packet(vs.codec_ctx, vs.pkt) < 0 {
-			av_packet_unref(vs.pkt)
-			continue
+		for {
+			sres := avcodec_send_packet(vs.codec_ctx, vs.pkt)
+			if sres != AVERROR_EAGAIN {
+				break
+			}
+			if avcodec_receive_frame(vs.codec_ctx, vs.frame) < 0 {
+				break
+			}
+			prof_add(PROF_DECODE_RECV, i64(time.since(_t1)))
+			video_take_frame(vp, vs)
 		}
 		av_packet_unref(vs.pkt)
 		for {
 			if avcodec_receive_frame(vs.codec_ctx, vs.frame) < 0 {
 				break
 			}
-			sync.mutex_lock(&vp.sws_mu)
-			if vs.sws == nil {
-				vs.src_format = int(vs.frame.format)
-				video_make_sws(vs, vp.out_w, vp.out_h)
-			}
-			sync.mutex_unlock(&vp.sws_mu)
 			prof_add(PROF_DECODE_RECV, i64(time.since(_t1)))
-			yf := yuv_get_frame(&vp.yuvq, &vp.stop)
-			if yf == nil {
-				break
-			}
-			av_frame_move_ref(yf, vs.frame)
-			pts_ns := sync.atomic_load(&vp.loop_offset)
-			if yf.pts != min(i64) {
-				pts_ns += i64(f64(yf.pts) * vs.time_base * 1000000000.0)
-			}
-			yf.pts = pts_ns
-			sync.atomic_store(&vp.last_pts, pts_ns)
-			if !yuv_push(&vp.yuvq, yf, &vp.stop) {
-				yuv_put_frame(&vp.yuvq, yf)
-				break
-			}
+			video_take_frame(vp, vs)
 		}
 	}
 }

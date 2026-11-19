@@ -4,10 +4,23 @@
 
 | 库 | 用途 |
 | --- | --- |
-| `libavformat` `libavcodec` | 容器解封装与解码（帧级多线程） |
-| `libswscale` | YUV 到 RGBA 缩放 |
+| `libavformat` `libavcodec` `libavutil` | 解封装与解码（帧级多线程），静态编入 `ffstatic/` |
+| `libswscale` | 非 YUV420P 帧的格式转换兑底 |
 | `libswresample` | 音频重采样到 44100 Hz s16 |
-| `vendor:miniaudio` | 音频输出设备 |
+| `miniaudio` | 音频输出设备，绑定与静态库在仓库内 `miniaudio/` |
+| `avx2_quant.o` | 量化与缩放的 AVX2 与 AVX-512 内核，`cc` 编译 |
+| `dav1d` | AV1 解码，系统动态库 |
+| `zlib` | PNG 与 TIFF 解压，系统动态库 |
+
+## 支持格式
+
+| 类别 | 格式 |
+| --- | --- |
+| 容器 | MP4、MOV、MKV、WebM、AVI、MPEG-TS、OGG、WAV、FLAC、MP3、FLV |
+| 视频编码 | H.264、HEVC、VP8、VP9、AV1 |
+| 音频编码 | AAC、MP3、FLAC、Opus、Vorbis、AC3、E-AC3、PCM s16le、s24le、f32le |
+| 静态图 | PNG、JPEG、WebP、BMP、GIF、TIFF，含 EXIF 方向 |
+| 动图 | GIF、APNG、动画 WebP，无限循环播放 |
 
 ## 架构
 

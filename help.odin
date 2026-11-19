@@ -58,7 +58,7 @@ print_help :: proc() {
 	help_line(HELP_YELLOW, "    --version", 22, "show the version")
 	fmt.printfln("")
 	fmt.printfln("%sTARGET:%s", section, HELP_RESET)
-	help_line(HELP_YELLOW, "<file>", 22, "path to a video file")
+	help_line(HELP_YELLOW, "<file>", 22, "path to a video, animation or image file")
 	fmt.printfln("")
 	fmt.printfln("%sKEYS:%s", section, HELP_RESET)
 	help_line(HELP_GREEN, "q, Esc", 22, "quit")
