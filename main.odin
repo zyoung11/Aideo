@@ -105,6 +105,7 @@ main :: proc() {
 		}
 	}
 	path := strings_clone_to_cstring(file_arg)
+	in_tmux := os.get_env("TMUX", context.allocator) != ""
 
 	av_log_set_level(AV_LOG_QUIET)
 
@@ -146,7 +147,10 @@ main :: proc() {
 	}
 	pal := get_palette(PALETTE_LEVELS[color_idx])
 
-	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1004h\x1b[?1000l\x1b[?1002l\x1b[?1003l")
+	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l")
+	if in_tmux {
+		fmt.print("\x1b[?1004h")
+	}
 	fmt.print("\x1b[2J\x1b[3J\x1b[H")
 
 	has_audio := audio_init()
@@ -292,11 +296,13 @@ main :: proc() {
 				full_disp = !full_disp
 				sync.atomic_store(&winch_flag, 1)
 			case KEY_FOCUS_IN:
-				render_submit(&rc, RenderJob{clear = true})
-				if paused {
-					rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
-				} else {
-					force_frame = true
+				if in_tmux {
+					render_submit(&rc, RenderJob{clear = true})
+					if paused {
+						rerender_freeze_scaled(&rc, out_w, out_h, start_col, start_row, pal)
+					} else {
+						force_frame = true
+					}
 				}
 			case KEY_FPS:
 				show_fps = !show_fps
@@ -431,7 +437,7 @@ main :: proc() {
 		force_frame = false
 		start_col = max((cols - (out_w + cell_w - 1) / cell_w) / 2 + 1, 1)
 		start_row = max((rows - (out_h + cell_h - 1) / cell_h) / 2 + 1, 1)
-		full_now := time.duration_seconds(time.since(full_t)) >= 2.0
+		full_now := in_tmux && time.duration_seconds(time.since(full_t)) >= 2.0
 		if full_now {
 			full_t = time.now()
 		}
@@ -461,7 +467,10 @@ main :: proc() {
 		}
 	}
 	term_leave_raw()
-	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1004l\x1b[?1000h\x1b[?1002h\x1b[?1003h")
+	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1000h\x1b[?1002h\x1b[?1003h")
+	if in_tmux {
+		fmt.print("\x1b[?1004l")
+	}
 	if profile_cli {
 		prof_report()
 	}

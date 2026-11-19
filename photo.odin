@@ -405,8 +405,12 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 		fmt.eprintfln("error: cannot open image: %s", raw_path)
 		os.exit(1)
 	}
+	in_tmux := os.get_env("TMUX", context.allocator) != ""
 
-	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1004h\x1b[?1000l\x1b[?1002l\x1b[?1003l")
+	fmt.print("\x1b[?1049h\x1b[?25l\x1b[?1000l\x1b[?1002l\x1b[?1003l")
+	if in_tmux {
+		fmt.print("\x1b[?1004h")
+	}
 	fmt.print("\x1b[2J\x1b[3J\x1b[H")
 
 	term_enter_raw()
@@ -464,8 +468,10 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 				pal = get_palette(PALETTE_LEVELS[color_idx])
 				need_render = true
 			case KEY_FOCUS_IN:
-				render_submit(&rc, RenderJob{clear = true})
-				need_render = true
+				if in_tmux {
+					render_submit(&rc, RenderJob{clear = true})
+					need_render = true
+				}
 			case KEY_FPS:
 				show_fps = !show_fps
 				label_t = time.Time{}
@@ -511,7 +517,7 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 			}
 		}
 
-		if time.duration_seconds(time.since(full_t)) >= 2.0 {
+		if in_tmux && time.duration_seconds(time.since(full_t)) >= 2.0 {
 			full_t = time.now()
 			need_render = true
 		}
@@ -561,5 +567,8 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 	photo_release(&ph)
 	free(vp)
 	term_leave_raw()
-	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1004l\x1b[?1000h\x1b[?1002h\x1b[?1003h")
+	fmt.print("\x1b[?1049l\x1b[?25h\x1b[?1000h\x1b[?1002h\x1b[?1003h")
+	if in_tmux {
+		fmt.print("\x1b[?1004l")
+	}
 }
