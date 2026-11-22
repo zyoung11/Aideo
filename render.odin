@@ -78,6 +78,9 @@ render_submit :: proc(rc: ^RenderCtx, job: RenderJob) {
 		if rc.job.clear && !j.clear {
 			j.clear = true
 		}
+		if rc.job.reset_cache && !j.reset_cache {
+			j.reset_cache = true
+		}
 	} else {
 		sync.sema_post(&rc.used)
 	}
