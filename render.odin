@@ -21,6 +21,10 @@ RenderJob :: struct {
 	clear:     bool,
 }
 
+// stdout_mu serializes terminal writes across every engine so two
+// sixel streams never interleave and tear each other apart.
+stdout_mu: sync.Mutex
+
 // RenderCtx runs encoding and terminal writes on separate threads so the
 // next frame is encoded while the previous one is still being written.
 // Only jobs that have not been encoded may be dropped, so the diff cache
@@ -50,7 +54,6 @@ RenderCtx :: struct {
 	vp:        ^VideoPlayer,
 	pool:      ^StripPool,
 	fd:        int,
-	stdout_mu: sync.Mutex,
 	written:   i64,
 	freeze:    []u8,
 	freeze_n:  int,
@@ -274,9 +277,9 @@ render_write_thread :: proc(data: rawptr) {
 		if wclear {
 			varr: IoVecList
 			iovs_push(&varr, CLEAR_BYTES[:])
-			sync.mutex_lock(&rc.stdout_mu)
+			sync.mutex_lock(&stdout_mu)
 			writev_all(rc.fd, &varr)
-			sync.mutex_unlock(&rc.stdout_mu)
+			sync.mutex_unlock(&stdout_mu)
 		}
 		if len(wdata) == 0 {
 			if stopped {
@@ -287,9 +290,9 @@ render_write_thread :: proc(data: rawptr) {
 		_t4 := time.now()
 		varr: IoVecList
 		iovs_push(&varr, wdata)
-		sync.mutex_lock(&rc.stdout_mu)
+		sync.mutex_lock(&stdout_mu)
 		writev_all(rc.fd, &varr)
-		sync.mutex_unlock(&rc.stdout_mu)
+		sync.mutex_unlock(&stdout_mu)
 		prof_add(PROF_WRITE, i64(time.since(_t4)))
 		sync.atomic_add(&rc.written, 1)
 		sync.mutex_lock(&rc.mu)

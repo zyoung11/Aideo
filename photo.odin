@@ -476,9 +476,9 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 				show_fps = !show_fps
 				label_t = time.Time{}
 				if !show_fps {
-					sync.mutex_lock(&rc.stdout_mu)
+					sync.mutex_lock(&stdout_mu)
 					fps_ui_hide(&fps_ui)
-					sync.mutex_unlock(&rc.stdout_mu)
+					sync.mutex_unlock(&stdout_mu)
 				}
 			}
 		}
@@ -507,13 +507,13 @@ photo_run :: proc(path: cstring, raw_path: string, full: bool) {
 				}
 				label := fmt.tprintf("[ %d | %dx%d %s | %s ]",
 					pal.nc, ph.w, ph.h, ph.codec, size_mark)
-				sync.mutex_lock(&rc.stdout_mu)
+				sync.mutex_lock(&stdout_mu)
 				if label_row <= rows {
 					fps_ui_show(&fps_ui, label_row, cols, label)
 				} else {
 					fps_ui_hide(&fps_ui)
 				}
-				sync.mutex_unlock(&rc.stdout_mu)
+				sync.mutex_unlock(&stdout_mu)
 			}
 		}
 
