@@ -1,6 +1,7 @@
 package aideo
 
 import "core:c"
+import posix "core:sys/posix"
 import "core:sync"
 import "core:thread"
 import "core:time"
@@ -281,7 +282,7 @@ render_write_thread :: proc(data: rawptr) {
 			varr: IoVecList
 			iovs_push(&varr, CLEAR_BYTES[:])
 			sync.mutex_lock(&stdout_mu)
-			writev_all(rc.fd, &varr)
+			writev_all(rc, &varr)
 			sync.mutex_unlock(&stdout_mu)
 		}
 		if len(wdata) == 0 {
@@ -294,7 +295,7 @@ render_write_thread :: proc(data: rawptr) {
 		varr: IoVecList
 		iovs_push(&varr, wdata)
 		sync.mutex_lock(&stdout_mu)
-		writev_all(rc.fd, &varr)
+		writev_all(rc, &varr)
 		sync.mutex_unlock(&stdout_mu)
 		prof_add(PROF_WRITE, i64(time.since(_t4)))
 		sync.atomic_add(&rc.written, 1)
@@ -320,13 +321,35 @@ render_write_thread :: proc(data: rawptr) {
 	}
 }
 
-// writev_all writes the whole iovec list to fd, handling partial writes.
-writev_all :: proc(fd: int, l: ^IoVecList) {
+// writev_all writes the whole iovec list to fd in non blocking mode,
+// giving up when the engine stops or the terminal hangs up so a
+// stalled terminal never blocks the shutdown path.
+writev_all :: proc(rc: ^RenderCtx, l: ^IoVecList) {
+	flags := posix.fcntl(posix.FD(rc.fd), .GETFL, 0)
+	_ = posix.fcntl(posix.FD(rc.fd), .SETFL, flags | 0x800)
+	defer _ = posix.fcntl(posix.FD(rc.fd), .SETFL, flags)
 	base := 0
 	for base < l.n {
+		if sync.atomic_load(&rc.stopped) != 0 {
+			return
+		}
+		pfd := PollFd{fd = i32(rc.fd), events = POLLOUT}
+		n := poll(&pfd, 1, 200)
+		if n < 0 {
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		if pfd.revents & (POLLERR | POLLHUP | POLLNVAL) != 0 {
+			return
+		}
 		cnt := min(l.n - base, 1024)
-		nw := writev(c.int(fd), &l.iovs[base], c.int(cnt))
-		if nw <= 0 {
+		nw := writev(c.int(rc.fd), &l.iovs[base], c.int(cnt))
+		if nw < 0 {
+			continue
+		}
+		if nw == 0 {
 			return
 		}
 		remain := int(nw)

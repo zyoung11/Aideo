@@ -51,6 +51,10 @@ PollFd :: struct {
 }
 
 POLLIN :: 1
+POLLOUT :: 4
+POLLERR :: 8
+POLLHUP :: 16
+POLLNVAL :: 32
 
 // IoVec is one scatter gather buffer for writev.
 IoVec :: struct {

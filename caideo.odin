@@ -201,3 +201,16 @@ aideo_repaint :: proc "c" (e: ^Engine) {
 	}
 	e.need_full = true
 }
+
+// aideo_stdout_lock serializes one caller's terminal writes against
+// every render thread so text and sixel streams never interleave.
+@(export)
+aideo_stdout_lock :: proc "c" () {
+	sync.mutex_lock(&stdout_mu)
+}
+
+// aideo_stdout_unlock releases the terminal write lock.
+@(export)
+aideo_stdout_unlock :: proc "c" () {
+	sync.mutex_unlock(&stdout_mu)
+}
