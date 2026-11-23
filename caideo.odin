@@ -14,6 +14,8 @@ aideo_config :: struct {
 	colors:     c.int,
 	origin_row: c.int,
 	origin_col: c.int,
+	border_px:  c.int,
+	border_color: c.int,
 }
 
 // Engine is the C ABI handle for one rendering instance. It owns the
@@ -31,7 +33,33 @@ Engine :: struct {
 	out_h:    int,
 	row:      int,
 	col:      int,
+	border_px: int,
+	border_color: u32,
 	need_full: bool,
+}
+
+// frame_border paints a solid frame around one RGBA buffer in place
+// so the picture area is always visible against the terminal. The
+// color is 0xRRGGBB.
+frame_border :: proc(p: []u8, w, h, px: int, color: u32) {
+	if px <= 0 || w <= px * 2 || h <= px * 2 {
+		return
+	}
+	cr := u8(color >> 16)
+	cg := u8(color >> 8)
+	cb := u8(color)
+	for y in 0..<h {
+		edge_row := y < px || y >= h - px
+		for x in 0..<w {
+			if edge_row || x < px || x >= w - px {
+				o := (y * w + x) * 4
+				p[o] = cr
+				p[o + 1] = cg
+				p[o + 2] = cb
+				p[o + 3] = 0xff
+			}
+		}
+	}
 }
 
 // engine_default_colors clamps an unsupported color count to 64.
@@ -77,6 +105,11 @@ aideo_open :: proc "c" (cfg: ^aideo_config) -> ^Engine {
 	e.out_h = max(int(cfg.out_h), 4)
 	e.row = max(int(cfg.origin_row), 1)
 	e.col = max(int(cfg.origin_col), 1)
+	e.border_px = max(int(cfg.border_px), 0)
+	e.border_color = u32(cfg.border_color)
+	if e.border_color == 0 {
+		e.border_color = 0xd8d8d8
+	}
 	e.pal = get_palette(engine_default_colors(int(cfg.colors)))
 	e.vp = new(VideoPlayer)
 	e.rc.vp = e.vp
@@ -169,6 +202,9 @@ aideo_push_rgba :: proc "c" (e: ^Engine, rgba: [^]u8, stride: c.int) {
 			copy(buf[y * e.out_w * 4:], rgba[off:off + e.out_w * 4])
 		}
 	}
+	if e.border_px > 0 {
+		frame_border(buf[:e.out_w * e.out_h * 4], e.out_w, e.out_h, e.border_px, e.border_color)
+	}
 	engine_submit(e, buf)
 }
 
@@ -180,6 +216,9 @@ aideo_push_yuv :: proc "c" (e: ^Engine, y, u, v: [^]u8, stride_y, stride_c: c.in
 	}
 	buf := video_pool_get(e.vp, e.out_w * e.out_h * 4)
 	scale_frame(&e.spool, e.plan, y, u, v, int(stride_y), int(stride_c), &buf[0], e.out_w * 4)
+	if e.border_px > 0 {
+		frame_border(buf[:e.out_w * e.out_h * 4], e.out_w, e.out_h, e.border_px, e.border_color)
+	}
 	engine_submit(e, buf)
 }
 

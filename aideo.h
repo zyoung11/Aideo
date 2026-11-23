@@ -23,6 +23,8 @@ typedef struct aideo_config {
 	int colors;      /* palette size: 2, 8, 16, 32, 64, 128 or 256 */
 	int origin_row;  /* cursor row the picture starts at, from 1 */
 	int origin_col;  /* cursor column the picture starts at, from 1 */
+	int border_px;   /* solid frame width in pixels, 0 disables */
+	int border_color;/* frame color as 0xRRGGBB, 0 means default */
 } aideo_config;
 
 /* aideo_open creates an engine and starts its render threads. */
