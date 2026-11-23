@@ -56,6 +56,10 @@ void aideo_clear(aideo_engine *e);
  * clearing the screen first. */
 void aideo_repaint(aideo_engine *e);
 
+/* aideo_restore redraws the frozen frame at once with a full encode so
+ * a picture survives a terminal clear without waiting for a new frame. */
+void aideo_restore(aideo_engine *e);
+
 /* aideo_stdout_lock serializes one caller's terminal writes against
  * every render thread so text and sixel streams never interleave. */
 void aideo_stdout_lock(void);

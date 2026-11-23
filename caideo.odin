@@ -21,6 +21,7 @@ aideo_config :: struct {
 // Engine is the C ABI handle for one rendering instance. It owns the
 // render pipeline, the strip workers and the yuv scaler.
 Engine :: struct {
+	mu:       sync.Mutex,
 	rc:       RenderCtx,
 	pool:     StripPool,
 	spool:    ScalePool,
@@ -35,7 +36,7 @@ Engine :: struct {
 	col:      int,
 	border_px: int,
 	border_color: u32,
-	need_full: bool,
+	need_full: i32,
 }
 
 // frame_border paints a solid frame around one RGBA buffer in place
@@ -48,18 +49,31 @@ frame_border :: proc(p: []u8, w, h, px: int, color: u32) {
 	cr := u8(color >> 16)
 	cg := u8(color >> 8)
 	cb := u8(color)
-	for y in 0..<h {
-		edge_row := y < px || y >= h - px
+	for y in 0..<px {
 		for x in 0..<w {
-			if edge_row || x < px || x >= w - px {
-				o := (y * w + x) * 4
-				p[o] = cr
-				p[o + 1] = cg
-				p[o + 2] = cb
-				p[o + 3] = 0xff
-			}
+			fill_px(p, w, y, x, cr, cg, cb)
+		}
+		for x in 0..<w {
+			fill_px(p, w, h - 1 - y, x, cr, cg, cb)
 		}
 	}
+	for y in px..<(h - px) {
+		for x in 0..<px {
+			fill_px(p, w, y, x, cr, cg, cb)
+		}
+		for x in (w - px)..<w {
+			fill_px(p, w, y, x, cr, cg, cb)
+		}
+	}
+}
+
+// fill_px writes one border pixel into an RGBA buffer.
+fill_px :: proc(p: []u8, w, y, x: int, cr, cg, cb: u8) {
+	o := (y * w + x) * 4
+	p[o] = cr
+	p[o + 1] = cg
+	p[o + 2] = cb
+	p[o + 3] = 0xff
 }
 
 // engine_default_colors clamps an unsupported color count to 64.
@@ -80,6 +94,10 @@ engine_build_plan :: proc(e: ^Engine) {
 }
 
 engine_submit :: proc(e: ^Engine, buf: []u8) {
+	reset := sync.atomic_exchange(&e.need_full, 0) != 0
+	if sync.atomic_exchange(&e.rc.lost, 0) != 0 {
+		reset = true
+	}
 	render_submit(&e.rc, RenderJob{
 		buf = buf,
 		w = e.out_w,
@@ -87,9 +105,8 @@ engine_submit :: proc(e: ^Engine, buf: []u8) {
 		start_col = e.col,
 		start_row = e.row,
 		pal = e.pal,
-		reset_cache = e.need_full,
+		reset_cache = reset,
 	})
-	e.need_full = false
 }
 
 @(export)
@@ -134,7 +151,9 @@ aideo_close :: proc "c" (e: ^Engine) {
 	if e == nil {
 		return
 	}
+	sync.mutex_lock(&e.mu)
 	render_stop(&e.rc)
+	sync.mutex_unlock(&e.mu)
 	if len(e.rc.freeze) > 0 {
 		video_pool_put(e.vp, e.rc.freeze)
 		e.rc.freeze = nil
@@ -157,6 +176,11 @@ aideo_close :: proc "c" (e: ^Engine) {
 			free(&e.rc.bufs[i].buf[0])
 		}
 	}
+	sync.mutex_lock(&stdout_mu)
+	varr: IoVecList
+	iovs_push(&varr, CLEAR_BYTES[:])
+	_ = writev(c.int(e.rc.fd), &varr.iovs[0], 1)
+	sync.mutex_unlock(&stdout_mu)
 	free(e.vp)
 	free(e)
 }
@@ -167,13 +191,18 @@ aideo_resize :: proc "c" (e: ^Engine, out_w, out_h, origin_row, origin_col: c.in
 	if e == nil {
 		return
 	}
+	sync.mutex_lock(&e.mu)
+	defer sync.mutex_unlock(&e.mu)
 	e.out_w = max(int(out_w), 4)
 	e.out_h = max(int(out_h), 4)
 	e.row = max(int(origin_row), 1)
 	e.col = max(int(origin_col), 1)
 	engine_build_plan(e)
 	render_submit(&e.rc, RenderJob{clear = true})
-	e.need_full = true
+	sync.atomic_store(&e.need_full, 1)
+	if len(e.rc.freeze) > 0 {
+		rerender_freeze_scaled(&e.rc, e.out_w, e.out_h, e.col, e.row, e.pal)
+	}
 }
 
 @(export)
@@ -182,8 +211,10 @@ aideo_set_colors :: proc "c" (e: ^Engine, colors: c.int) {
 	if e == nil {
 		return
 	}
+	sync.mutex_lock(&e.mu)
+	defer sync.mutex_unlock(&e.mu)
 	e.pal = get_palette(engine_default_colors(int(colors)))
-	e.need_full = true
+	sync.atomic_store(&e.need_full, 1)
 }
 
 @(export)
@@ -192,6 +223,8 @@ aideo_push_rgba :: proc "c" (e: ^Engine, rgba: [^]u8, stride: c.int) {
 	if e == nil {
 		return
 	}
+	sync.mutex_lock(&e.mu)
+	defer sync.mutex_unlock(&e.mu)
 	buf := video_pool_get(e.vp, e.out_w * e.out_h * 4)
 	st := int(stride)
 	if st == e.out_w * 4 {
@@ -214,6 +247,8 @@ aideo_push_yuv :: proc "c" (e: ^Engine, y, u, v: [^]u8, stride_y, stride_c: c.in
 	if e == nil {
 		return
 	}
+	sync.mutex_lock(&e.mu)
+	defer sync.mutex_unlock(&e.mu)
 	buf := video_pool_get(e.vp, e.out_w * e.out_h * 4)
 	scale_frame(&e.spool, e.plan, y, u, v, int(stride_y), int(stride_c), &buf[0], e.out_w * 4)
 	if e.border_px > 0 {
@@ -228,8 +263,17 @@ aideo_clear :: proc "c" (e: ^Engine) {
 	if e == nil {
 		return
 	}
+	sync.mutex_lock(&e.mu)
+	defer sync.mutex_unlock(&e.mu)
+	sync.mutex_lock(&e.rc.mu)
+	if len(e.rc.freeze) > 0 {
+		video_pool_put(e.vp, e.rc.freeze)
+		e.rc.freeze = nil
+		e.rc.freeze_n = 0
+	}
+	sync.mutex_unlock(&e.rc.mu)
 	render_submit(&e.rc, RenderJob{clear = true})
-	e.need_full = true
+	sync.atomic_store(&e.need_full, 1)
 }
 
 @(export)
@@ -238,7 +282,24 @@ aideo_repaint :: proc "c" (e: ^Engine) {
 	if e == nil {
 		return
 	}
-	e.need_full = true
+	sync.mutex_lock(&e.mu)
+	defer sync.mutex_unlock(&e.mu)
+	sync.atomic_store(&e.need_full, 1)
+}
+
+// aideo_restore redraws the frozen frame at once with a full encode
+// so a picture survives a terminal clear without waiting for a new
+// frame.
+@(export)
+aideo_restore :: proc "c" (e: ^Engine) {
+	context = runtime.default_context()
+	if e == nil {
+		return
+	}
+	sync.mutex_lock(&e.mu)
+	defer sync.mutex_unlock(&e.mu)
+	sync.atomic_store(&e.need_full, 1)
+	rerender_freeze(&e.rc, e.out_w, e.out_h, e.col, e.row, e.pal)
 }
 
 // aideo_stdout_lock serializes one caller's terminal writes against
