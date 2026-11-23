@@ -193,8 +193,13 @@ stdin_ready :: proc(timeout_ms: int) -> bool {
 }
 
 // key_thread reads stdin and translates key bytes into key events. A
-// lone ESC is confirmed by waiting 20 ms for continuation bytes so arrow
-// key sequences split across reads are never mistaken for quit.
+// lone ESC is dropped: the quit key is q or Q only, so an escape
+// sequence split across reads or delayed by a busy terminal mux is
+// never mistaken for quit. ESC followed by a non CSI byte is an Alt
+// chord and is ignored as well. EAGAIN is retried: the render thread
+// flips stdout into non blocking mode while writing a frame, and on a
+// terminal stdin shares that open file description, so reads fail
+// with EAGAIN while a frame is being written.
 key_thread :: proc() {
 	buf: [256]u8
 	n := 0
@@ -203,6 +208,10 @@ key_thread :: proc() {
 			n = 0
 		}
 		nread, err := os.read(os.stdin, buf[n:])
+		if pe, ok := err.(os.Platform_Error); ok && pe == .EAGAIN {
+			_ = stdin_ready(5)
+			continue
+		}
 		if err != nil || nread <= 0 {
 			key_push(KEY_QUIT)
 			return
@@ -214,11 +223,13 @@ key_thread :: proc() {
 			if b == 27 {
 				if i + 1 >= n {
 					if !stdin_ready(20) {
-						key_push(KEY_QUIT)
 						i += 1
 						break
 					}
 					k, rerr := os.read(os.stdin, buf[n:])
+					if pe, ok := rerr.(os.Platform_Error); ok && pe == .EAGAIN {
+						continue
+					}
 					if rerr != nil || k <= 0 {
 						key_push(KEY_QUIT)
 						return
@@ -237,6 +248,9 @@ key_thread :: proc() {
 							break
 						}
 						k, rerr := os.read(os.stdin, buf[n:])
+						if pe, ok := rerr.(os.Platform_Error); ok && pe == .EAGAIN {
+							continue
+						}
 						if rerr != nil || k <= 0 {
 							key_push(KEY_QUIT)
 							return
@@ -259,7 +273,6 @@ key_thread :: proc() {
 					i = j + 1
 					continue
 				}
-				key_push(KEY_QUIT)
 				i += 1
 				continue
 			}

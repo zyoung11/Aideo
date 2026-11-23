@@ -309,9 +309,9 @@ main :: proc() {
 				show_fps = !show_fps
 				fps_ui_t = time.Time{}
 				if !show_fps {
-					sync.mutex_lock(&rc.stdout_mu)
+					aideo.aideo_stdout_lock()
 					aideo.fps_ui_hide(&fps_ui)
-					sync.mutex_unlock(&rc.stdout_mu)
+					aideo.aideo_stdout_unlock()
 				}
 			}
 		}
@@ -369,13 +369,13 @@ main :: proc() {
 					size_mark = "\u26F6"
 				}
 				label := fmt.tprintf("[ %d | %.3f/%sfps | %s | %s | %s ]", pal.nc, inst, aideo.fps_preset(src_fps), ptext, seg, size_mark)
-				sync.mutex_lock(&rc.stdout_mu)
+				aideo.aideo_stdout_lock()
 				if fps_row <= rows {
 					aideo.fps_ui_show(&fps_ui, fps_row, cols, label)
 				} else {
 					aideo.fps_ui_hide(&fps_ui)
 				}
-				sync.mutex_unlock(&rc.stdout_mu)
+				aideo.aideo_stdout_unlock()
 			}
 		}
 

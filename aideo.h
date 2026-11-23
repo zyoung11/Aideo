@@ -33,8 +33,10 @@ aideo_engine *aideo_open(const aideo_config *cfg);
 /* aideo_close stops the threads and releases every resource. */
 void aideo_close(aideo_engine *e);
 
-/* aideo_resize changes the drawn size and clears the screen. The next
- * frame is drawn in full. */
+/* aideo_resize changes the drawn size and origin. It does not touch
+ * the screen: the caller must clear the old picture area itself, so a
+ * relayout of several engines wipes the screen once instead of once
+ * per engine. The next frame is drawn in full at the new geometry. */
 void aideo_resize(aideo_engine *e, int out_w, int out_h, int origin_row, int origin_col);
 
 /* aideo_set_colors switches the palette. The next frame is drawn in full. */
