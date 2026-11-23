@@ -187,8 +187,9 @@ aideo_close :: proc "c" (e: ^Engine) {
 
 // aideo_resize changes the drawn size and origin without touching the
 // screen, so a caller that relayouts several engines wipes the old
-// picture area once instead of once per engine. The next frame is
-// drawn in full at the new geometry.
+// picture area once instead of once per engine. Frames still in the
+// render pipeline are dropped so nothing lands at the stale position.
+// The next frame is drawn in full at the new geometry.
 @(export)
 aideo_resize :: proc "c" (e: ^Engine, out_w, out_h, origin_row, origin_col: c.int) {
 	context = runtime.default_context()
@@ -197,6 +198,7 @@ aideo_resize :: proc "c" (e: ^Engine, out_w, out_h, origin_row, origin_col: c.in
 	}
 	sync.mutex_lock(&e.mu)
 	defer sync.mutex_unlock(&e.mu)
+	sync.atomic_add(&e.rc.generation, 1)
 	e.out_w = max(int(out_w), 4)
 	e.out_h = max(int(out_h), 4)
 	e.row = max(int(origin_row), 1)

@@ -11,6 +11,9 @@ TERMINATE_BYTES := [2]u8{0x1b, '\\'}
 
 // RenderJob is an immutable snapshot of everything the render pipeline
 // needs to encode and write one frame. A clear job only wipes the screen.
+// The generation stamps the layout the job was submitted under so jobs
+// still in flight when a resize happens are dropped instead of being
+// drawn at their stale position.
 RenderJob :: struct {
 	buf:       []u8,
 	w:         int,
@@ -21,6 +24,7 @@ RenderJob :: struct {
 	reset_cache: bool,
 	keep_freeze: bool,
 	clear:     bool,
+	generation: u32,
 }
 
 // stdout_mu serializes terminal writes across every engine so two
@@ -36,6 +40,7 @@ RenderCtx :: struct {
 	job:       RenderJob,
 	has:       bool,
 	used:      sync.Sema,
+	generation: u32,
 
 	wmu:       sync.Mutex,
 	wjob:      RenderJob,
@@ -75,6 +80,7 @@ RenderCtx :: struct {
 render_submit :: proc(rc: ^RenderCtx, job: RenderJob) {
 	j := job
 	sync.mutex_lock(&rc.mu)
+	j.generation = sync.atomic_load(&rc.generation)
 	if rc.has {
 		if len(rc.job.buf) > 0 {
 			video_pool_put(rc.vp, rc.job.buf)
@@ -229,6 +235,12 @@ render_encode_thread :: proc(data: rawptr) {
 			}
 			return
 		}
+		if job.generation != sync.atomic_load(&rc.generation) {
+			if len(job.buf) > 0 {
+				video_pool_put(rc.vp, job.buf)
+			}
+			continue
+		}
 		if job.clear && rc.cache != nil {
 			strip_cache_free(rc.cache)
 			rc.cache = nil
@@ -285,6 +297,18 @@ render_write_thread :: proc(data: rawptr) {
 		sync.mutex_unlock(&rc.wmu)
 		sync.sema_post(&rc.wempty)
 		stopped := sync.atomic_load(&rc.stopped) != 0
+		if job.generation != sync.atomic_load(&rc.generation) {
+			if len(job.buf) > 0 {
+				video_pool_put(rc.vp, job.buf)
+			}
+			if wbuf >= 0 {
+				render_buf_put(rc, wbuf)
+			}
+			if stopped {
+				return
+			}
+			continue
+		}
 		if sync.atomic_load(&rc.stalled) != 0 {
 			pfd := PollFd{fd = i32(rc.fd), events = POLLOUT}
 			ready := poll(&pfd, 1, 0) > 0 && pfd.revents & (POLLERR | POLLHUP | POLLNVAL) == 0
