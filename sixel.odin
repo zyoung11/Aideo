@@ -1,12 +1,12 @@
 package aideo
 
 import "core:c"
-import "core:sync"
-import "core:time"
-import "core:thread"
 import x86 "core:simd/x86"
+import "core:sync"
+import "core:thread"
+import "core:time"
 
-foreign import avx2lib { "avx2_quant.o" }
+foreign import avx2lib "avx2_quant.o"
 
 foreign avx2lib {
 	quant_row_simd :: proc(dst: [^]u8, rgba: [^]u8, w: c.int, dpos_r: [^]u8, dneg_r: [^]u8, dpos_g: [^]u8, dneg_g: [^]u8, dpos_b: [^]u8, dneg_b: [^]u8, r_shr: c.int, g_shr: c.int, b_shr: c.int, r_shift: c.int, g_shift: c.int) ---
@@ -23,24 +23,33 @@ BAYER_4X4 := [16]i8{0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5}
 SIXEL_ST_BYTES := [2]u8{0x1b, 0x5c}
 
 PALETTE_LEVELS := [7]int{2, 8, 16, 32, 64, 128, 256}
-PALETTE_BITS  := [7][3]int{{0, 0, 0}, {1, 1, 1}, {2, 1, 1}, {2, 2, 1}, {2, 2, 2}, {3, 2, 2}, {3, 3, 2}}
+PALETTE_BITS := [7][3]int {
+	{0, 0, 0},
+	{1, 1, 1},
+	{2, 1, 1},
+	{2, 2, 1},
+	{2, 2, 2},
+	{3, 2, 2},
+	{3, 3, 2},
+}
 
 SixelPalette :: struct {
-	nc:      int,
-	is_gray: bool,
+	nc:                     int,
+	is_gray:                bool,
 	r_bits, g_bits, b_bits: int,
-	r_shift, g_shift:      int,
-	colors:  [256]u32,
-	lut_r:   [16][256]u8,
-	lut_g:   [16][256]u8,
-	lut_b:   [16][256]u8,
-	dither:  [16]i8,
+	r_shift, g_shift:       int,
+	colors:                 [256]u32,
+	lut_r:                  [16][256]u8,
+	lut_g:                  [16][256]u8,
+	lut_b:                  [16][256]u8,
+	dither:                 [16]i8,
 }
 
 StripCache :: struct {
 	hashes:  []u64,
 	rle:     [][dynamic]u8,
 	pix:     [][dynamic]u8,
+	pix_a:   [][dynamic]u8,
 	changed: []u8,
 }
 
@@ -49,6 +58,7 @@ strip_cache_init :: proc(cache: ^StripCache, total_strips: int) {
 	cache.hashes = make([]u64, total_strips)
 	cache.rle = make([][dynamic]u8, total_strips)
 	cache.pix = make([][dynamic]u8, total_strips)
+	cache.pix_a = make([][dynamic]u8, total_strips)
 	cache.changed = make([]u8, total_strips)
 }
 
@@ -58,14 +68,18 @@ strip_cache_free :: proc(cache: ^StripCache) {
 		return
 	}
 	delete(cache.hashes)
-	for i in 0..<len(cache.rle) {
+	for i in 0 ..< len(cache.rle) {
 		delete(cache.rle[i])
 	}
 	delete(cache.rle)
-	for i in 0..<len(cache.pix) {
+	for i in 0 ..< len(cache.pix) {
 		delete(cache.pix[i])
 	}
 	delete(cache.pix)
+	for i in 0 ..< len(cache.pix_a) {
+		delete(cache.pix_a[i])
+	}
+	delete(cache.pix_a)
 	delete(cache.changed)
 	free(cache)
 }
@@ -86,7 +100,7 @@ retro_levels :: proc(dst: []u8, levels: int) {
 	case 4:
 		dst[0], dst[1], dst[2], dst[3] = 0, 105, 210, 255
 	case:
-		for i in 0..<levels {
+		for i in 0 ..< levels {
 			dst[i] = u8(i * 255 / (levels - 1))
 		}
 	}
@@ -97,7 +111,7 @@ retro_blue_levels :: proc(dst: []u8, levels: int) {
 	case 2:
 		dst[0], dst[1] = 10, 150
 	case:
-		for i in 0..<levels {
+		for i in 0 ..< levels {
 			dst[i] = u8(i * 255 / (levels - 1))
 		}
 	}
@@ -107,8 +121,8 @@ build_luts :: proc(p: ^SixelPalette) {
 	dR := make_dither(1 << u32(p.r_bits))
 	dG := make_dither(1 << u32(p.g_bits))
 	dB := make_dither(1 << u32(p.b_bits))
-	for b in 0..<16 {
-		for v in 0..<256 {
+	for b in 0 ..< 16 {
+		for v in 0 ..< 256 {
 			s := v + int(dR[b])
 			s = clamp(s, 0, 255)
 			p.lut_r[b][v] = u8(s >> u32(8 - p.r_bits)) << u32(p.r_shift)
@@ -132,9 +146,9 @@ build_uniform_palette :: proc(p: ^SixelPalette, r_bits, g_bits, b_bits: int) {
 	p.r_bits, p.g_bits, p.b_bits = r_bits, g_bits, b_bits
 	p.g_shift = b_bits
 	p.r_shift = g_bits + b_bits
-	for ri in 0..<r_levels {
-		for gi in 0..<g_levels {
-			for bi in 0..<b_levels {
+	for ri in 0 ..< r_levels {
+		for gi in 0 ..< g_levels {
+			for bi in 0 ..< b_levels {
 				idx := ri << u32(p.r_shift) | gi << u32(p.g_shift) | bi
 				r := u8(ri * 255 / (r_levels - 1))
 				g := u8(gi * 255 / (g_levels - 1))
@@ -160,9 +174,9 @@ build_retro_palette :: proc(p: ^SixelPalette, r_bits, g_bits, b_bits: int) {
 	retro_levels(r_lv[:], r_levels)
 	retro_levels(g_lv[:], g_levels)
 	retro_blue_levels(b_lv[:], b_levels)
-	for ri in 0..<r_levels {
-		for gi in 0..<g_levels {
-			for bi in 0..<b_levels {
+	for ri in 0 ..< r_levels {
+		for gi in 0 ..< g_levels {
+			for bi in 0 ..< b_levels {
 				idx := ri << u32(p.r_shift) | gi << u32(p.g_shift) | bi
 				p.colors[idx] = u32(r_lv[ri]) << 16 | u32(g_lv[gi]) << 8 | u32(b_lv[bi])
 			}
@@ -174,12 +188,12 @@ build_retro_palette :: proc(p: ^SixelPalette, r_bits, g_bits, b_bits: int) {
 build_gray_palette :: proc(p: ^SixelPalette, levels: int) {
 	p.nc = levels
 	p.is_gray = true
-	for i in 0..<levels {
+	for i in 0 ..< levels {
 		v := u8(i * 255 / (levels - 1))
 		p.colors[i] = u32(v) << 16 | u32(v) << 8 | u32(v)
 	}
 	step := 256 / levels
-	for b in 0..<16 {
+	for b in 0 ..< 16 {
 		p.dither[b] = i8((int(BAYER_4X4[b]) - 8) * step / 16)
 	}
 }
@@ -226,37 +240,40 @@ strip_pixel_hash_rgba :: proc(data: []u8, width, y_start, y_end: int) -> u64 {
 	P4 :: u32(0x27D4EB2F)
 	a1: [8]u32
 	a2: [8]u32
-	for k in 0..<8 {
+	for k in 0 ..< 8 {
 		a1[k] = 0x9E3779B9
 		a2[k] = 0x85EBCA6B
 	}
 	base := y_start * width * 4
 	nwords := (y_end - y_start) * width
-	for i in 0..<nwords {
+	for i in 0 ..< nwords {
 		q := base + i * 4
-		v := u32(data[q]) | u32(data[q+1]) << 8 | u32(data[q+2]) << 16 | u32(data[q+3]) << 24
+		v := u32(data[q]) | u32(data[q + 1]) << 8 | u32(data[q + 2]) << 16 | u32(data[q + 3]) << 24
 		k := i % 8
 		a1[k] = a1[k] * P1 + v * P2
 		a2[k] = a2[k] * P3 + v * P4
 	}
 	s1: u32
 	s2: u32
-	for k in 0..<8 {
+	for k in 0 ..< 8 {
 		s1 += a1[k] * u32(2 * k + 1)
 		s2 += a2[k] * u32(2 * k + 1)
 	}
 	return u64(s1) << 32 | u64(s2)
 }
 
-@(enable_target_feature="sse2,ssse3") shuf_mask_r :: proc "contextless" () -> x86.__m128i {
+@(enable_target_feature = "sse2,ssse3")
+shuf_mask_r :: proc "contextless" () -> x86.__m128i {
 	return x86._mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 12, 8, 4, 0)
 }
 
-@(enable_target_feature="sse2,ssse3") shuf_mask_g :: proc "contextless" () -> x86.__m128i {
+@(enable_target_feature = "sse2,ssse3")
+shuf_mask_g :: proc "contextless" () -> x86.__m128i {
 	return x86._mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 13, 9, 5, 1)
 }
 
-@(enable_target_feature="sse2,ssse3") shuf_mask_b :: proc "contextless" () -> x86.__m128i {
+@(enable_target_feature = "sse2,ssse3")
+shuf_mask_b :: proc "contextless" () -> x86.__m128i {
 	return x86._mm_set_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 14, 10, 6, 2)
 }
 
@@ -271,7 +288,7 @@ quantize_row_uniform_simd :: proc(dst: []u8, rgba: []u8, w, yb4: int, p: ^SixelP
 	dneg_g: [32]u8
 	dpos_b: [32]u8
 	dneg_b: [32]u8
-	for i in 0..<4 {
+	for i in 0 ..< 4 {
 		col := yb4 | i
 		dr := int(dR[col])
 		dg := int(dG[col])
@@ -298,17 +315,38 @@ quantize_row_uniform_simd :: proc(dst: []u8, rgba: []u8, w, yb4: int, p: ^SixelP
 			dneg_b[16 + i] = u8(-db)
 		}
 	}
-	quant_row_simd(&dst[0], &rgba[0], c.int(w), &dpos_r[0], &dneg_r[0], &dpos_g[0], &dneg_g[0], &dpos_b[0], &dneg_b[0],
-		c.int(8 - p.r_bits), c.int(8 - p.g_bits), c.int(8 - p.b_bits),
-		c.int(p.r_shift), c.int(p.g_shift))
+	quant_row_simd(
+		&dst[0],
+		&rgba[0],
+		c.int(w),
+		&dpos_r[0],
+		&dneg_r[0],
+		&dpos_g[0],
+		&dneg_g[0],
+		&dpos_b[0],
+		&dneg_b[0],
+		c.int(8 - p.r_bits),
+		c.int(8 - p.g_bits),
+		c.int(8 - p.b_bits),
+		c.int(p.r_shift),
+		c.int(p.g_shift),
+	)
 }
 
 @(private)
-quantize_row_uniform_scalar :: proc(dst: []u8, rgba: []u8, w, yb4, x_start: int, p: ^SixelPalette) {
-	for x in x_start..<w {
+quantize_row_uniform_scalar :: proc(
+	dst: []u8,
+	rgba: []u8,
+	w, yb4, x_start: int,
+	p: ^SixelPalette,
+) {
+	for x in x_start ..< w {
 		b := yb4 | (x & 3)
 		pi := x * 4
-		ci := int(p.lut_r[b][rgba[pi]]) | int(p.lut_g[b][rgba[pi+1]]) | int(p.lut_b[b][rgba[pi+2]])
+		ci :=
+			int(p.lut_r[b][rgba[pi]]) |
+			int(p.lut_g[b][rgba[pi + 1]]) |
+			int(p.lut_b[b][rgba[pi + 2]])
 		dst[x] = u8(ci)
 	}
 }
@@ -319,9 +357,9 @@ quantize_row_gray :: proc(dst: []u8, rgba: []u8, w, yb4: int, p: ^SixelPalette) 
 	for n := p.nc >> 1; n > 0; n >>= 1 {
 		shift -= 1
 	}
-	for x in 0..<w {
+	for x in 0 ..< w {
 		pi := x * 4
-		gray := (6966 * int(rgba[pi]) + 23436 * int(rgba[pi+1]) + 2366 * int(rgba[pi+2])) >> 15
+		gray := (6966 * int(rgba[pi]) + 23436 * int(rgba[pi + 1]) + 2366 * int(rgba[pi + 2])) >> 15
 		gray = clamp(gray + int(p.dither[yb4 | (x & 3)]), 0, 255)
 		dst[x] = u8(gray >> u32(shift))
 	}
@@ -349,7 +387,7 @@ buffer_grow :: proc(b: ^Buffer, need: int) {
 	b.buf = nb
 }
 
-write_byte :: proc (b: ^Buffer, v: u8) {
+write_byte :: proc(b: ^Buffer, v: u8) {
 	if b.pos >= len(b.buf) {
 		buffer_grow(b, 1)
 	}
@@ -391,24 +429,24 @@ strip_state_reset :: proc(st: ^StripState, width, nc: int) {
 	}
 	st.epoch += 1
 	if st.epoch == 0 {
-		for i in 0..<len(st.seen) {
+		for i in 0 ..< len(st.seen) {
 			st.seen[i] = 0
 		}
 		st.epoch = 1
 	}
-	for i in 0..<256 {
+	for i in 0 ..< 256 {
 		st.min_x[i] = 1 << 30
 		st.max_x[i] = -1
 	}
 	if st.prev_width == width && st.prev_nc == nc {
 		for c in st.dirty {
 			base := c * width
-			for i in base..<base + width {
+			for i in base ..< base + width {
 				st.buf[i] = 0
 			}
 		}
 	} else {
-		for i in 0..<strip_cap {
+		for i in 0 ..< strip_cap {
 			st.buf[i] = 0
 		}
 	}
@@ -429,7 +467,7 @@ emit_run :: proc(out: ^Buffer, ch: u8, count_in: int) {
 			write_sixel_num(out, c)
 			write_byte(out, ch + 63)
 		} else {
-			for i in 0..<c {
+			for i in 0 ..< c {
 				write_byte(out, ch + 63)
 			}
 		}
@@ -439,24 +477,24 @@ emit_run :: proc(out: ^Buffer, ch: u8, count_in: int) {
 
 write_sixel_num :: proc(b: ^Buffer, n: int) {
 	if n >= 10000 {
-		write_byte(b, u8(0x30 + n/10000))
+		write_byte(b, u8(0x30 + n / 10000))
 	}
 	if n >= 1000 {
-		write_byte(b, u8(0x30 + (n/1000)%10))
+		write_byte(b, u8(0x30 + (n / 1000) % 10))
 	}
 	if n >= 100 {
-		write_byte(b, u8(0x30 + (n/100)%10))
+		write_byte(b, u8(0x30 + (n / 100) % 10))
 	}
 	if n >= 10 {
-		write_byte(b, u8(0x30 + (n/10)%10))
+		write_byte(b, u8(0x30 + (n / 10) % 10))
 	}
-	write_byte(b, u8(0x30 + n%10))
+	write_byte(b, u8(0x30 + n % 10))
 }
 
 encode_strip :: proc(out: ^Buffer, st: ^StripState, width: int) {
 	for c in st.dirty {
 		base := c * width
-		row := st.buf[base:base+width]
+		row := st.buf[base:base + width]
 		x0 := int(st.min_x[c])
 		x1 := int(st.max_x[c])
 
@@ -502,12 +540,12 @@ encode_strip :: proc(out: ^Buffer, st: ^StripState, width: int) {
 }
 
 StripWorkerCtx :: struct {
-	rgba:        []u8,
-	width:       int,
-	height:      int,
-	pal:         ^SixelPalette,
-	cache:       ^StripCache,
-	next_job:    i64,
+	rgba:         []u8,
+	width:        int,
+	height:       int,
+	pal:          ^SixelPalette,
+	cache:        ^StripCache,
+	next_job:     i64,
 	total_strips: int,
 }
 
@@ -524,6 +562,7 @@ StripWorkerState :: struct {
 	st:     StripState,
 	row_ci: []u8,
 	cur:    []u8,
+	cur_a:  []u8,
 	buf:    Buffer,
 }
 
@@ -568,14 +607,18 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx, ws: ^StripWorkerState) {
 		_t1 := time.now()
 
 		prev := ctx.cache.pix[srow]
+		prev_a := ctx.cache.pix_a[srow]
 		if len(ws.cur) < n_rows * width {
 			ws.cur = make([]u8, n_rows * width)
 		}
+		if len(ws.cur_a) < n_rows * width {
+			ws.cur_a = make([]u8, n_rows * width)
+		}
 		row_offset := y_start * width * 4
-		for dy in 0..<n_rows {
+		for dy in 0 ..< n_rows {
 			yb4 := ((y_start + dy) & 3) << 2
 			bit := u8(1 << u32(dy))
-			row := ctx.rgba[row_offset:row_offset+width*4]
+			row := ctx.rgba[row_offset:row_offset + width * 4]
 			if pal.is_gray {
 				quantize_row_gray(row_ci, row, width, yb4, pal)
 			} else if uniform {
@@ -585,23 +628,35 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx, ws: ^StripWorkerState) {
 			} else {
 				quantize_row_uniform_scalar(row_ci, row, width, yb4, 0, pal)
 			}
-			copy(ws.cur[dy * width:], row_ci[:width])
 			base := dy * width
-			for x in 0..<width {
-				ci := int(row_ci[x])
-				if base + x < len(prev) && prev[base + x] == u8(ci) {
+			for x in 0 ..< width {
+				ci := u8(row_ci[x])
+				a: u8 = 0
+				if row[x * 4 + 3] >= 128 {
+					a = 255
+				}
+				ws.cur[base + x] = ci
+				ws.cur_a[base + x] = a
+				if base + x < len(prev) &&
+				   prev[base + x] == ci &&
+				   base + x < len(prev_a) &&
+				   prev_a[base + x] == a {
 					continue
 				}
-				if st.seen[ci] != st.epoch {
-					st.seen[ci] = st.epoch
-					append(&st.dirty, ci)
+				if a == 0 {
+					continue
 				}
-				st.buf[ci*width+x] |= bit
-				if i32(x) < st.min_x[ci] {
-					st.min_x[ci] = i32(x)
+				cii := int(ci)
+				if st.seen[cii] != st.epoch {
+					st.seen[cii] = st.epoch
+					append(&st.dirty, cii)
 				}
-				if i32(x) > st.max_x[ci] {
-					st.max_x[ci] = i32(x)
+				st.buf[cii * width + x] |= bit
+				if i32(x) < st.min_x[cii] {
+					st.min_x[cii] = i32(x)
+				}
+				if i32(x) > st.max_x[cii] {
+					st.max_x[cii] = i32(x)
 				}
 			}
 			row_offset += width * 4
@@ -618,6 +673,8 @@ strip_pool_run :: proc(ctx: ^StripWorkerCtx, ws: ^StripWorkerState) {
 		ctx.cache.changed[srow] = 1
 		clear(&ctx.cache.pix[srow])
 		append(&ctx.cache.pix[srow], ..ws.cur[:n_rows * width])
+		clear(&ctx.cache.pix_a[srow])
+		append(&ctx.cache.pix_a[srow], ..ws.cur_a[:n_rows * width])
 	}
 }
 
@@ -638,8 +695,14 @@ strip_pool_worker :: proc(data: rawptr) {
 // strip_pool_init spawns num permanent worker threads for frame encoding.
 strip_pool_init :: proc(pool: ^StripPool, workers: int) {
 	pool.workers = make([]^thread.Thread, workers)
-	for i in 0..<workers {
-		pool.workers[i] = thread.create_and_start_with_data(pool, strip_pool_worker, nil, .Normal, true)
+	for i in 0 ..< workers {
+		pool.workers[i] = thread.create_and_start_with_data(
+			pool,
+			strip_pool_worker,
+			nil,
+			.Normal,
+			true,
+		)
 	}
 }
 
@@ -647,7 +710,7 @@ strip_pool_init :: proc(pool: ^StripPool, workers: int) {
 strip_pool_stop :: proc(pool: ^StripPool) {
 	sync.atomic_store(&pool.stopped, 1)
 	sync.sema_post(&pool.start, len(pool.workers))
-	for _ in 0..<len(pool.workers) {
+	for _ in 0 ..< len(pool.workers) {
 		sync.sema_wait(&pool.exited)
 	}
 }
@@ -655,7 +718,14 @@ strip_pool_stop :: proc(pool: ^StripPool) {
 // sixel_encode assembles one complete frame into out. Band data is copied
 // so the buffer is self contained and can be written while the next frame
 // is being encoded.
-sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: int, pal: ^SixelPalette, cache: ^StripCache) {
+sixel_encode :: proc(
+	pool: ^StripPool,
+	out: ^Buffer,
+	rgba: []u8,
+	width, height: int,
+	pal: ^SixelPalette,
+	cache: ^StripCache,
+) {
 	nc := pal.nc
 	total_strips := (height + 5) / 6
 
@@ -664,7 +734,7 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 	write_sixel_num(out, width)
 	write_byte(out, ';')
 	write_sixel_num(out, height)
-	for i in 0..<nc {
+	for i in 0 ..< nc {
 		c := pal.colors[i]
 		write_byte(out, '#')
 		write_sixel_num(out, i + 1)
@@ -678,27 +748,27 @@ sixel_encode :: proc(pool: ^StripPool, out: ^Buffer, rgba: []u8, width, height: 
 		write_sixel_num(out, int((c & 0xff) * 100 / 255))
 	}
 
-	for i in 0..<total_strips {
+	for i in 0 ..< total_strips {
 		cache.changed[i] = 0
 	}
 
 	n_workers := len(pool.workers)
-	pool.ctx = StripWorkerCtx{
-		rgba = rgba,
-		width = width,
-		height = height,
-		pal = pal,
-		cache = cache,
+	pool.ctx = StripWorkerCtx {
+		rgba         = rgba,
+		width        = width,
+		height       = height,
+		pal          = pal,
+		cache        = cache,
 		total_strips = total_strips,
 	}
 	_t3 := time.now()
 	sync.atomic_store(&pool.ctx.next_job, 0)
 	sync.sema_post(&pool.start, n_workers)
-	for _ in 0..<n_workers {
+	for _ in 0 ..< n_workers {
 		sync.sema_wait(&pool.done)
 	}
 
-	for srow in 0..<total_strips {
+	for srow in 0 ..< total_strips {
 		if srow > 0 {
 			write_byte(out, 0x2d)
 		}

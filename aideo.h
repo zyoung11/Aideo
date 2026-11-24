@@ -25,6 +25,7 @@ typedef struct aideo_config {
 	int origin_col;  /* cursor column the picture starts at, from 1 */
 	int border_px;   /* solid frame width in pixels, 0 disables */
 	int border_color;/* frame color as 0xRRGGBB, 0 means default */
+	int fit;         /* 0 stretch, 1 contain with transparent bars, 2 cover crop */
 } aideo_config;
 
 /* aideo_open creates an engine and starts its render threads. */

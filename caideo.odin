@@ -1,42 +1,55 @@
 package aideo
 
-import "core:c"
 import "base:runtime"
+import "core:c"
 import "core:sync"
 
 // aideo_config mirrors the C struct of the same name in aideo.h.
 aideo_config :: struct {
-	fd:         c.int,
-	src_w:      c.int,
-	src_h:      c.int,
-	out_w:      c.int,
-	out_h:      c.int,
-	colors:     c.int,
-	origin_row: c.int,
-	origin_col: c.int,
-	border_px:  c.int,
+	fd:           c.int,
+	src_w:        c.int,
+	src_h:        c.int,
+	out_w:        c.int,
+	out_h:        c.int,
+	colors:       c.int,
+	origin_row:   c.int,
+	origin_col:   c.int,
+	border_px:    c.int,
 	border_color: c.int,
+	fit:          c.int,
 }
+
+// FIT_STRETCH, FIT_CONTAIN and FIT_COVER select how the source maps
+// into the output rect: direct scale, aspect fit with transparent
+// bars, or aspect fill with a center crop.
+FIT_STRETCH :: 0
+FIT_CONTAIN :: 1
+FIT_COVER :: 2
 
 // Engine is the C ABI handle for one rendering instance. It owns the
 // render pipeline, the strip workers and the yuv scaler.
 Engine :: struct {
-	mu:       sync.Mutex,
-	rc:       RenderCtx,
-	pool:     StripPool,
-	spool:    ScalePool,
-	vp:       ^VideoPlayer,
-	pal:      ^SixelPalette,
-	plan:     ^ScalePlan,
-	src_w:    int,
-	src_h:    int,
-	out_w:    int,
-	out_h:    int,
-	row:      int,
-	col:      int,
-	border_px: int,
+	mu:           sync.Mutex,
+	rc:           RenderCtx,
+	pool:         StripPool,
+	spool:        ScalePool,
+	vp:           ^VideoPlayer,
+	pal:          ^SixelPalette,
+	plan:         ^ScalePlan,
+	src_w:        int,
+	src_h:        int,
+	out_w:        int,
+	out_h:        int,
+	row:          int,
+	col:          int,
+	border_px:    int,
 	border_color: u32,
-	need_full: i32,
+	fit:          int,
+	dst_x:        int,
+	dst_y:        int,
+	crop_x:       int,
+	crop_y:       int,
+	need_full:    i32,
 }
 
 // frame_border paints a solid frame around one RGBA buffer in place
@@ -49,19 +62,19 @@ frame_border :: proc(p: []u8, w, h, px: int, color: u32) {
 	cr := u8(color >> 16)
 	cg := u8(color >> 8)
 	cb := u8(color)
-	for y in 0..<px {
-		for x in 0..<w {
+	for y in 0 ..< px {
+		for x in 0 ..< w {
 			fill_px(p, w, y, x, cr, cg, cb)
 		}
-		for x in 0..<w {
+		for x in 0 ..< w {
 			fill_px(p, w, h - 1 - y, x, cr, cg, cb)
 		}
 	}
-	for y in px..<(h - px) {
-		for x in 0..<px {
+	for y in px ..< (h - px) {
+		for x in 0 ..< px {
 			fill_px(p, w, y, x, cr, cg, cb)
 		}
-		for x in (w - px)..<w {
+		for x in (w - px) ..< w {
 			fill_px(p, w, y, x, cr, cg, cb)
 		}
 	}
@@ -90,7 +103,39 @@ engine_build_plan :: proc(e: ^Engine) {
 	if e.plan != nil {
 		scale_plan_free(e.plan)
 	}
-	e.plan = scale_plan(e.src_w, e.src_h, e.out_w, e.out_h)
+	sw := e.src_w
+	sh := e.src_h
+	dw := e.out_w
+	dh := e.out_h
+	e.dst_x = 0
+	e.dst_y = 0
+	e.crop_x = 0
+	e.crop_y = 0
+	if e.fit == FIT_CONTAIN {
+		iw := e.out_w - e.border_px * 2
+		ih := e.out_h - e.border_px * 2
+		if iw >= 4 && ih >= 4 {
+			dw = iw
+			dh = dw * sh / sw
+			if dh > ih {
+				dh = ih
+				dw = dh * sw / sh
+			}
+			dw = max(dw - dw % 2, 2)
+			dh = max(dh - dh % 2, 2)
+			e.dst_x = e.border_px + (iw - dw) / 2
+			e.dst_y = e.border_px + (ih - dh) / 2
+		}
+	} else if e.fit == FIT_COVER {
+		if sw * e.out_h > sh * e.out_w {
+			sw = max((sh * e.out_w / e.out_h) &~ 1, 2)
+		} else {
+			sh = max((sw * e.out_h / e.out_w) &~ 1, 2)
+		}
+		e.crop_x = max((e.src_w - sw) / 2 &~ 1, 0)
+		e.crop_y = max((e.src_h - sh) / 2 &~ 1, 0)
+	}
+	e.plan = scale_plan(sw, sh, dw, dh)
 }
 
 engine_submit :: proc(e: ^Engine, buf: []u8) {
@@ -98,15 +143,18 @@ engine_submit :: proc(e: ^Engine, buf: []u8) {
 	if sync.atomic_exchange(&e.rc.lost, 0) != 0 {
 		reset = true
 	}
-	render_submit(&e.rc, RenderJob{
-		buf = buf,
-		w = e.out_w,
-		h = e.out_h,
-		start_col = e.col,
-		start_row = e.row,
-		pal = e.pal,
-		reset_cache = reset,
-	})
+	render_submit(
+		&e.rc,
+		RenderJob {
+			buf = buf,
+			w = e.out_w,
+			h = e.out_h,
+			start_col = e.col,
+			start_row = e.row,
+			pal = e.pal,
+			reset_cache = reset,
+		},
+	)
 }
 
 @(export)
@@ -127,6 +175,7 @@ aideo_open :: proc "c" (cfg: ^aideo_config) -> ^Engine {
 	if e.border_color == 0 {
 		e.border_color = 0xd8d8d8
 	}
+	e.fit = clamp(int(cfg.fit), FIT_STRETCH, FIT_COVER)
 	e.pal = get_palette(engine_default_colors(int(cfg.colors)))
 	e.vp = new(VideoPlayer)
 	e.rc.vp = e.vp
@@ -136,7 +185,7 @@ aideo_open :: proc "c" (cfg: ^aideo_config) -> ^Engine {
 	}
 	strip_pool_init(&e.pool, max(cpu_count() / 2, 4))
 	e.rc.pool = &e.pool
-	for i in 0..<len(e.rc.bufs) {
+	for i in 0 ..< len(e.rc.bufs) {
 		buffer_init(&e.rc.bufs[i], e.out_w * e.out_h / 2)
 	}
 	scale_pool_init(&e.spool, max(cpu_count() / 2, 2))
@@ -164,14 +213,14 @@ aideo_close :: proc "c" (e: ^Engine) {
 		scale_plan_free(e.plan)
 	}
 	sync.mutex_lock(&e.vp.pool_mu)
-	for i in 0..<len(e.vp.pool) {
+	for i in 0 ..< len(e.vp.pool) {
 		if e.vp.pool[i] != nil {
 			free(&e.vp.pool[i][0])
 			e.vp.pool[i] = nil
 		}
 	}
 	sync.mutex_unlock(&e.vp.pool_mu)
-	for i in 0..<len(e.rc.bufs) {
+	for i in 0 ..< len(e.rc.bufs) {
 		if len(e.rc.bufs[i].buf) > 0 {
 			free(&e.rc.bufs[i].buf[0])
 		}
@@ -235,7 +284,7 @@ aideo_push_rgba :: proc "c" (e: ^Engine, rgba: [^]u8, stride: c.int) {
 	if st == e.out_w * 4 {
 		copy(buf, rgba[:e.out_w * e.out_h * 4])
 	} else {
-		for y in 0..<e.out_h {
+		for y in 0 ..< e.out_h {
 			off := y * st
 			copy(buf[y * e.out_w * 4:], rgba[off:off + e.out_w * 4])
 		}
@@ -255,7 +304,23 @@ aideo_push_yuv :: proc "c" (e: ^Engine, y, u, v: [^]u8, stride_y, stride_c: c.in
 	sync.mutex_lock(&e.mu)
 	defer sync.mutex_unlock(&e.mu)
 	buf := video_pool_get(e.vp, e.out_w * e.out_h * 4)
-	scale_frame(&e.spool, e.plan, y, u, v, int(stride_y), int(stride_c), &buf[0], e.out_w * 4)
+	sy := int(stride_y)
+	sc := int(stride_c)
+	if e.fit == FIT_CONTAIN {
+		runtime.mem_zero(&buf[0], len(buf))
+	}
+	off := e.dst_y * e.out_w * 4 + e.dst_x * 4
+	scale_frame(
+		&e.spool,
+		e.plan,
+		([^]u8)(&y[e.crop_y * sy + e.crop_x]),
+		([^]u8)(&u[(e.crop_y / 2) * sc + e.crop_x / 2]),
+		([^]u8)(&v[(e.crop_y / 2) * sc + e.crop_x / 2]),
+		sy,
+		sc,
+		([^]u8)(&buf[off]),
+		e.out_w * 4,
+	)
 	if e.border_px > 0 {
 		frame_border(buf[:e.out_w * e.out_h * 4], e.out_w, e.out_h, e.border_px, e.border_color)
 	}
